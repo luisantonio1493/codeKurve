@@ -5,8 +5,8 @@ each phase's CI must pass on Windows, macOS, and Linux before moving on.
 
 | Phase | Name | Status |
 |---|---|---|
-| 0 | Governance and scaffold | **Implementation complete** (local gates green; 3-OS CI pending first push to a remote) |
-| 1 | Minimal vertical slice | Not started |
+| 0 | Governance and scaffold | **Complete** (merged to `main`, pushed) |
+| 1 | Minimal vertical slice | **Implementation complete** (local gates green; 3-OS CI triggered on push) |
 | 2 | TypeScript graph | Not started |
 | 3 | Incremental and watcher | Not started |
 | 4 | MCP | Not started |
