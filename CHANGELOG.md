@@ -15,3 +15,4 @@ All notable changes to this project are documented here. Format follows
 - Add typed error model and project configuration (`.codekurve/config.toml`)
 - Add `codekurve init` command
 - Add TypeScript/JavaScript file discovery honoring `.gitignore`
+- Add Tree-sitter symbol extraction for classes and top-level functions

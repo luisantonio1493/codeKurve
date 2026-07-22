@@ -25,4 +25,7 @@ pub enum Error {
 
     #[error("path does not exist: {}", .0.display())]
     PathNotFound(PathBuf),
+
+    #[error("parse error: {0}")]
+    Parse(String),
 }
