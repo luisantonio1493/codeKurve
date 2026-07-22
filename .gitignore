@@ -1,0 +1,19 @@
+# OS
+.DS_Store
+
+# Rust build output
+target/
+
+# CodeKurve local index / data directory
+.codekurve/
+
+# Gentle-AI generated skill registry (managed automatically)
+.atl/.skill-registry.cache.json
+.atl/skill-registry.md
+
+# Editor temporary files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
