@@ -14,3 +14,4 @@ All notable changes to this project are documented here. Format follows
 - Add `codekurve version` command
 - Add typed error model and project configuration (`.codekurve/config.toml`)
 - Add `codekurve init` command
+- Add TypeScript/JavaScript file discovery honoring `.gitignore`
