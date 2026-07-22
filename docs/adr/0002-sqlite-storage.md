@@ -30,10 +30,13 @@ DB server.
   sole source of truth.
 - Concurrency is constrained to SQLite's model: WAL for concurrent reads,
   one coordinated writer for mutations (see ADR 0008).
-- Open/deferred point: whether `rusqlite`'s `bundled` feature (statically
-  linked SQLite) is acceptable for enterprise distribution, or whether a
-  system-linked SQLite is required instead, is not yet decided — to be
-  confirmed when the store crate is implemented (Phase 1+), not in Phase 0.
+- `rusqlite` is used with the `bundled` feature (statically linked SQLite),
+  decided when the store crate landed in Phase 1. Rationale: Windows has no
+  system SQLite, so the 3-OS CI matrix needs a self-contained build; `bundled`
+  guarantees FTS5 is compiled in and pins a reproducible SQLite version; SQLite
+  is public domain, so it does not conflict with the pending licensing stance
+  (`docs/LICENSING.md`). Revisit only if enterprise distribution or binary size
+  forces a system-linked build.
 - Implementation (schema, PRAGMAs, migrations) lands in a later phase; see
   `docs/ROADMAP.md`.
 

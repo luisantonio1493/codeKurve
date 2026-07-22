@@ -16,3 +16,4 @@ All notable changes to this project are documented here. Format follows
 - Add `codekurve init` command
 - Add TypeScript/JavaScript file discovery honoring `.gitignore`
 - Add Tree-sitter symbol extraction for classes and top-level functions
+- Add SQLite storage with FTS5 (schema migration 0001) and symbol queries
