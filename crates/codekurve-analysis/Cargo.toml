@@ -1,0 +1,7 @@
+[package]
+name = "codekurve-analysis"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true

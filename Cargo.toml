@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# rust-version intentionally unpinned — MSRV deferred (see CODEKURVE_MASTER_PLAN.md §13).
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
