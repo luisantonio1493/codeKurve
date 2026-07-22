@@ -1,0 +1,3 @@
+# Force LF on checkout across all platforms so `rustfmt` (newline_style = Unix)
+# passes on Windows CI. See rustfmt.toml.
+* text=auto eol=lf
