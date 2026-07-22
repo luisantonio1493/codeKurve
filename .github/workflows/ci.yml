@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  checks:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: licensing check
+        run: python scripts/check_licensing.py
+
+# Deferred (see docs/ROADMAP.md and design decisions):
+# - aarch64 Linux runner (macos-latest already covers aarch64 macOS).
+# - doc-tests, cargo-deny, and a dedicated MSRV job.
+# - dependency caching (no Swatinem/rust-cache in Phase 0 — auditability
+#   over speed; reconsider only when build slowness is measured).
