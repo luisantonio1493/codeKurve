@@ -9,4 +9,6 @@ All notable changes to this project are documented here. Format follows
 
 - Initialize Rust workspace (5 crates)
 - Add governance documentation
+- Add architecture decision records (0001-0010)
+- Add cross-platform CI quality gates and licensing check
 - Add `codekurve version` command
