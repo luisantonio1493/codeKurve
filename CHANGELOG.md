@@ -9,3 +9,4 @@ All notable changes to this project are documented here. Format follows
 
 - Initialize Rust workspace (5 crates)
 - Add governance documentation
+- Add `codekurve version` command
