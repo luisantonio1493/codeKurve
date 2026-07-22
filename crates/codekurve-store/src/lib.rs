@@ -7,3 +7,4 @@ pub mod repo;
 
 pub use error::{Error, Result};
 pub use repo::{FileInput, IndexOutcome, StoredSymbol};
+pub use rusqlite::Connection;

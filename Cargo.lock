@@ -88,7 +88,9 @@ name = "codekurve"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
+ "codekurve-analysis",
  "codekurve-core",
+ "codekurve-store",
  "predicates",
  "tempfile",
 ]

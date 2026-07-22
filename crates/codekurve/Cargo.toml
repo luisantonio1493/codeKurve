@@ -8,6 +8,8 @@ workspace = true
 
 [dependencies]
 codekurve-core = { path = "../codekurve-core" }
+codekurve-analysis = { path = "../codekurve-analysis" }
+codekurve-store = { path = "../codekurve-store" }
 
 [dev-dependencies]
 assert_cmd = "2"

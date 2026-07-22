@@ -187,6 +187,18 @@ pub fn search(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Look up a project id by its canonical root path.
+pub fn find_project(conn: &Connection, root_path: &str) -> Result<Option<String>> {
+    let id = conn
+        .query_row(
+            "SELECT id FROM projects WHERE root_path = ?1",
+            params![root_path],
+            |row| row.get(0),
+        )
+        .ok();
+    Ok(id)
+}
+
 /// Exact-name lookup for the `symbol` command.
 pub fn find_by_name(conn: &Connection, project_id: &str, name: &str) -> Result<Vec<StoredSymbol>> {
     let mut stmt = conn.prepare(
