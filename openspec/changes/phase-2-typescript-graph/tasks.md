@@ -56,11 +56,13 @@ Every PR: `cargo fmt --check`, `cargo clippy --workspace --all-targets --all-fea
 
 ## PR3: Intra-file relationship extraction (base: PR2)
 
-- [ ] 3.1 `crates/codekurve-analysis/src/extract.rs`: emit `Contains` (class→method/property), `Inherits`/`Implements` (heritage clause), same-file `Calls`/`Constructs` — all `Provenance::Extracted`, `EdgeTarget::Local` when in-file resolvable else `Unresolved(text)`.
-- [ ] 3.2 `crates/codekurve-analysis/src/extract.rs`: emit `Imports`/`Exports` edges with `EdgeTarget::Unresolved(module_specifier)` (module resolution deferred to PR4a).
-- [ ] 3.3 `crates/codekurve-store/src/repo.rs`: wire `persist_relationships` (PR2) to real same-file edges from `FileAnalysis.relationships`.
-- [ ] 3.4 `crates/codekurve-analysis/tests/fixtures/ts-graph/`: new fixture dir; add `heritage.ts` (`class Foo extends Base implements IFoo`) and `contains.ts` (class + 2 methods).
-- [ ] 3.5 Test: `crates/codekurve-analysis/tests/relationship_extraction.rs` (new) — asserts one `extends` + one `implements` edge (spec scenario "Class extends and implements") and two `contains` rows (spec scenario "Contains hierarchy").
+**Split note (apply-time)**: 3.1's full scope (Contains + heritage + same-file Calls/Constructs) measured ~549 changed lines in one branch, clearly over the 400-line budget — split into two chained sub-PRs per the orchestrator's flagged fallback: PR3a (Contains + Inherits/Implements, 406/-38) and PR3b (Calls/Constructs, 123/-24), PR3b based on PR3a. 3.2 (Imports/Exports edges) was out of this run's given scope (not part of the enumerated edge kinds) and stays `[ ]`/unimplemented — a risk flagged in the apply-progress record for maintainer awareness.
+
+- [x] 3.1 `crates/codekurve-analysis/src/extract.rs`: emit `Contains` (class→method/property), `Inherits`/`Implements` (heritage clause), same-file `Calls`/`Constructs` — all `Provenance::Extracted`, `EdgeTarget::Local` when in-file resolvable else `Unresolved(text)`. (done across PR3a + PR3b, see split note)
+- [ ] 3.2 `crates/codekurve-analysis/src/extract.rs`: emit `Imports`/`Exports` edges with `EdgeTarget::Unresolved(module_specifier)` (module resolution deferred to PR4a). **Not done this run** — deferred, see split note.
+- [x] 3.3 `crates/codekurve-store/src/repo.rs`: wire `persist_relationships` (PR2) to real same-file edges from `FileAnalysis.relationships`. (test-proven with real `Contains` edge data; commands.rs pipeline wiring stays PR4b per design's stated runtime harness)
+- [x] 3.4 `crates/codekurve-analysis/tests/fixtures/ts-graph/`: new fixture dir; add `heritage.ts` (`class Foo extends Base implements IFoo`) and `contains.ts` (class + 2 methods).
+- [x] 3.5 Test: `crates/codekurve-analysis/tests/relationship_extraction.rs` (new) — asserts one `extends` + one `implements` edge (spec scenario "Class extends and implements") and two `contains` rows (spec scenario "Contains hierarchy"). Plus extract.rs unit tests for the same-file `Calls`/`Constructs` cases (method calling a sibling method; `new` expression).
 
 ## PR4a: Resolution module (base: PR3)
 

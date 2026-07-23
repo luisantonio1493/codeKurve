@@ -1,10 +1,8 @@
 //! Symbol and intra-file relationship extraction via Tree-sitter. See
 //! CODEKURVE_MASTER_PLAN.md §Fase 1 (symbols) and §18/§20 (relationship IR).
-//! This slice extracts `Contains` (class -> member) and heritage
-//! (`Inherits`/`Implements`) edges; same-file `Calls`/`Constructs` land in
-//! the next slice, cross-file resolution in the one after that. Every edge
-//! here either resolves to a same-file symbol or carries
-//! `EdgeTarget::Unresolved(text)` for a later pass to pick up.
+//! Cross-file resolution (imports/exports, cross-file calls) lands in a later
+//! phase slice — every edge here either resolves to a same-file symbol or
+//! carries `EdgeTarget::Unresolved(text)` for a later pass to pick up.
 
 use codekurve_core::error::{Error, Result};
 use codekurve_core::{
@@ -44,7 +42,7 @@ pub fn analyze(source: &str, language: LanguageId, relative_path: &str) -> Resul
         out_rels: Vec::new(),
         pending: Vec::new(),
     };
-    collect(tree.root_node(), None, &mut ctx);
+    collect(tree.root_node(), None, None, &mut ctx);
     let mut relationships = ctx.out_rels;
     resolve_pending(&ctx.out, ctx.pending, &mut relationships);
 
@@ -57,8 +55,8 @@ pub fn analyze(source: &str, language: LanguageId, relative_path: &str) -> Resul
     })
 }
 
-/// A heritage target discovered while walking, deferred until the whole
-/// file's symbols are known (the base/interface may be a forward reference).
+/// A heritage/call/construct target discovered while walking, deferred until
+/// the whole file's symbols are known (both may be forward references).
 struct PendingRel {
     source_key: String,
     kind: RelationshipKind,
@@ -67,9 +65,10 @@ struct PendingRel {
 }
 
 /// Everything the recursive walk needs that doesn't change with tree depth —
-/// bundled so `collect` stays under clippy's argument-count limit; `node`
-/// and `parent` (enclosing class name, for qualified names) are the only
-/// things that vary per call and stay as explicit arguments.
+/// bundled so `collect` stays under clippy's argument-count limit; `node`,
+/// `parent` (enclosing class name, for qualified names), and `scope`
+/// (enclosing function/method local key, for call/construct attribution)
+/// are the only things that vary per call and stay as explicit arguments.
 struct CollectCtx<'a> {
     source: &'a [u8],
     language: LanguageId,
@@ -79,7 +78,7 @@ struct CollectCtx<'a> {
     pending: Vec<PendingRel>,
 }
 
-fn collect(node: Node, parent: Option<&str>, ctx: &mut CollectCtx) {
+fn collect(node: Node, parent: Option<&str>, scope: Option<&str>, ctx: &mut CollectCtx) {
     let (source, language, relative_path) = (ctx.source, ctx.language, ctx.relative_path);
     match node.kind() {
         "class_declaration" | "abstract_class_declaration" => {
@@ -100,7 +99,7 @@ fn collect(node: Node, parent: Option<&str>, ctx: &mut CollectCtx) {
             // recursion below for this subtree.
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                collect(child, name.as_deref(), ctx);
+                collect(child, name.as_deref(), scope, ctx);
             }
             return;
         }
@@ -122,7 +121,7 @@ fn collect(node: Node, parent: Option<&str>, ctx: &mut CollectCtx) {
             let method_key = qualified_name(relative_path, Some(class_name), &method_name);
             ctx.out_rels.push(ExtractedRelationship {
                 source_local_key: class_key,
-                target: EdgeTarget::Local(method_key),
+                target: EdgeTarget::Local(method_key.clone()),
                 kind: RelationshipKind::Contains,
                 span: span_of(node),
                 provenance: Provenance::Extracted,
@@ -130,15 +129,16 @@ fn collect(node: Node, parent: Option<&str>, ctx: &mut CollectCtx) {
                 reason: None,
             });
             // A method body can contain its own nested functions/classes;
-            // recurse into it without the enclosing class as parent.
+            // recurse into it without the enclosing class as parent, but with
+            // this method as the call/construct attribution scope.
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                collect(child, None, ctx);
+                collect(child, None, Some(method_key.as_str()), ctx);
             }
             return;
         }
         "function_declaration" | "generator_function_declaration" if is_top_level(node) => {
-            push_named(
+            let Some(name) = push_named(
                 node,
                 source,
                 language,
@@ -146,14 +146,42 @@ fn collect(node: Node, parent: Option<&str>, ctx: &mut CollectCtx) {
                 SymbolKind::Function,
                 None,
                 &mut ctx.out,
-            );
+            ) else {
+                return;
+            };
+            let key = qualified_name(relative_path, None, &name);
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect(child, parent, Some(key.as_str()), ctx);
+            }
+            return;
+        }
+        "call_expression" => {
+            if let (Some(source_key), Some(target_name)) = (scope, callee_name(node, source)) {
+                ctx.pending.push(PendingRel {
+                    source_key: source_key.to_string(),
+                    kind: RelationshipKind::Calls,
+                    target_name,
+                    span: span_of(node),
+                });
+            }
+        }
+        "new_expression" => {
+            if let (Some(source_key), Some(target_name)) = (scope, constructor_name(node, source)) {
+                ctx.pending.push(PendingRel {
+                    source_key: source_key.to_string(),
+                    kind: RelationshipKind::Constructs,
+                    target_name,
+                    span: span_of(node),
+                });
+            }
         }
         _ => {}
     }
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect(child, parent, ctx);
+        collect(child, parent, scope, ctx);
     }
 }
 
@@ -200,9 +228,9 @@ fn collect_heritage(
     }
 }
 
-/// Resolves every deferred heritage target against the file's full symbol
-/// list, now that forward references are visible. A same-file name+kind
-/// match becomes `EdgeTarget::Local`; zero matches become
+/// Resolves every deferred heritage/call/construct target against the file's
+/// full symbol list, now that forward references are visible. A same-file
+/// name+kind match becomes `EdgeTarget::Local`; zero matches become
 /// `EdgeTarget::Unresolved(text)` (never dropped — §18.3, though this is not
 /// yet an `UnresolvedReference` row, that decision needs the whole-project
 /// view a later phase slice adds); multiple matches emit one Low-confidence
@@ -253,10 +281,16 @@ fn resolve_pending(
     }
 }
 
-/// Which symbol kinds a heritage relationship may target, so a bare-name
-/// match doesn't cross semantic categories.
+/// Which symbol kinds a relationship kind may target, so a bare-name match
+/// doesn't cross semantic categories (e.g. `new Foo()` must target a class,
+/// not a same-named function).
 fn kind_matches(rel_kind: RelationshipKind, sym_kind: SymbolKind) -> bool {
     match rel_kind {
+        RelationshipKind::Constructs => sym_kind == SymbolKind::Class,
+        RelationshipKind::Calls => matches!(
+            sym_kind,
+            SymbolKind::Function | SymbolKind::Method | SymbolKind::Constructor
+        ),
         RelationshipKind::Inherits | RelationshipKind::Implements => {
             matches!(sym_kind, SymbolKind::Class | SymbolKind::Interface)
         }
@@ -275,6 +309,29 @@ fn find_child<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
         }
     }
     None
+}
+
+/// The callee name of a `call_expression`: the bare identifier for
+/// `foo()`, or the accessed property for `this.foo()`/`obj.foo()`.
+fn callee_name(node: Node, source: &[u8]) -> Option<String> {
+    let func = node.child_by_field_name("function")?;
+    match func.kind() {
+        "identifier" => func.utf8_text(source).ok().map(str::to_string),
+        "member_expression" => func
+            .child_by_field_name("property")
+            .and_then(|p| p.utf8_text(source).ok())
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// The constructed type name of a `new_expression` (`new Foo()`).
+fn constructor_name(node: Node, source: &[u8]) -> Option<String> {
+    let ctor = node.child_by_field_name("constructor")?;
+    match ctor.kind() {
+        "identifier" => ctor.utf8_text(source).ok().map(str::to_string),
+        _ => None,
+    }
 }
 
 /// A `type_identifier` or `generic_type` (e.g. `Comparable<T>`) name from an
@@ -492,5 +549,47 @@ function alsoTop() {
             EdgeTarget::Unresolved("IFoo".to_string())
         );
         assert_eq!(implements.confidence, Confidence::Unresolved);
+    }
+
+    /// A method calling a sibling method resolves to a same-file `Calls`
+    /// edge (spec "Exact local call").
+    #[test]
+    fn method_call_to_sibling_resolves_locally() {
+        let source =
+            "class Service {\n  run() { return this.helper(); }\n  helper() { return 1; }\n}\n";
+        let analysis = analyze(source, LanguageId::TypeScript, "src/service.ts").unwrap();
+
+        let call = analysis
+            .relationships
+            .iter()
+            .find(|r| r.kind == RelationshipKind::Calls)
+            .unwrap();
+        assert_eq!(call.source_local_key, "src/service.ts::Service.run");
+        assert_eq!(
+            call.target,
+            EdgeTarget::Local("src/service.ts::Service.helper".to_string())
+        );
+        assert_eq!(call.confidence, Confidence::Exact);
+    }
+
+    /// A `new` expression targeting a same-file class resolves to a
+    /// `Constructs` edge (spec "Exact local call" tier applies equally to
+    /// constructs).
+    #[test]
+    fn new_expression_resolves_to_local_class() {
+        let source = "class Widget {}\nfunction build() { return new Widget(); }\n";
+        let analysis = analyze(source, LanguageId::TypeScript, "src/widget.ts").unwrap();
+
+        let construct = analysis
+            .relationships
+            .iter()
+            .find(|r| r.kind == RelationshipKind::Constructs)
+            .unwrap();
+        assert_eq!(construct.source_local_key, "src/widget.ts::build");
+        assert_eq!(
+            construct.target,
+            EdgeTarget::Local("src/widget.ts::Widget".to_string())
+        );
+        assert_eq!(construct.confidence, Confidence::Exact);
     }
 }
