@@ -156,6 +156,18 @@ fn collect(node: Node, parent: Option<&str>, scope: Option<&str>, ctx: &mut Coll
             }
             return;
         }
+        "import_statement" => {
+            collect_imports(node, source, relative_path, &mut ctx.out_rels);
+        }
+        "export_statement" => {
+            collect_exports(
+                node,
+                source,
+                relative_path,
+                &mut ctx.out_rels,
+                &mut ctx.pending,
+            );
+        }
         "call_expression" => {
             if let (Some(source_key), Some(target_name)) = (scope, callee_name(node, source)) {
                 ctx.pending.push(PendingRel {
@@ -228,8 +240,214 @@ fn collect_heritage(
     }
 }
 
-/// Resolves every deferred heritage/call/construct target against the file's
-/// full symbol list, now that forward references are visible. A same-file
+/// Emits one `Imports` edge per imported binding (default/named/namespace)
+/// in an `import_statement`. Module resolution (specifier → concrete file)
+/// is a later phase slice (PR4a) — the target always carries the raw module
+/// specifier text. `reason` carries the imported name (`"default"` for a
+/// default import, `"*"` for a namespace import) so a later pass can look it
+/// up in the target module's exports without re-parsing source.
+fn collect_imports(
+    node: Node,
+    source: &[u8],
+    relative_path: &str,
+    out: &mut Vec<ExtractedRelationship>,
+) {
+    let Some(specifier) = module_specifier(node, source) else {
+        return;
+    };
+    let Some(clause) = find_child(node, "import_clause") else {
+        return;
+    };
+    let source_key = relative_path.to_string();
+
+    let mut cursor = clause.walk();
+    for part in clause.named_children(&mut cursor) {
+        match part.kind() {
+            "identifier" => push_unresolved_edge(
+                out,
+                &source_key,
+                RelationshipKind::Imports,
+                &specifier,
+                span_of(part),
+                Some("default".to_string()),
+            ),
+            "namespace_import" => push_unresolved_edge(
+                out,
+                &source_key,
+                RelationshipKind::Imports,
+                &specifier,
+                span_of(part),
+                Some("*".to_string()),
+            ),
+            "named_imports" => {
+                let mut ic = part.walk();
+                for spec in part.named_children(&mut ic) {
+                    let Some(name_node) = spec.child_by_field_name("name") else {
+                        continue;
+                    };
+                    let Ok(name) = name_node.utf8_text(source) else {
+                        continue;
+                    };
+                    push_unresolved_edge(
+                        out,
+                        &source_key,
+                        RelationshipKind::Imports,
+                        &specifier,
+                        span_of(spec),
+                        Some(name.to_string()),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Emits `Exports` edges from an `export_statement`. Re-exports (a `from`
+/// clause, or `export * from`) target `EdgeTarget::Unresolved(module_specifier)`
+/// since the source module isn't known until whole-project resolution
+/// (PR4a). Local named/default exports defer through `pending` so they
+/// resolve against this file's own symbol list, same as heritage edges.
+/// Direct declaration exports (`export class Foo {}`) are intentionally not
+/// covered — `is_exported` wiring is a later phase slice (see
+/// `push_named`'s comment); their symbols still extract normally via the
+/// shared recursion below.
+fn collect_exports(
+    node: Node,
+    source: &[u8],
+    relative_path: &str,
+    out: &mut Vec<ExtractedRelationship>,
+    pending: &mut Vec<PendingRel>,
+) {
+    let source_key = relative_path.to_string();
+    let specifier = module_specifier(node, source);
+
+    if let Some(clause) = find_child(node, "export_clause") {
+        let mut cursor = clause.walk();
+        for spec in clause.named_children(&mut cursor) {
+            if spec.kind() != "export_specifier" {
+                continue;
+            }
+            let Some(name_node) = spec.child_by_field_name("name") else {
+                continue;
+            };
+            let Ok(name) = name_node.utf8_text(source) else {
+                continue;
+            };
+            match &specifier {
+                Some(module) => push_unresolved_edge(
+                    out,
+                    &source_key,
+                    RelationshipKind::Exports,
+                    module,
+                    span_of(spec),
+                    Some(name.to_string()),
+                ),
+                None => pending.push(PendingRel {
+                    source_key: source_key.clone(),
+                    kind: RelationshipKind::Exports,
+                    target_name: name.to_string(),
+                    span: span_of(spec),
+                }),
+            }
+        }
+        return;
+    }
+
+    if let Some(module) = &specifier {
+        // `export * from './mod'` (and `export * as ns from './mod'` — the
+        // `ns` alias is dropped, this is extraction not resolution).
+        push_unresolved_edge(
+            out,
+            &source_key,
+            RelationshipKind::Exports,
+            module,
+            span_of(node),
+            None,
+        );
+        return;
+    }
+
+    if is_default_export(node, source) {
+        match export_default_name(node, source) {
+            Some(name) => pending.push(PendingRel {
+                source_key,
+                kind: RelationshipKind::Exports,
+                target_name: name,
+                span: span_of(node),
+            }),
+            None => push_unresolved_edge(
+                out,
+                &source_key,
+                RelationshipKind::Exports,
+                "default",
+                span_of(node),
+                Some("anonymous default export".to_string()),
+            ),
+        }
+    }
+}
+
+/// Pushes an `Extracted`/`Unresolved` relationship — the shared shape for
+/// import/export edges whose target isn't a same-file symbol (module
+/// specifier, or an anonymous default export placeholder).
+fn push_unresolved_edge(
+    out: &mut Vec<ExtractedRelationship>,
+    source_key: &str,
+    kind: RelationshipKind,
+    target_text: &str,
+    span: SourceSpan,
+    reason: Option<String>,
+) {
+    out.push(ExtractedRelationship {
+        source_local_key: source_key.to_string(),
+        target: EdgeTarget::Unresolved(target_text.to_string()),
+        kind,
+        span,
+        provenance: Provenance::Extracted,
+        confidence: Confidence::Unresolved,
+        reason,
+    });
+}
+
+/// The module specifier text from an `import_statement`/`export_statement`'s
+/// `source` string field, with surrounding quotes stripped.
+fn module_specifier(node: Node, source: &[u8]) -> Option<String> {
+    let string_node = node.child_by_field_name("source")?;
+    let text = string_node.utf8_text(source).ok()?;
+    Some(text.trim_matches(['\'', '"', '`']).to_string())
+}
+
+/// Whether an `export_statement` node is an `export default ...` (no
+/// dedicated field distinguishes it in this grammar — the `default` keyword
+/// is an anonymous token).
+fn is_default_export(node: Node, source: &[u8]) -> bool {
+    node.utf8_text(source)
+        .map(|t| t.trim_start().starts_with("export default"))
+        .unwrap_or(false)
+}
+
+/// The exported name for `export default X`, when determinable: a named
+/// class/function declaration's own name, or a bare identifier value
+/// (`export default someIdentifier;`). `None` for anonymous
+/// declarations/expressions (`export default class {}`, `export default 42`).
+fn export_default_name(node: Node, source: &[u8]) -> Option<String> {
+    if let Some(decl) = node.child_by_field_name("declaration") {
+        return decl
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source).ok())
+            .map(str::to_string);
+    }
+    let value = node.child_by_field_name("value")?;
+    if value.kind() == "identifier" {
+        return value.utf8_text(source).ok().map(str::to_string);
+    }
+    None
+}
+
+/// Resolves every deferred heritage/call/construct/local-export target
+/// against the file's full symbol list, now that forward references are
+/// visible. A same-file
 /// name+kind match becomes `EdgeTarget::Local`; zero matches become
 /// `EdgeTarget::Unresolved(text)` (never dropped — §18.3, though this is not
 /// yet an `UnresolvedReference` row, that decision needs the whole-project
@@ -293,6 +511,12 @@ fn kind_matches(rel_kind: RelationshipKind, sym_kind: SymbolKind) -> bool {
         ),
         RelationshipKind::Inherits | RelationshipKind::Implements => {
             matches!(sym_kind, SymbolKind::Class | SymbolKind::Interface)
+        }
+        RelationshipKind::Exports => {
+            matches!(
+                sym_kind,
+                SymbolKind::Class | SymbolKind::Function | SymbolKind::Interface
+            )
         }
         _ => true,
     }
