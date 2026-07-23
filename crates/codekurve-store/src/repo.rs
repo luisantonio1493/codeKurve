@@ -109,16 +109,17 @@ pub fn reindex(
         outcome.files += 1;
 
         for symbol in &file.symbols {
+            // §16.3: excludes start_byte so unrelated edits shifting later
+            // byte offsets don't change unaffected symbols' identity.
             let symbol_key = format!(
-                "{}#{}:{}@{}",
+                "{}/{}/{}/{}",
+                symbol.language.as_str(),
                 file.relative_path,
                 symbol.kind.as_str(),
-                symbol.name,
-                symbol.span.start_byte
+                symbol.qualified_name,
             );
             let symbol_id = hash_id("sym", &format!("{file_id}/{symbol_key}"));
-            // ponytail: qualified name == name until resolution lands (§Fase 2).
-            let qualified = &symbol.name;
+            let qualified = &symbol.qualified_name;
             tx.execute(
                 "INSERT INTO symbols(id, project_id, file_id, symbol_key, name, qualified_name,
                      kind, language, start_byte, end_byte, start_line, start_column,
@@ -261,6 +262,7 @@ mod tests {
     fn symbol(name: &str, kind: SymbolKind, start_byte: usize) -> Symbol {
         Symbol {
             name: name.to_string(),
+            qualified_name: format!("src/member.ts::{name}"),
             kind,
             language: LanguageId::TypeScript,
             span: SourceSpan {
@@ -271,6 +273,7 @@ mod tests {
                 end_line: 2,
                 end_column: 1,
             },
+            parent: None,
         }
     }
 
@@ -338,5 +341,41 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM symbols_fts", [], |r| r.get(0))
             .unwrap();
         assert_eq!(fts_total, 1);
+    }
+
+    /// Spec scenario "Reindex after unrelated edit" (§16.3): a later edit
+    /// that only shifts `start_byte` must not change an unaffected symbol's
+    /// `symbol_key`.
+    #[test]
+    fn symbol_key_excludes_start_byte() {
+        let mut conn = seed();
+        let pid = project_id(&conn);
+        let before: String = conn
+            .query_row(
+                "SELECT symbol_key FROM symbols WHERE name = 'MemberService'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        let files = vec![FileInput {
+            relative_path: "src/member.ts".to_string(),
+            language: "typescript".to_string(),
+            size_bytes: 42,
+            symbols: vec![
+                symbol("MemberService", SymbolKind::Class, 500),
+                symbol("findMember", SymbolKind::Function, 600),
+            ],
+        }];
+        reindex(&mut conn, &pid, &files).unwrap();
+
+        let after: String = conn
+            .query_row(
+                "SELECT symbol_key FROM symbols WHERE name = 'MemberService'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, after);
     }
 }

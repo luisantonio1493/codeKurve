@@ -9,4 +9,4 @@ pub mod symbol;
 pub use config::Config;
 pub use error::{Error, Result};
 pub use language::LanguageId;
-pub use symbol::{SourceSpan, Symbol, SymbolKind};
+pub use symbol::{Confidence, Provenance, RelationshipKind, SourceSpan, Symbol, SymbolKind};

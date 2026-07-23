@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use codekurve_analysis::discovery::{self, DiscoveryOptions};
 use codekurve_analysis::extract;
-use codekurve_core::{Config, LanguageId};
+use codekurve_core::{Config, LanguageId, Symbol};
 use codekurve_store::db;
 use codekurve_store::repo::{self, FileInput, StoredSymbol};
 use codekurve_store::Connection;
@@ -27,13 +27,27 @@ pub fn index(root: &Path) -> Result<(), String> {
             parse_errors += 1;
             continue;
         };
-        let symbols = match extract::extract_symbols(&source, file.language) {
-            Ok(symbols) => symbols,
+        let analysis = match extract::analyze(&source, file.language, &file.relative_path) {
+            Ok(analysis) => analysis,
             Err(_) => {
                 parse_errors += 1;
                 continue;
             }
         };
+        // Composition-root mapping: analysis IR -> store's persist-input
+        // type, so `codekurve-store` never depends on `codekurve-analysis`.
+        let symbols: Vec<Symbol> = analysis
+            .symbols
+            .into_iter()
+            .map(|s| Symbol {
+                name: s.name,
+                qualified_name: s.qualified_name,
+                kind: s.kind,
+                language: s.language,
+                span: s.span,
+                parent: s.parent,
+            })
+            .collect();
         files.push(FileInput {
             relative_path: file.relative_path.clone(),
             language: file.language.as_str().to_string(),
