@@ -445,6 +445,12 @@ fn export_default_name(node: Node, source: &[u8]) -> Option<String> {
     None
 }
 
+/// Reason text for a deferred (`PendingRel`) target with zero same-file
+/// candidates. Shared with `resolve.rs` so cross-file resolution (PR4a-2)
+/// can tell a same-file-miss `Exports` edge apart from a module-specifier
+/// re-export without re-parsing.
+pub(crate) const NO_SAME_FILE_MATCH_REASON: &str = "no matching same-file symbol";
+
 /// Resolves every deferred heritage/call/construct/local-export target
 /// against the file's full symbol list, now that forward references are
 /// visible. A same-file
@@ -471,7 +477,7 @@ fn resolve_pending(
                 span: rel.span,
                 provenance: Provenance::Extracted,
                 confidence: Confidence::Unresolved,
-                reason: Some("no matching same-file symbol".to_string()),
+                reason: Some(NO_SAME_FILE_MATCH_REASON.to_string()),
             }),
             [only] => out.push(ExtractedRelationship {
                 source_local_key: rel.source_key,
@@ -501,8 +507,9 @@ fn resolve_pending(
 
 /// Which symbol kinds a relationship kind may target, so a bare-name match
 /// doesn't cross semantic categories (e.g. `new Foo()` must target a class,
-/// not a same-named function).
-fn kind_matches(rel_kind: RelationshipKind, sym_kind: SymbolKind) -> bool {
+/// not a same-named function). `pub(crate)` so `resolve.rs` (PR4a-2) applies
+/// the same rule to cross-file candidates.
+pub(crate) fn kind_matches(rel_kind: RelationshipKind, sym_kind: SymbolKind) -> bool {
     match rel_kind {
         RelationshipKind::Constructs => sym_kind == SymbolKind::Class,
         RelationshipKind::Calls => matches!(

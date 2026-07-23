@@ -7,20 +7,18 @@
 //! by discovery + `extract::analyze`, so no project-root parameter is
 //! needed here (PR4b's pipeline is what makes that file set complete).
 //!
-//! This slice (PR4a-1) ships the whole-project symbol table and module
-//! resolution (§20.2). Reference/call resolution against that table (§20.4)
-//! is PR4a-2, which wires `SymbolTable`'s fields and `resolve_module` into a
-//! `pub fn resolve()` entry point — until then nothing outside this module's
-//! own tests calls them (matches this slice's rollback boundary: delete the
-//! file, nothing else depends on it yet), hence the blanket dead-code
-//! allowance below rather than scattering `#[allow]` per item.
-#![allow(dead_code)]
+//! PR4a-1 shipped the whole-project symbol table and module resolution
+//! (§20.2, still below); this adds reference/call resolution against that
+//! table (§20.4): `resolve()` walks every `Unresolved` edge and either
+//! resolves it to `Global`/`External`, or moves it to
+//! `FileAnalysis.unresolved` when it has zero candidates.
 
 use std::collections::{HashMap, HashSet};
 
-use codekurve_core::{RelationshipKind, SymbolKind};
+use codekurve_core::{Confidence, Provenance, RelationshipKind, SymbolKind};
 
-use crate::ir::{EdgeTarget, FileAnalysis};
+use crate::extract::kind_matches;
+use crate::ir::{EdgeTarget, ExtractedRelationship, FileAnalysis, UnresolvedReference};
 
 /// Minimal `tsconfig.json` `compilerOptions.paths` alias map: prefix (with a
 /// single trailing `*`) -> replacement prefix. Deliberately narrow scope
@@ -224,6 +222,341 @@ fn apply_alias(specifier: &str, aliases: &TsconfigAliases) -> Option<String> {
     None
 }
 
+/// Counts of how many edges resolution produced, for `codekurve index`'s
+/// summary output (PR4b).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ResolutionReport {
+    pub resolved: usize,
+    pub unresolved: usize,
+}
+
+/// Resolves every `EdgeTarget::Unresolved` edge left by `extract::analyze`
+/// against the whole-project `SymbolTable`, in place. Zero-candidate edges
+/// move to `FileAnalysis.unresolved` (never dropped, §18.3); multi-candidate
+/// edges become one Low-confidence edge per candidate (never pick first,
+/// §20.4).
+pub fn resolve(files: &mut [FileAnalysis], aliases: &TsconfigAliases) -> ResolutionReport {
+    let table = SymbolTable::build(&*files);
+    let known_files: HashSet<String> = files.iter().map(|f| f.file.clone()).collect();
+    let mut report = ResolutionReport::default();
+
+    for file in files.iter_mut() {
+        let file_name = file.file.clone();
+        let old_rels = std::mem::take(&mut file.relationships);
+        let mut new_rels = Vec::with_capacity(old_rels.len());
+        for rel in old_rels {
+            resolve_one(
+                &file_name,
+                rel,
+                &table,
+                &known_files,
+                aliases,
+                &mut new_rels,
+                &mut file.unresolved,
+                &mut report,
+            );
+        }
+        file.relationships = new_rels;
+    }
+    report
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_one(
+    file: &str,
+    rel: ExtractedRelationship,
+    table: &SymbolTable,
+    known_files: &HashSet<String>,
+    aliases: &TsconfigAliases,
+    new_rels: &mut Vec<ExtractedRelationship>,
+    unresolved: &mut Vec<UnresolvedReference>,
+    report: &mut ResolutionReport,
+) {
+    let text = match &rel.target {
+        EdgeTarget::Unresolved(t) => t.clone(),
+        _ => {
+            new_rels.push(rel);
+            return;
+        }
+    };
+
+    match rel.kind {
+        RelationshipKind::Imports => resolve_import(
+            file,
+            &rel,
+            &text,
+            table,
+            known_files,
+            aliases,
+            new_rels,
+            unresolved,
+            report,
+        ),
+        RelationshipKind::Exports => resolve_export(
+            file,
+            &rel,
+            &text,
+            table,
+            known_files,
+            aliases,
+            new_rels,
+            unresolved,
+            report,
+        ),
+        RelationshipKind::Calls
+        | RelationshipKind::Constructs
+        | RelationshipKind::Inherits
+        | RelationshipKind::Implements => {
+            resolve_by_name(&rel, &text, table, new_rels, unresolved, report)
+        }
+        // `References`/`Defines`/etc. aren't produced by `extract::analyze`
+        // yet — nothing to resolve, pass through unchanged.
+        _ => new_rels.push(rel),
+    }
+}
+
+/// §20.4 tiers for a project-wide by-name lookup (`Calls`/`Constructs`
+/// same-file misses, `Inherits`/`Implements` same-file misses).
+fn resolve_by_name(
+    rel: &ExtractedRelationship,
+    text: &str,
+    table: &SymbolTable,
+    new_rels: &mut Vec<ExtractedRelationship>,
+    unresolved: &mut Vec<UnresolvedReference>,
+    report: &mut ResolutionReport,
+) {
+    let matches: Vec<&ProjectSymbol> = table
+        .by_name
+        .get(text)
+        .into_iter()
+        .flatten()
+        .filter(|ps| kind_matches(rel.kind, ps.kind))
+        .collect();
+
+    match matches.as_slice() {
+        [] => {
+            unresolved.push(unresolved_ref(rel, text, "no matching symbol in project"));
+            report.unresolved += 1;
+        }
+        [only] => {
+            push_global(
+                new_rels,
+                rel,
+                &only.file,
+                &only.qualified_name,
+                Provenance::Resolved,
+                Confidence::High,
+            );
+            report.resolved += 1;
+        }
+        many => {
+            // Never silently pick one (§20.4/§27.4): one Low-confidence,
+            // Heuristic-provenance edge per candidate — extraction collapses
+            // both `this.foo()`/`obj.foo()` member calls and bare `foo()`
+            // calls to the same by-name target, so a multi-candidate hit is
+            // always a genuine "receiver undeterminable" case here.
+            for candidate in many {
+                push_global(
+                    new_rels,
+                    rel,
+                    &candidate.file,
+                    &candidate.qualified_name,
+                    Provenance::Heuristic,
+                    Confidence::Low,
+                );
+                report.resolved += 1;
+            }
+        }
+    }
+}
+
+/// An `Imports` edge, or an `Exports` edge with a `from` module specifier.
+#[allow(clippy::too_many_arguments)]
+fn resolve_import(
+    file: &str,
+    rel: &ExtractedRelationship,
+    specifier: &str,
+    table: &SymbolTable,
+    known_files: &HashSet<String>,
+    aliases: &TsconfigAliases,
+    new_rels: &mut Vec<ExtractedRelationship>,
+    unresolved: &mut Vec<UnresolvedReference>,
+    report: &mut ResolutionReport,
+) {
+    match resolve_module(file, specifier, known_files, aliases) {
+        ModuleResolution::External(pkg) => {
+            push_external(new_rels, rel, pkg);
+            report.resolved += 1;
+        }
+        ModuleResolution::Unresolved => {
+            unresolved.push(unresolved_ref(
+                rel,
+                specifier,
+                "module not found in project",
+            ));
+            report.unresolved += 1;
+        }
+        ModuleResolution::Project(target_file) => resolve_binding(
+            rel,
+            &target_file,
+            rel.reason.as_deref(),
+            table,
+            new_rels,
+            unresolved,
+            report,
+        ),
+    }
+}
+
+/// An `Exports` edge: either a same-file export with zero local candidates
+/// (extract.rs already searched the file — can never resolve elsewhere), or
+/// a module-specifier re-export (`export { x } from './mod'` / `export *
+/// from './mod'`).
+#[allow(clippy::too_many_arguments)]
+fn resolve_export(
+    file: &str,
+    rel: &ExtractedRelationship,
+    text: &str,
+    table: &SymbolTable,
+    known_files: &HashSet<String>,
+    aliases: &TsconfigAliases,
+    new_rels: &mut Vec<ExtractedRelationship>,
+    unresolved: &mut Vec<UnresolvedReference>,
+    report: &mut ResolutionReport,
+) {
+    if rel.reason.as_deref() == Some(crate::extract::NO_SAME_FILE_MATCH_REASON) {
+        unresolved.push(unresolved_ref(rel, text, "not declared in this file"));
+        report.unresolved += 1;
+        return;
+    }
+
+    match resolve_module(file, text, known_files, aliases) {
+        ModuleResolution::External(pkg) => {
+            push_external(new_rels, rel, pkg);
+            report.resolved += 1;
+        }
+        ModuleResolution::Unresolved => {
+            unresolved.push(unresolved_ref(rel, text, "module not found in project"));
+            report.unresolved += 1;
+        }
+        ModuleResolution::Project(target_file) => resolve_binding(
+            rel,
+            &target_file,
+            rel.reason.as_deref(),
+            table,
+            new_rels,
+            unresolved,
+            report,
+        ),
+    }
+}
+
+/// Resolves a named binding (`Some(name)`), namespace import/blanket
+/// re-export (`Some("*")`/`None`) against a module already resolved to a
+/// project file.
+fn resolve_binding(
+    rel: &ExtractedRelationship,
+    target_file: &str,
+    binding: Option<&str>,
+    table: &SymbolTable,
+    new_rels: &mut Vec<ExtractedRelationship>,
+    unresolved: &mut Vec<UnresolvedReference>,
+    report: &mut ResolutionReport,
+) {
+    match binding {
+        Some("*") | None => {
+            // Namespace import / `export * from`: binds the whole module,
+            // not one symbol — no `Module` symbol kind is emitted yet
+            // (ponytail: add one if per-namespace-member access is needed).
+            push_global(
+                new_rels,
+                rel,
+                target_file,
+                "*",
+                Provenance::Resolved,
+                Confidence::High,
+            );
+            report.resolved += 1;
+        }
+        Some(name) => match table.exports.get(target_file).and_then(|m| m.get(name)) {
+            Some(sym) => {
+                push_global(
+                    new_rels,
+                    rel,
+                    &sym.file,
+                    &sym.qualified_name,
+                    Provenance::Resolved,
+                    Confidence::Exact,
+                );
+                report.resolved += 1;
+            }
+            None => {
+                // A `"default"` reason also lands here: extraction doesn't
+                // tag which local export is the module's `export default`
+                // target (see extract.rs's `collect_exports` doc comment),
+                // so a literal `"default"` key is never present — reported
+                // as unresolved rather than guessed.
+                unresolved.push(unresolved_ref(rel, name, "not exported by target module"));
+                report.unresolved += 1;
+            }
+        },
+    }
+}
+
+fn push_global(
+    new_rels: &mut Vec<ExtractedRelationship>,
+    rel: &ExtractedRelationship,
+    file: &str,
+    qualified_name: &str,
+    provenance: Provenance,
+    confidence: Confidence,
+) {
+    new_rels.push(ExtractedRelationship {
+        source_local_key: rel.source_local_key.clone(),
+        target: EdgeTarget::Global {
+            file: file.to_string(),
+            qualified_name: qualified_name.to_string(),
+        },
+        kind: rel.kind,
+        span: rel.span,
+        provenance,
+        confidence,
+        reason: None,
+    });
+}
+
+fn push_external(
+    new_rels: &mut Vec<ExtractedRelationship>,
+    rel: &ExtractedRelationship,
+    pkg: String,
+) {
+    new_rels.push(ExtractedRelationship {
+        source_local_key: rel.source_local_key.clone(),
+        target: EdgeTarget::External(pkg),
+        kind: rel.kind,
+        span: rel.span,
+        provenance: Provenance::Resolved,
+        confidence: Confidence::Exact,
+        reason: rel.reason.clone(),
+    });
+}
+
+fn unresolved_ref(
+    rel: &ExtractedRelationship,
+    target_text: &str,
+    reason: &str,
+) -> UnresolvedReference {
+    UnresolvedReference {
+        source_local_key: rel.source_local_key.clone(),
+        relationship_kind: rel.kind,
+        target_text: target_text.to_string(),
+        context: rel.reason.clone(),
+        candidate_count: 0,
+        reason: reason.to_string(),
+        confidence: Confidence::Unresolved,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +642,119 @@ mod tests {
         let by_name = table.by_name.get("helper").unwrap();
         assert_eq!(by_name.len(), 1);
         assert_eq!(by_name[0].qualified_name, "src/utils.ts::helper");
+    }
+
+    /// Relative import + implicit extension/`index.*`, end to end through
+    /// `resolve()` (spec "Implicit extension resolution").
+    #[test]
+    fn resolve_named_import_across_files() {
+        let mut files = vec![
+            analyzed("src/app.ts", "import { helper } from './utils';\n"),
+            analyzed("src/utils.ts", "export function helper() {}\n"),
+        ];
+
+        let report = resolve(&mut files, &TsconfigAliases::new());
+        assert_eq!(report.unresolved, 0);
+
+        let edge = files[0].relationships.first().unwrap();
+        assert_eq!(
+            edge.target,
+            EdgeTarget::Global {
+                file: "src/utils.ts".to_string(),
+                qualified_name: "src/utils.ts::helper".to_string(),
+            }
+        );
+        assert_eq!(edge.confidence, Confidence::Exact);
+    }
+
+    /// A bare package specifier resolves to an external node, never an
+    /// `UnresolvedReference` row (spec "External package import").
+    #[test]
+    fn external_package_import_has_no_unresolved_row() {
+        let mut files = vec![analyzed("src/main.ts", "import { z } from 'zod';\n")];
+
+        let report = resolve(&mut files, &TsconfigAliases::new());
+        assert_eq!(report.unresolved, 0);
+        assert!(files[0].unresolved.is_empty());
+        assert_eq!(
+            files[0].relationships.first().unwrap().target,
+            EdgeTarget::External("zod".to_string())
+        );
+    }
+
+    /// A same-file-unresolved `Calls` edge resolves to the single cross-file
+    /// candidate at High confidence (spec-adjacent to "Exact local call").
+    #[test]
+    fn cross_file_call_resolves_to_single_candidate() {
+        let mut files = vec![
+            analyzed("src/caller.ts", "function run() { return doWork(); }\n"),
+            analyzed("src/worker.ts", "export function doWork() { return 1; }\n"),
+        ];
+
+        resolve(&mut files, &TsconfigAliases::new());
+
+        let call = files[0]
+            .relationships
+            .iter()
+            .find(|r| r.kind == RelationshipKind::Calls)
+            .unwrap();
+        assert_eq!(
+            call.target,
+            EdgeTarget::Global {
+                file: "src/worker.ts".to_string(),
+                qualified_name: "src/worker.ts::doWork".to_string(),
+            }
+        );
+        assert_eq!(call.provenance, Provenance::Resolved);
+        assert_eq!(call.confidence, Confidence::High);
+    }
+
+    /// Two cross-file candidates -> two Low-confidence edges, never pick
+    /// one (spec "Multi-candidate call is not unresolved").
+    #[test]
+    fn multi_candidate_call_produces_one_low_confidence_edge_per_candidate() {
+        let mut files = vec![
+            analyzed("src/caller.ts", "function run() { return doWork(); }\n"),
+            analyzed("src/worker1.ts", "export function doWork() { return 1; }\n"),
+            analyzed("src/worker2.ts", "export function doWork() { return 2; }\n"),
+        ];
+
+        let report = resolve(&mut files, &TsconfigAliases::new());
+        assert_eq!(report.unresolved, 0);
+
+        let calls: Vec<_> = files[0]
+            .relationships
+            .iter()
+            .filter(|r| r.kind == RelationshipKind::Calls)
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|r| r.confidence == Confidence::Low));
+        assert!(calls.iter().all(|r| r.provenance == Provenance::Heuristic));
+        assert!(files[0].unresolved.is_empty());
+    }
+
+    /// Zero candidates anywhere in the project -> `UnresolvedReference`,
+    /// never dropped and never left as a relationships-table row (spec
+    /// "Zero-candidate import" principle applies equally to calls).
+    #[test]
+    fn zero_candidate_call_becomes_unresolved_reference() {
+        let mut files = vec![analyzed(
+            "src/lonely.ts",
+            "function run() { return neverDefined(); }\n",
+        )];
+
+        let report = resolve(&mut files, &TsconfigAliases::new());
+        assert_eq!(report.unresolved, 1);
+
+        assert!(!files[0]
+            .relationships
+            .iter()
+            .any(|r| r.kind == RelationshipKind::Calls));
+
+        let unresolved = files[0].unresolved.first().unwrap();
+        assert_eq!(unresolved.relationship_kind, RelationshipKind::Calls);
+        assert_eq!(unresolved.target_text, "neverDefined");
+        assert_eq!(unresolved.candidate_count, 0);
+        assert_eq!(unresolved.confidence, Confidence::Unresolved);
     }
 }
