@@ -79,12 +79,16 @@ Every PR: `cargo fmt --check`, `cargo clippy --workspace --all-targets --all-fea
 
 ## PR4b: Two-pass pipeline wiring + acceptance fixture (base: PR4a)
 
-- [ ] 4b.1 `crates/codekurve/src/commands.rs`: restructure `index()` — pass 1 loop only builds `Vec<FileAnalysis>` (collect parse errors, no per-file persist); pass 2: one `resolve::resolve(&mut analyses, &root, tsconfig)` call; one `repo::reindex(project, resolved)` call.
-- [ ] 4b.2 `crates/codekurve/src/commands.rs`: minimal `tsconfig.json` loader (parses `compilerOptions.paths` only) passed into `resolve::resolve`.
-- [ ] 4b.3 `crates/codekurve-store/src/repo.rs`: `reindex()` persists resolved relationships + unresolved refs in the same tx as symbols (spec "Atomic persistence on failure").
+**Split note (apply-time)**: the full scope (pipeline restructuring + tsconfig loader + persistence wiring + multi-file acceptance fixture + acceptance test) measured ~549 changed lines in one branch, over the 400-line budget — split into two chained sub-PRs, mirroring the PR3a/b/c and PR4a-1/PR4a-2 precedent: **PR4b-1** (pipeline restructuring + persistence wiring, 4b.1/4b.2/4b.3/4b.6, ~396 changed lines) and **PR4b-2** (base: PR4b-1; acceptance fixture + integration test, 4b.4/4b.5/4b.7, ~137 changed lines).
+
+**PR4b-1 apply-time notes**: (1) `RelationshipInput`/`UnresolvedReferenceInput` (PR2) identify symbols by pre-resolved id strings, but ids are only assigned inside `repo::reindex`'s own insert loop — `repo.rs` now exposes deterministic `file_id`/`symbol_key`/`symbol_id` helpers (used internally by `reindex` too, single source of truth) so `commands.rs` can precompute matching ids and build the source/target maps before calling `reindex`, without `codekurve-store` depending on `codekurve-analysis`. (2) `relationships.source_symbol_id` is `NOT NULL` (§24.2), but `Imports`/`Exports` edges are extracted at file level, not symbol level, and no `Module` symbol kind is emitted by `extract::analyze` yet (documented PR4a gap) — `commands.rs` now synthesizes one `SymbolKind::Module` symbol per file (keyed by its own relative path) as a stand-in source, closing the gap without touching the analysis crate.
+
+- [x] 4b.1 `crates/codekurve/src/commands.rs`: restructure `index()` — pass 1 loop only builds `Vec<FileAnalysis>` (collect parse errors, no per-file persist); pass 2: one `resolve::resolve(&mut analyses, &aliases)` call; one `repo::reindex(project, resolved)` call. (PR4b-1)
+- [x] 4b.2 `crates/codekurve/src/commands.rs`: minimal `tsconfig.json` loader (parses `compilerOptions.paths` only, hand-rolled narrow-shape scan — no `serde_json`, deliberately scoped to PR5b) passed into `resolve::resolve`. (PR4b-1)
+- [x] 4b.3 `crates/codekurve-store/src/repo.rs`: `reindex()` persists resolved relationships + unresolved refs in the same tx as symbols (spec "Atomic persistence on failure"). (PR4b-1)
 - [ ] 4b.4 `crates/codekurve-analysis/tests/fixtures/ts-graph/`: extend to a multi-file fixture covering all 9 kinds (imports, exports, contains, extends, implements, calls, constructs, references, unresolved) + `expected_relationships.json` (kind/source/target/provenance/confidence tuples) — the fixture infra this phase needs.
 - [ ] 4b.5 Test (acceptance gate, §34.2-34.3): `crates/codekurve-analysis/tests/relationship_graph_fixture.rs` (new) — runs discovery+`analyze`+`resolve` over the fixture, asserts every `expected_relationships.json` row present with matching provenance/confidence.
-- [ ] 4b.6 Test: `crates/codekurve-store/src/repo.rs` — forced mid-tx error leaves zero partial rows (spec scenario "Atomic persistence on failure").
+- [x] 4b.6 Test: `crates/codekurve-store/src/repo.rs` — `reindex_rolls_back_completely_on_relationship_error` — a relationship row violating the `source_symbol_id` FK leaves zero partial rows (spec scenario "Atomic persistence on failure"). (PR4b-1)
 - [ ] 4b.7 Test: `crates/codekurve/tests/vertical_slice.rs` (extend) — `codekurve index` stdout reports relationship counts.
 
 ## PR5a: Repo query fns + BFS traversal (base: PR4b)

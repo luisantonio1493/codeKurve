@@ -68,6 +68,26 @@ pub struct StoredSymbol {
     pub span: SourceSpan,
 }
 
+/// Deterministic file storage id. Exposed so a caller (the `codekurve`
+/// composition root, PR4b) can precompute relationship source/target ids
+/// before the DB round-trip that `reindex` performs — `reindex` uses this
+/// same function internally, so the two never drift apart.
+pub fn file_id(project_id: &str, relative_path: &str) -> String {
+    hash_id("fil", &format!("{project_id}/{relative_path}"))
+}
+
+/// §16.3: excludes `start_byte` so unrelated edits shifting later byte
+/// offsets don't change unaffected symbols' identity.
+pub fn symbol_key(language: &str, relative_path: &str, kind: &str, qualified_name: &str) -> String {
+    format!("{language}/{relative_path}/{kind}/{qualified_name}")
+}
+
+/// Deterministic symbol storage id from a precomputed `file_id`/`symbol_key`
+/// — see `file_id`'s doc comment.
+pub fn symbol_id(file_id: &str, symbol_key: &str) -> String {
+    hash_id("sym", &format!("{file_id}/{symbol_key}"))
+}
+
 /// Register or update a project by its canonical root path. Returns its id.
 pub fn upsert_project(
     conn: &Connection,
@@ -136,7 +156,7 @@ pub fn reindex(
     };
 
     for file in files {
-        let file_id = hash_id("fil", &format!("{project_id}/{}", file.relative_path));
+        let file_id = file_id(project_id, &file.relative_path);
         tx.execute(
             "INSERT INTO files(id, project_id, relative_path, language, size_bytes,
                  parse_status, generation, created_at, updated_at)
@@ -153,16 +173,13 @@ pub fn reindex(
         outcome.files += 1;
 
         for symbol in &file.symbols {
-            // §16.3: excludes start_byte so unrelated edits shifting later
-            // byte offsets don't change unaffected symbols' identity.
-            let symbol_key = format!(
-                "{}/{}/{}/{}",
+            let symbol_key = symbol_key(
                 symbol.language.as_str(),
-                file.relative_path,
+                &file.relative_path,
                 symbol.kind.as_str(),
-                symbol.qualified_name,
+                &symbol.qualified_name,
             );
-            let symbol_id = hash_id("sym", &format!("{file_id}/{symbol_key}"));
+            let symbol_id = symbol_id(&file_id, &symbol_key);
             let qualified = &symbol.qualified_name;
             tx.execute(
                 "INSERT INTO symbols(id, project_id, file_id, symbol_key, name, qualified_name,
@@ -547,5 +564,52 @@ mod tests {
             .unwrap();
         assert_eq!(kind, "contains");
         assert_eq!(target.as_deref(), Some(target_id.as_str()));
+    }
+
+    /// PR4b task 4b.6 / spec scenario "Atomic persistence on failure": a
+    /// relationship row that violates the `source_symbol_id` foreign key
+    /// mid-transaction must roll back the whole reindex, leaving the
+    /// previous generation's rows untouched rather than a partial write.
+    #[test]
+    fn reindex_rolls_back_completely_on_relationship_error() {
+        let mut conn = seed();
+        let pid = project_id(&conn);
+        let symbols_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+            .unwrap();
+        let files_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+
+        let files = vec![FileInput {
+            relative_path: "src/member.ts".to_string(),
+            language: "typescript".to_string(),
+            size_bytes: 42,
+            symbols: vec![symbol("MemberService", SymbolKind::Class, 0)],
+        }];
+        let bogus_relationships = vec![RelationshipInput {
+            source_symbol_id: "sym-does-not-exist".to_string(),
+            target_symbol_id: None,
+            target_external: None,
+            kind: RelationshipKind::Contains,
+            provenance: Provenance::Extracted,
+            confidence: Confidence::Exact,
+            source_file_id: "fil-does-not-exist".to_string(),
+            start_line: None,
+            start_column: None,
+            reason: None,
+        }];
+
+        let result = reindex(&mut conn, &pid, &files, &bogus_relationships, &[]);
+        assert!(result.is_err());
+
+        let symbols_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+            .unwrap();
+        let files_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(symbols_after, symbols_before);
+        assert_eq!(files_after, files_before);
     }
 }
