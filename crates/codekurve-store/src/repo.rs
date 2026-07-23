@@ -489,4 +489,63 @@ mod tests {
             .unwrap();
         assert_eq!(before, after);
     }
+
+    /// PR3 task 3.3: `persist_relationships` (wired in PR2 with empty vecs)
+    /// stores real same-file edges — the shape PR3's intra-file extraction
+    /// produces once resolved to symbol ids by its caller.
+    #[test]
+    fn persists_and_reads_back_relationships() {
+        let mut conn = seed();
+        let pid = project_id(&conn);
+        let source_id: String = conn
+            .query_row(
+                "SELECT id FROM symbols WHERE name = 'MemberService'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let target_id: String = conn
+            .query_row(
+                "SELECT id FROM symbols WHERE name = 'findMember'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let file_id: String = conn
+            .query_row("SELECT id FROM files LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+
+        let files = vec![FileInput {
+            relative_path: "src/member.ts".to_string(),
+            language: "typescript".to_string(),
+            size_bytes: 42,
+            symbols: vec![
+                symbol("MemberService", SymbolKind::Class, 0),
+                symbol("findMember", SymbolKind::Function, 100),
+            ],
+        }];
+        let relationships = vec![RelationshipInput {
+            source_symbol_id: source_id.clone(),
+            target_symbol_id: Some(target_id.clone()),
+            target_external: None,
+            kind: RelationshipKind::Contains,
+            provenance: Provenance::Extracted,
+            confidence: Confidence::Exact,
+            source_file_id: file_id,
+            start_line: Some(1),
+            start_column: Some(0),
+            reason: None,
+        }];
+        reindex(&mut conn, &pid, &files, &relationships, &[]).unwrap();
+
+        let (kind, target): (String, Option<String>) = conn
+            .query_row(
+                "SELECT kind, target_symbol_id FROM relationships WHERE source_symbol_id = ?1",
+                params![source_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "contains");
+        assert_eq!(target.as_deref(), Some(target_id.as_str()));
+    }
 }
