@@ -48,11 +48,11 @@ Every PR: `cargo fmt --check`, `cargo clippy --workspace --all-targets --all-fea
 
 ## PR2: Migration 0002 (base: PR1)
 
-- [ ] 2.1 `crates/codekurve-store/src/migrations.rs`: add `MIGRATION_0002` (`relationships`, `unresolved_references` DDL + indexes per §24.2/§24.4), bump `SCHEMA_VERSION = 2`, extend `apply()` for the `current < 2` branch.
-- [ ] 2.2 `crates/codekurve-store/src/repo.rs`: add `persist_relationships`/`persist_unresolved` (insert-only, called with empty vecs for now); add `DELETE ... WHERE project_id` for both new tables inside the existing `reindex` tx.
-- [ ] 2.3 `crates/codekurve/src/commands.rs` `doctor()`: report `SCHEMA_VERSION` via a new `codekurve_store::migrations::current_version(&conn)` helper.
-- [ ] 2.4 Test: `crates/codekurve-store/src/migrations.rs` — fresh DB ends at version 2, both tables exist (spec scenario "Fresh database migration").
-- [ ] 2.5 Test: `crates/codekurve/tests/vertical_slice.rs` (extend) — `doctor` stdout contains `[ok] schema: version 2`.
+- [x] 2.1 `crates/codekurve-store/src/migrations.rs`: add `MIGRATION_0002` (`relationships`, `unresolved_references` DDL + indexes per §24.2/§24.4), bump `SCHEMA_VERSION = 2`, extend `apply()` for the `current < 2` branch.
+- [x] 2.2 `crates/codekurve-store/src/repo.rs`: add `persist_relationships`/`persist_unresolved` (insert-only, called with empty vecs for now); add `DELETE ... WHERE project_id` for both new tables inside the existing `reindex` tx.
+- [x] 2.3 `crates/codekurve/src/commands.rs` `doctor()`: report `SCHEMA_VERSION` via a new `codekurve_store::migrations::current_version(&conn)` helper.
+- [x] 2.4 Test: `crates/codekurve-store/src/migrations.rs` — fresh DB ends at version 2, both tables exist (spec scenario "Fresh database migration").
+- [x] 2.5 Test: `crates/codekurve/tests/vertical_slice.rs` (extend) — `doctor` stdout contains `[ok] schema: version 2`.
 
 ## PR3: Intra-file relationship extraction (base: PR2)
 

@@ -5,8 +5,8 @@
 use std::hash::{Hash, Hasher};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use codekurve_core::{SourceSpan, Symbol};
-use rusqlite::{params, Connection, Row};
+use codekurve_core::{Confidence, Provenance, RelationshipKind, SourceSpan, Symbol};
+use rusqlite::{params, Connection, Row, Transaction};
 
 use crate::error::Result;
 
@@ -16,6 +16,38 @@ pub struct FileInput {
     pub language: String,
     pub size_bytes: u64,
     pub symbols: Vec<Symbol>,
+}
+
+/// One relationship edge to persist (§24.2 `relationships`). Ids are
+/// already resolved by the caller — `reindex` only stores rows, it never
+/// looks up or infers a target. ponytail: no caller populates this yet;
+/// intra-file extraction (PR3) and cross-file resolution (PR4b) decide how
+/// ids get resolved before calling `reindex`.
+pub struct RelationshipInput {
+    pub source_symbol_id: String,
+    pub target_symbol_id: Option<String>,
+    pub target_external: Option<String>,
+    pub kind: RelationshipKind,
+    pub provenance: Provenance,
+    pub confidence: Confidence,
+    pub source_file_id: String,
+    pub start_line: Option<u32>,
+    pub start_column: Option<u32>,
+    pub reason: Option<String>,
+}
+
+/// One unresolved reference to persist (§24.2 `unresolved_references`) —
+/// zero-candidate or insufficient-context targets that never become a
+/// `relationships` row (§27.4: never silently pick first).
+pub struct UnresolvedReferenceInput {
+    pub source_symbol_id: Option<String>,
+    pub source_file_id: String,
+    pub relationship_kind: RelationshipKind,
+    pub target_text: String,
+    pub context_json: Option<String>,
+    pub candidate_count: u32,
+    pub reason: String,
+    pub confidence: Confidence,
 }
 
 /// Counts returned by a reindex.
@@ -68,9 +100,21 @@ pub fn reindex(
     conn: &mut Connection,
     project_id: &str,
     files: &[FileInput],
+    relationships: &[RelationshipInput],
+    unresolved: &[UnresolvedReferenceInput],
 ) -> Result<IndexOutcome> {
     let tx = conn.transaction()?;
 
+    // Relationships/unresolved first: they FK-reference symbols/files, so
+    // they must go before those tables are cleared (foreign_keys = ON).
+    tx.execute(
+        "DELETE FROM relationships WHERE project_id = ?1",
+        params![project_id],
+    )?;
+    tx.execute(
+        "DELETE FROM unresolved_references WHERE project_id = ?1",
+        params![project_id],
+    )?;
     tx.execute(
         "DELETE FROM symbols_fts WHERE symbol_id IN
              (SELECT id FROM symbols WHERE project_id = ?1)",
@@ -160,8 +204,75 @@ pub fn reindex(
         }
     }
 
+    persist_relationships(&tx, project_id, &ts, relationships)?;
+    persist_unresolved(&tx, project_id, &ts, unresolved)?;
+
     tx.commit()?;
     Ok(outcome)
+}
+
+fn persist_relationships(
+    tx: &Transaction,
+    project_id: &str,
+    ts: &str,
+    relationships: &[RelationshipInput],
+) -> Result<()> {
+    for (i, rel) in relationships.iter().enumerate() {
+        let id = hash_id("rel", &format!("{project_id}/{}/{i}", rel.source_symbol_id));
+        tx.execute(
+            "INSERT INTO relationships(id, project_id, source_symbol_id, target_symbol_id,
+                 target_external, kind, provenance, confidence, source_file_id,
+                 start_line, start_column, reason, generation, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13, ?13)",
+            params![
+                id,
+                project_id,
+                rel.source_symbol_id,
+                rel.target_symbol_id,
+                rel.target_external,
+                rel.kind.as_str(),
+                rel.provenance.as_str(),
+                rel.confidence.as_str(),
+                rel.source_file_id,
+                rel.start_line,
+                rel.start_column,
+                rel.reason,
+                ts,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn persist_unresolved(
+    tx: &Transaction,
+    project_id: &str,
+    ts: &str,
+    unresolved: &[UnresolvedReferenceInput],
+) -> Result<()> {
+    for (i, u) in unresolved.iter().enumerate() {
+        let id = hash_id("unr", &format!("{project_id}/{}/{i}", u.source_file_id));
+        tx.execute(
+            "INSERT INTO unresolved_references(id, project_id, source_symbol_id, source_file_id,
+                 relationship_kind, target_text, context_json, candidate_count, reason,
+                 confidence, generation, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?11)",
+            params![
+                id,
+                project_id,
+                u.source_symbol_id,
+                u.source_file_id,
+                u.relationship_kind.as_str(),
+                u.target_text,
+                u.context_json,
+                u.candidate_count,
+                u.reason,
+                u.confidence.as_str(),
+                ts,
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 /// Full-text search over symbol name/qualified-name/kind/path (§24.3).
@@ -289,7 +400,7 @@ mod tests {
                 symbol("findMember", SymbolKind::Function, 100),
             ],
         }];
-        let outcome = reindex(&mut conn, &project, &files).unwrap();
+        let outcome = reindex(&mut conn, &project, &files, &[], &[]).unwrap();
         assert_eq!(outcome.files, 1);
         assert_eq!(outcome.symbols, 2);
         conn
@@ -330,7 +441,7 @@ mod tests {
             size_bytes: 42,
             symbols: vec![symbol("MemberService", SymbolKind::Class, 0)],
         }];
-        let outcome = reindex(&mut conn, &pid, &files).unwrap();
+        let outcome = reindex(&mut conn, &pid, &files, &[], &[]).unwrap();
         assert_eq!(outcome.symbols, 1);
         // Old symbols from the first generation are gone.
         let total: i64 = conn
@@ -367,7 +478,7 @@ mod tests {
                 symbol("findMember", SymbolKind::Function, 600),
             ],
         }];
-        reindex(&mut conn, &pid, &files).unwrap();
+        reindex(&mut conn, &pid, &files, &[], &[]).unwrap();
 
         let after: String = conn
             .query_row(

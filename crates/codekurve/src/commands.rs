@@ -66,7 +66,8 @@ pub fn index(root: &Path) -> Result<(), String> {
         &repo::config_hash(&config_text),
     )
     .map_err(|e| e.to_string())?;
-    let outcome = repo::reindex(&mut conn, &project_id, &files).map_err(|e| e.to_string())?;
+    let outcome =
+        repo::reindex(&mut conn, &project_id, &files, &[], &[]).map_err(|e| e.to_string())?;
 
     println!(
         "indexed {} file(s), {} symbol(s){}",
@@ -138,6 +139,19 @@ pub fn doctor(root: &Path) -> Result<(), String> {
     report("sqlite", true, "available (bundled)");
     report("fts5", fts5, if fts5 { "available" } else { "MISSING" });
     ok &= fts5;
+
+    let version =
+        codekurve_store::migrations::current_version(&probe).map_err(|e| e.to_string())?;
+    let schema_ok = version == codekurve_store::migrations::SCHEMA_VERSION;
+    report(
+        "schema",
+        schema_ok,
+        &format!(
+            "version {version} (expected {})",
+            codekurve_store::migrations::SCHEMA_VERSION
+        ),
+    );
+    ok &= schema_ok;
 
     match root.canonicalize() {
         Ok(root) => {
