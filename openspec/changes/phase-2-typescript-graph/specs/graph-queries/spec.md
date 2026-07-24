@@ -1,0 +1,91 @@
+# Graph Queries Specification
+
+## Purpose
+
+Six hand-rolled CLI commands (no clap) that query the relationship graph built by `relationship-graph`: references, callers, callees, implementations, trace, impact (plan §26, §27, §50).
+
+## Requirements
+
+### Requirement: Six Graph Query Commands
+
+The CLI MUST expose `references`, `callers`, `callees`, `implementations`, `trace`, and `impact`, each supporting `--json`, `--root`, `--limit`, `--offset`, and, where applicable, `--depth` and `--min-confidence` (§27.2).
+
+#### Scenario: Callers of a symbol
+
+- GIVEN an indexed project where `MemberService.getEligibility` is called from two files
+- WHEN `codekurve callers --symbol-id <id>` runs
+- THEN the command returns both call sites with each edge's confidence and provenance
+
+#### Scenario: Min-confidence filter
+
+- GIVEN a symbol with both `Exact` and `Low` confidence callers
+- WHEN `codekurve callers --symbol-id <id> --min-confidence high` runs
+- THEN only `Exact`/`High` confidence callers are returned
+
+### Requirement: Ambiguous Symbol Resolution Exits 6
+
+If a query targets a symbol by name and multiple symbols match, the command MUST exit code 6, list every candidate with its qualified name, and MUST NOT silently pick the first match (§27.4).
+
+#### Scenario: Ambiguous name lookup
+
+- GIVEN two symbols both named `getEligibility` in different classes
+- WHEN `codekurve references getEligibility` runs (no `--symbol-id`)
+- THEN the command exits with code 6 and prints both candidates, instructing the user to pass `--symbol-id` or a qualified name
+
+#### Scenario: Qualified name disambiguates
+
+- GIVEN the same ambiguous name
+- WHEN the command is run with the full qualified name instead
+- THEN it resolves to exactly one symbol and exits 0
+
+### Requirement: Missing Index Exits 4
+
+Any of the six commands run against a project with no completed index run MUST exit code 4 with a message directing the user to run `codekurve index`.
+
+#### Scenario: Query before first index
+
+- GIVEN a project directory with no prior `codekurve index` run
+- WHEN `codekurve trace --from A --to B` runs
+- THEN the command exits code 4 and does not attempt a query
+
+### Requirement: Trace Path Traversal
+
+`trace` MUST perform bounded BFS between two symbols honoring `--depth`, `allowed_edge_types`, and `min_confidence`, and MUST set `truncated: true` with a `reason` when any limit (depth, nodes, edges, time budget) is hit (§26.4, §50.3).
+
+#### Scenario: Path found within depth
+
+- GIVEN symbols A and B connected by 2 calls edges
+- WHEN `codekurve trace --from A --to B --depth 5` runs
+- THEN the command returns the path with `truncated: false`
+
+#### Scenario: Depth limit exceeded
+
+- GIVEN the shortest path between A and B requires 6 hops
+- WHEN `codekurve trace --from A --to B --depth 3` runs
+- THEN no path is returned and the result reports `truncated: true`, `reason: max_depth`
+
+### Requirement: Impact Analysis
+
+`impact` MUST perform bounded reverse graph traversal from a symbol, labeling results "potential impact" (never guaranteed), grouping by file/module, and stating why each node is included (§26.5).
+
+#### Scenario: Reverse dependency chain
+
+- GIVEN `IMemberService` is implemented by `MemberService`, which is injected by `EligibilityController`
+- WHEN `codekurve impact --symbol-id <IMemberService-id>` runs
+- THEN the result includes both nodes with an explanation of the edge kind connecting each to the target
+
+#### Scenario: Impact truncation
+
+- GIVEN a symbol whose reverse graph exceeds the configured max-nodes limit
+- WHEN `impact` runs
+- THEN the result includes `truncated: true` and the partial result set, never a silently incomplete answer presented as complete
+
+### Requirement: Versioned JSON Output
+
+With `--json`, every command MUST emit the §27.5 envelope: `schema_version`, `project`, `result`, `warnings`, `truncated`.
+
+#### Scenario: JSON envelope shape
+
+- GIVEN any successful query with `--json`
+- WHEN the command completes
+- THEN stdout is a single JSON object containing all five envelope fields
