@@ -10,12 +10,29 @@ use codekurve_analysis::discovery::{self, DiscoveryOptions};
 use codekurve_analysis::extract;
 use codekurve_analysis::ir::{EdgeTarget, FileAnalysis};
 use codekurve_analysis::resolve::{self, TsconfigAliases};
-use codekurve_core::{Config, LanguageId, SourceSpan, Symbol, SymbolKind};
+use codekurve_core::{Confidence, Config, LanguageId, SourceSpan, Symbol, SymbolKind};
 use codekurve_store::db;
 use codekurve_store::repo::{
     self, FileInput, RelationshipInput, StoredSymbol, UnresolvedReferenceInput,
 };
 use codekurve_store::Connection;
+
+/// Structured CLI error (§27, spec "Ambiguous name lookup"/"Query before
+/// first index"): code 1 = generic failure — `From<String>` keeps every
+/// pre-PR5b command (`index`/`search`/`symbol`/`doctor`) working unchanged;
+/// code 4 = no completed index run; code 6 = ambiguous bare-name lookup.
+/// Lands in `commands.rs` only, per design.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandError {
+    pub code: u8,
+    pub message: String,
+}
+
+impl From<String> for CommandError {
+    fn from(message: String) -> Self {
+        Self { code: 1, message }
+    }
+}
 
 /// `codekurve index --root <path>` — two-pass pipeline (design §22): pass 1
 /// parses every discovered file in isolation; pass 2 resolves every edge
@@ -430,6 +447,251 @@ pub fn doctor(root: &Path) -> Result<(), String> {
 fn report(check: &str, ok: bool, detail: &str) {
     let mark = if ok { "ok" } else { "FAIL" };
     println!("[{mark}] {check}: {detail}");
+}
+
+/// Shared parameters for the four relationship-list graph-query commands
+/// (§27.2): one query subject via `symbol_id` (used verbatim) or
+/// `symbol_name` (bare or qualified, resolved through [`resolve_symbol`]),
+/// plus `min_confidence`/`limit`/`offset`/`json`. `trace`/`impact` (BFS
+/// traversal, PR5b-2) extend this shape with `depth`.
+pub struct QueryArgs<'a> {
+    pub root: &'a Path,
+    pub symbol_id: Option<&'a str>,
+    pub symbol_name: Option<&'a str>,
+    pub min_confidence: Option<&'a str>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub json: bool,
+}
+
+/// `codekurve references --symbol-id <id>|--symbol-name <name> --root <path>`
+pub fn references(args: &QueryArgs) -> Result<(), CommandError> {
+    relationship_command(args, repo::references)
+}
+
+/// `codekurve callers --symbol-id <id>|--symbol-name <name> --root <path>`
+pub fn callers(args: &QueryArgs) -> Result<(), CommandError> {
+    relationship_command(args, repo::callers)
+}
+
+/// `codekurve callees --symbol-id <id>|--symbol-name <name> --root <path>`
+pub fn callees(args: &QueryArgs) -> Result<(), CommandError> {
+    relationship_command(args, repo::callees)
+}
+
+/// `codekurve implementations --symbol-id <id>|--symbol-name <name> --root <path>`
+pub fn implementations(args: &QueryArgs) -> Result<(), CommandError> {
+    relationship_command(args, repo::implementations)
+}
+
+type RelationshipQueryFn = fn(
+    &Connection,
+    &str,
+    &str,
+    Option<Confidence>,
+) -> codekurve_store::Result<Vec<repo::StoredRelationship>>;
+
+/// Shared body of `references`/`callers`/`callees`/`implementations`: resolve
+/// the project + subject symbol, run the single indexed SELECT (§5a.1),
+/// paginate, then print either plain text or the §27.5 JSON envelope.
+fn relationship_command(args: &QueryArgs, query: RelationshipQueryFn) -> Result<(), CommandError> {
+    let (_, config, conn, project_id) = require_indexed_project(args.root)?;
+    let symbol_id = resolve_symbol(&conn, &project_id, args.symbol_id, args.symbol_name)?;
+    let min_confidence = parse_confidence(args.min_confidence)?;
+
+    let mut rows = query(&conn, &project_id, &symbol_id, min_confidence)
+        .map_err(|e| CommandError::from(e.to_string()))?;
+    let total = rows.len();
+    paginate(&mut rows, args.limit, args.offset);
+    let truncated = total > args.offset.unwrap_or(0) + rows.len();
+
+    if args.json {
+        let result = serde_json::Value::Array(rows.iter().map(relationship_json).collect());
+        print_envelope(&config.project.name, result, Vec::new(), truncated);
+    } else {
+        print_relationships(&rows);
+    }
+    Ok(())
+}
+
+/// Every graph-query command's preamble (spec "Query before first index"):
+/// resolve `root`, load config, open the DB, find the project row — any
+/// failure here means "no completed index run", always exit code 4.
+fn require_indexed_project(
+    root: &Path,
+) -> Result<(PathBuf, Config, Connection, String), CommandError> {
+    let root = canonicalize(root).map_err(|e| CommandError {
+        code: 4,
+        message: e,
+    })?;
+    let config = load_config(&root).map_err(|e| CommandError {
+        code: 4,
+        message: e,
+    })?;
+    let conn = open_existing_db(&root, &config).map_err(|e| CommandError {
+        code: 4,
+        message: e,
+    })?;
+    let pid = project_id(&conn, &root).map_err(|e| CommandError {
+        code: 4,
+        message: e,
+    })?;
+    Ok((root, config, conn, pid))
+}
+
+/// Resolves one query subject. `--symbol-id` is used verbatim (already
+/// disambiguated). `--symbol-name` accepts either a bare name — ambiguous
+/// matches (>1 candidate) become `CommandError{code:6}` listing every
+/// candidate's qualified name/kind/path (spec "Ambiguous name lookup"), never
+/// silently picking one — or a full qualified name (`path::Name` /
+/// `path::Class.method`), which narrows to exactly one match (spec
+/// "Qualified name disambiguates") by looking up the bare identifier tail
+/// then filtering candidates down to the exact qualified-name match.
+fn resolve_symbol(
+    conn: &Connection,
+    project_id: &str,
+    symbol_id: Option<&str>,
+    symbol_name: Option<&str>,
+) -> Result<String, CommandError> {
+    if let Some(id) = symbol_id {
+        return Ok(id.to_string());
+    }
+    let name = symbol_name.ok_or_else(|| CommandError {
+        code: 1,
+        message: "expected --symbol-id or --symbol-name".to_string(),
+    })?;
+
+    let is_qualified = name.contains("::");
+    let bare = if is_qualified { bare_name(name) } else { name };
+    let candidates = repo::find_candidates_by_name(conn, project_id, bare)
+        .map_err(|e| CommandError::from(e.to_string()))?;
+
+    if is_qualified {
+        return candidates
+            .into_iter()
+            .find(|c| c.qualified_name == name)
+            .map(|c| c.id)
+            .ok_or_else(|| CommandError {
+                code: 1,
+                message: format!("no symbol matching qualified name {name:?}"),
+            });
+    }
+    match candidates.len() {
+        0 => Err(CommandError {
+            code: 1,
+            message: format!("no symbol named {name:?}"),
+        }),
+        1 => Ok(candidates[0].id.clone()),
+        _ => Err(CommandError {
+            code: 6,
+            message: ambiguous_message(name, &candidates),
+        }),
+    }
+}
+
+/// The bare identifier tail of a qualified name (`path::Class.method` ->
+/// `method`; `path::name` -> `name`), matching what `symbols.name` stores.
+fn bare_name(qualified: &str) -> &str {
+    let local = qualified.rsplit("::").next().unwrap_or(qualified);
+    local.rsplit('.').next().unwrap_or(local)
+}
+
+fn ambiguous_message(name: &str, candidates: &[repo::SymbolCandidate]) -> String {
+    let mut message = format!("ambiguous symbol name {name:?}, candidates:");
+    for c in candidates {
+        message.push_str(&format!(
+            "\n  {} ({}) [{}]",
+            c.qualified_name, c.kind, c.relative_path
+        ));
+    }
+    message
+}
+
+fn parse_confidence(raw: Option<&str>) -> Result<Option<Confidence>, CommandError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match raw {
+        "exact" => Ok(Some(Confidence::Exact)),
+        "high" => Ok(Some(Confidence::High)),
+        "medium" => Ok(Some(Confidence::Medium)),
+        "low" => Ok(Some(Confidence::Low)),
+        "unresolved" => Ok(Some(Confidence::Unresolved)),
+        other => Err(CommandError {
+            code: 1,
+            message: format!("unknown --min-confidence value: {other:?}"),
+        }),
+    }
+}
+
+/// ponytail: applies to the four flat relationship-list commands only —
+/// `trace`/`impact`'s BFS result (a path plus a reached-set) isn't a
+/// page-able list in the same sense, so they don't call this.
+fn paginate<T>(rows: &mut Vec<T>, limit: Option<usize>, offset: Option<usize>) {
+    if let Some(offset) = offset {
+        let drop_n = offset.min(rows.len());
+        rows.drain(0..drop_n);
+    }
+    if let Some(limit) = limit {
+        rows.truncate(limit);
+    }
+}
+
+fn relationship_json(r: &repo::StoredRelationship) -> serde_json::Value {
+    serde_json::json!({
+        "source_symbol_id": r.source_symbol_id,
+        "source_qualified_name": r.source_qualified_name,
+        "target_symbol_id": r.target_symbol_id,
+        "target_qualified_name": r.target_qualified_name,
+        "target_external": r.target_external,
+        "kind": r.kind,
+        "provenance": r.provenance,
+        "confidence": r.confidence,
+        "start_line": r.start_line,
+        "start_column": r.start_column,
+    })
+}
+
+fn print_relationships(rows: &[repo::StoredRelationship]) {
+    if rows.is_empty() {
+        println!("no results");
+        return;
+    }
+    for r in rows {
+        let target = r
+            .target_qualified_name
+            .as_deref()
+            .or(r.target_external.as_deref())
+            .unwrap_or("?");
+        println!(
+            "{} -> {}  [{}, {}, {}]  {}:{}",
+            r.source_qualified_name,
+            target,
+            r.kind,
+            r.confidence,
+            r.provenance,
+            r.start_line.unwrap_or(0),
+            r.start_column.unwrap_or(0)
+        );
+    }
+}
+
+/// §27.5 JSON envelope: `schema_version`, `project`, `result`, `warnings`,
+/// `truncated` — every field, every command, every time.
+fn print_envelope(
+    project: &str,
+    result: serde_json::Value,
+    warnings: Vec<String>,
+    truncated: bool,
+) {
+    let envelope = serde_json::json!({
+        "schema_version": 1,
+        "project": project,
+        "result": result,
+        "warnings": warnings,
+        "truncated": truncated,
+    });
+    println!("{envelope}");
 }
 
 fn discovery_options(config: &Config) -> DiscoveryOptions {

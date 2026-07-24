@@ -92,6 +92,7 @@ dependencies = [
  "codekurve-core",
  "codekurve-store",
  "predicates",
+ "serde_json",
  "tempfile",
 ]
 

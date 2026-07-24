@@ -7,9 +7,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use cli::Args;
+use commands::CommandError;
 
-const USAGE: &str =
-    "usage: codekurve <version|init|index|search|symbol|doctor> [args] [--root <path>]";
+const USAGE: &str = "usage: codekurve <version|init|index|search|symbol|doctor|references|callers|\
+callees|implementations> [args] [--root <path>]";
 
 fn main() -> ExitCode {
     let mut raw = std::env::args().skip(1);
@@ -19,22 +20,30 @@ fn main() -> ExitCode {
     };
     let args = Args::parse(raw);
 
-    let result = match command.as_str() {
+    let result: Result<(), CommandError> = match command.as_str() {
         "version" => {
             println!("codekurve {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
-        "init" => run_init(&args),
-        "index" => commands::index(&args.root),
+        "init" => run_init(&args).map_err(CommandError::from),
+        "index" => commands::index(&args.root).map_err(CommandError::from),
         "search" => match args.positional(0) {
-            Some(query) => commands::search(&args.root, query),
-            None => Err("usage: codekurve search <query> [--root <path>]".to_string()),
+            Some(query) => commands::search(&args.root, query).map_err(CommandError::from),
+            None => Err(usage_error(
+                "usage: codekurve search <query> [--root <path>]",
+            )),
         },
         "symbol" => match args.positional(0) {
-            Some(name) => commands::symbol(&args.root, name),
-            None => Err("usage: codekurve symbol <name> [--root <path>]".to_string()),
+            Some(name) => commands::symbol(&args.root, name).map_err(CommandError::from),
+            None => Err(usage_error(
+                "usage: codekurve symbol <name> [--root <path>]",
+            )),
         },
-        "doctor" => commands::doctor(&args.root),
+        "doctor" => commands::doctor(&args.root).map_err(CommandError::from),
+        "references" => commands::references(&query_args(&args)),
+        "callers" => commands::callers(&query_args(&args)),
+        "callees" => commands::callees(&query_args(&args)),
+        "implementations" => commands::implementations(&query_args(&args)),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -43,10 +52,30 @@ fn main() -> ExitCode {
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(message) => {
-            eprintln!("error: {message}");
-            ExitCode::FAILURE
+        Err(e) => {
+            eprintln!("error: {}", e.message);
+            ExitCode::from(e.code)
         }
+    }
+}
+
+/// A CLI usage mistake (missing required positional) — same code-1 bucket as
+/// every other pre-PR5b error, not a graph-query-specific failure.
+fn usage_error(message: &str) -> CommandError {
+    CommandError::from(message.to_string())
+}
+
+/// Translates the raw string flags in `cli::Args` into the graph-query
+/// commands' shared, typed [`commands::QueryArgs`].
+fn query_args(args: &Args) -> commands::QueryArgs<'_> {
+    commands::QueryArgs {
+        root: &args.root,
+        symbol_id: args.symbol_id.as_deref(),
+        symbol_name: args.symbol_name.as_deref(),
+        min_confidence: args.min_confidence.as_deref(),
+        limit: args.limit,
+        offset: args.offset,
+        json: args.json,
     }
 }
 
