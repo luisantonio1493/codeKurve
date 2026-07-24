@@ -93,13 +93,15 @@ Every PR: `cargo fmt --check`, `cargo clippy --workspace --all-targets --all-fea
 - [x] 4b.6 Test: `crates/codekurve-store/src/repo.rs` — `reindex_rolls_back_completely_on_relationship_error` — a relationship row violating the `source_symbol_id` FK leaves zero partial rows (spec scenario "Atomic persistence on failure"). (PR4b-1)
 - [x] 4b.7 Test: `crates/codekurve/tests/vertical_slice.rs` (extend) — `codekurve index` stdout contains `2 relationship(s), 0 unresolved` for the vertical-slice fixture. (PR4b-2)
 
-## PR5a: Repo query fns + BFS traversal (base: PR4b)
+## PR5a: Repo query fns + BFS traversal (base: PR4b2)
 
-- [ ] 5a.1 `crates/codekurve-store/src/repo.rs`: add `references`/`callers`/`callees`(kind=Calls)/`implementations`(kind=Implements|Inherits) — single indexed SELECTs, filterable by `min_confidence`.
-- [ ] 5a.2 `crates/codekurve-store/src/traverse.rs` (new): `load_adjacency(project_id) -> HashMap<SymbolId, Vec<Edge>>`; `bfs()` forward (trace) and reverse (impact) with depth/node/edge/time caps + `Truncated{reason}`.
-- [ ] 5a.3 `crates/codekurve-store/src/repo.rs`: `find_candidates_by_name` — all matches with qualified_name, for CLI ambiguity handling (PR5b).
-- [ ] 5a.4 Test: `repo.rs` — callers/callees/references/implementations against seeded relationships (spec scenarios "Callers of a symbol", "Min-confidence filter").
-- [ ] 5a.5 Test: `traverse.rs` — path found within depth (scenario "Path found within depth"); depth exceeded → `truncated:true, reason:max_depth` (scenario "Depth limit exceeded"); reverse impact truncation (scenario "Impact truncation").
+**Split note (apply-time)**: measured ~805 changed lines in one branch (repo.rs 366 + traverse.rs 438 new), clearly over the 400-line budget — split into two chained sub-PRs mirroring the PR3a/b/c, PR4a-1/PR4a-2, and PR4b-1/PR4b-2 precedent: **PR5a-1** (repo.rs query fns, 5a.1/5a.3/5a.4, 366 changed lines, base PR4b-2) and **PR5a-2** (base: PR5a-1; `traverse.rs` BFS, 5a.2/5a.5, 438 changed lines).
+
+- [x] 5a.1 `crates/codekurve-store/src/repo.rs`: add `references`/`callers`/`callees`(kind=Calls)/`implementations`(kind=Implements|Inherits) — single indexed SELECTs, filterable by `min_confidence`. (PR5a-1)
+- [ ] 5a.2 `crates/codekurve-store/src/traverse.rs` (new): `load_adjacency(project_id) -> HashMap<SymbolId, Vec<Edge>>`; `bfs()` forward (trace) and reverse (impact) with depth/node/edge/time caps + `Truncated{reason}`. (PR5a-2)
+- [x] 5a.3 `crates/codekurve-store/src/repo.rs`: `find_candidates_by_name` — all matches with qualified_name, for CLI ambiguity handling (PR5b). (PR5a-1)
+- [x] 5a.4 Test: `repo.rs` — callers/callees/references/implementations against seeded relationships (spec scenarios "Callers of a symbol", "Min-confidence filter"). (PR5a-1)
+- [ ] 5a.5 Test: `traverse.rs` — path found within depth (scenario "Path found within depth"); depth exceeded → `truncated:true, reason:max_depth` (scenario "Depth limit exceeded"); reverse impact truncation (scenario "Impact truncation"). (PR5a-2)
 
 ## PR5b: CLI query commands (base: PR5a)
 

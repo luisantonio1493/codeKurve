@@ -292,6 +292,208 @@ fn persist_unresolved(
     Ok(())
 }
 
+/// A relationship edge as read back from storage, with both endpoints'
+/// qualified names already joined — the `references`/`callers`/`callees`/
+/// `implementations` display model (mirrors `StoredSymbol`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredRelationship {
+    pub source_symbol_id: String,
+    pub source_qualified_name: String,
+    pub target_symbol_id: Option<String>,
+    pub target_qualified_name: Option<String>,
+    pub target_external: Option<String>,
+    pub kind: String,
+    pub provenance: String,
+    pub confidence: String,
+    pub start_line: Option<u32>,
+    pub start_column: Option<u32>,
+}
+
+/// A bare-name match for CLI ambiguity handling (§27.4): a bare-name query
+/// hitting more than one symbol must list every candidate's id + qualified
+/// name, never silently pick one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolCandidate {
+    pub id: String,
+    pub qualified_name: String,
+    pub kind: String,
+    pub relative_path: String,
+}
+
+/// Relative confidence ordering for `--min-confidence` filtering — higher is
+/// stricter, matching declaration order in §17.5 (Exact > High > Medium >
+/// Low > Unresolved). A free fn over raw strings, not the `Confidence` enum,
+/// because stored rows read `confidence` back as text (`pub(crate)`: reused
+/// by `traverse.rs`'s BFS edge filtering).
+pub(crate) fn confidence_rank(s: &str) -> u8 {
+    match s {
+        "exact" => 4,
+        "high" => 3,
+        "medium" => 2,
+        "low" => 1,
+        _ => 0, // "unresolved" or unrecognized
+    }
+}
+
+/// All relationships that target `symbol_id`, any kind — "who references
+/// this symbol" (the `references` CLI command, PR5b).
+pub fn references(
+    conn: &Connection,
+    project_id: &str,
+    symbol_id: &str,
+    min_confidence: Option<Confidence>,
+) -> Result<Vec<StoredRelationship>> {
+    query_relationships(
+        conn,
+        "target_symbol_id",
+        project_id,
+        symbol_id,
+        &[],
+        min_confidence,
+    )
+}
+
+/// Call sites that call `symbol_id` (`kind = calls`, target = the callee) —
+/// the `callers` CLI command.
+pub fn callers(
+    conn: &Connection,
+    project_id: &str,
+    symbol_id: &str,
+    min_confidence: Option<Confidence>,
+) -> Result<Vec<StoredRelationship>> {
+    query_relationships(
+        conn,
+        "target_symbol_id",
+        project_id,
+        symbol_id,
+        &[RelationshipKind::Calls],
+        min_confidence,
+    )
+}
+
+/// Calls made *by* `symbol_id` (`kind = calls`, source = the caller) — the
+/// `callees` CLI command.
+pub fn callees(
+    conn: &Connection,
+    project_id: &str,
+    symbol_id: &str,
+    min_confidence: Option<Confidence>,
+) -> Result<Vec<StoredRelationship>> {
+    query_relationships(
+        conn,
+        "source_symbol_id",
+        project_id,
+        symbol_id,
+        &[RelationshipKind::Calls],
+        min_confidence,
+    )
+}
+
+/// Symbols that `implements` or `inherits`/`extends` `symbol_id` — the
+/// `implementations` CLI command.
+pub fn implementations(
+    conn: &Connection,
+    project_id: &str,
+    symbol_id: &str,
+    min_confidence: Option<Confidence>,
+) -> Result<Vec<StoredRelationship>> {
+    query_relationships(
+        conn,
+        "target_symbol_id",
+        project_id,
+        symbol_id,
+        &[RelationshipKind::Implements, RelationshipKind::Inherits],
+        min_confidence,
+    )
+}
+
+/// Shared query behind `references`/`callers`/`callees`/`implementations`:
+/// one indexed SELECT (`idx_relationships_source_kind`/`_target_kind` covers
+/// `column = ?` [`AND kind IN (...)`]) joined to both endpoints' symbol rows
+/// for display, then an in-memory `min_confidence` filter (row counts per
+/// symbol are small; no need for a second query or SQL rank `CASE`).
+fn query_relationships(
+    conn: &Connection,
+    column: &'static str,
+    project_id: &str,
+    symbol_id: &str,
+    kinds: &[RelationshipKind],
+    min_confidence: Option<Confidence>,
+) -> Result<Vec<StoredRelationship>> {
+    let kind_filter = if kinds.is_empty() {
+        String::new()
+    } else {
+        let placeholders = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        format!(" AND r.kind IN ({placeholders})")
+    };
+    let sql = format!(
+        "SELECT r.source_symbol_id, src.qualified_name, r.target_symbol_id, tgt.qualified_name,
+                r.target_external, r.kind, r.provenance, r.confidence, r.start_line, r.start_column
+         FROM relationships r
+         JOIN symbols src ON src.id = r.source_symbol_id
+         LEFT JOIN symbols tgt ON tgt.id = r.target_symbol_id
+         WHERE r.project_id = ? AND r.{column} = ?{kind_filter}
+         ORDER BY r.start_line"
+    );
+    let mut binds: Vec<&str> = vec![project_id, symbol_id];
+    binds.extend(kinds.iter().map(|k| k.as_str()));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(binds.iter().copied()),
+        map_relationship,
+    )?;
+    let mut result = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    if let Some(min) = min_confidence {
+        let threshold = confidence_rank(min.as_str());
+        result.retain(|r| confidence_rank(&r.confidence) >= threshold);
+    }
+    Ok(result)
+}
+
+fn map_relationship(row: &Row) -> rusqlite::Result<StoredRelationship> {
+    Ok(StoredRelationship {
+        source_symbol_id: row.get(0)?,
+        source_qualified_name: row.get(1)?,
+        target_symbol_id: row.get(2)?,
+        target_qualified_name: row.get(3)?,
+        target_external: row.get(4)?,
+        kind: row.get(5)?,
+        provenance: row.get(6)?,
+        confidence: row.get(7)?,
+        start_line: row.get::<_, Option<i64>>(8)?.map(|v| v as u32),
+        start_column: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
+    })
+}
+
+/// All symbols named `name`, for CLI bare-name ambiguity handling (§27.4).
+/// `find_by_name` already lists exact-name matches for the `symbol` command
+/// but doesn't expose `id` — the graph query commands need it to resolve
+/// `--symbol-name` into a concrete `--symbol-id` (or list candidates + exit
+/// 6 when there's more than one).
+pub fn find_candidates_by_name(
+    conn: &Connection,
+    project_id: &str,
+    name: &str,
+) -> Result<Vec<SymbolCandidate>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.id, s.qualified_name, s.kind, f.relative_path
+         FROM symbols s
+         JOIN files f ON f.id = s.file_id
+         WHERE s.project_id = ?1 AND s.name = ?2
+         ORDER BY s.qualified_name",
+    )?;
+    let rows = stmt.query_map(params![project_id, name], |row| {
+        Ok(SymbolCandidate {
+            id: row.get(0)?,
+            qualified_name: row.get(1)?,
+            kind: row.get(2)?,
+            relative_path: row.get(3)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Full-text search over symbol name/qualified-name/kind/path (§24.3).
 pub fn search(
     conn: &Connection,
@@ -611,5 +813,169 @@ mod tests {
             .unwrap();
         assert_eq!(symbols_after, symbols_before);
         assert_eq!(files_after, files_before);
+    }
+
+    /// The `IMemberService`/`MemberService`/`findMember`/
+    /// `EligibilityController` fixture shared by PR5a's graph-query tests.
+    fn graph_files() -> Vec<FileInput> {
+        vec![FileInput {
+            relative_path: "src/member.ts".to_string(),
+            language: "typescript".to_string(),
+            size_bytes: 42,
+            symbols: vec![
+                symbol("IMemberService", SymbolKind::Interface, 0),
+                symbol("MemberService", SymbolKind::Class, 50),
+                symbol("findMember", SymbolKind::Function, 100),
+                symbol("EligibilityController", SymbolKind::Class, 150),
+            ],
+        }]
+    }
+
+    /// Seeds `graph_files()` (no relationships yet) for PR5a's
+    /// `references`/`callers`/`callees`/`implementations` tests (task 5a.4).
+    fn seed_graph() -> (Connection, String, String, String, String, String) {
+        let mut conn = db::open_in_memory().unwrap();
+        let project = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        reindex(&mut conn, &project, &graph_files(), &[], &[]).unwrap();
+
+        let get = |n: &str| -> String {
+            conn.query_row("SELECT id FROM symbols WHERE name = ?1", params![n], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        let (interface, class, function, controller) = (
+            get("IMemberService"),
+            get("MemberService"),
+            get("findMember"),
+            get("EligibilityController"),
+        );
+        (conn, project, interface, class, function, controller)
+    }
+
+    /// PR5a task 5a.4 / spec scenario "Callers of a symbol": two call sites
+    /// (one Exact, one Low-confidence) both come back via `callers`, with
+    /// confidence/provenance intact — and via `references`/`callees` from
+    /// the other side of the same edges.
+    #[test]
+    fn callers_of_a_symbol() {
+        let (mut conn, pid, interface, class, function, controller) = seed_graph();
+        let file_id: String = conn
+            .query_row("SELECT id FROM files LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+
+        let relationships = vec![
+            RelationshipInput {
+                source_symbol_id: class.clone(),
+                target_symbol_id: Some(interface.clone()),
+                target_external: None,
+                kind: RelationshipKind::Implements,
+                provenance: Provenance::Extracted,
+                confidence: Confidence::High,
+                source_file_id: file_id.clone(),
+                start_line: Some(1),
+                start_column: Some(0),
+                reason: None,
+            },
+            RelationshipInput {
+                source_symbol_id: controller.clone(),
+                target_symbol_id: Some(function.clone()),
+                target_external: None,
+                kind: RelationshipKind::Calls,
+                provenance: Provenance::Extracted,
+                confidence: Confidence::Exact,
+                source_file_id: file_id.clone(),
+                start_line: Some(5),
+                start_column: Some(2),
+                reason: None,
+            },
+            RelationshipInput {
+                source_symbol_id: class.clone(),
+                target_symbol_id: Some(function.clone()),
+                target_external: None,
+                kind: RelationshipKind::Calls,
+                provenance: Provenance::Heuristic,
+                confidence: Confidence::Low,
+                source_file_id: file_id,
+                start_line: Some(9),
+                start_column: Some(2),
+                reason: Some("ambiguous receiver".to_string()),
+            },
+        ];
+        reindex(&mut conn, &pid, &graph_files(), &relationships, &[]).unwrap();
+
+        let calls_to_function = callers(&conn, &pid, &function, None).unwrap();
+        assert_eq!(calls_to_function.len(), 2);
+        assert!(calls_to_function.iter().all(|r| r.kind == "calls"));
+        assert!(calls_to_function.iter().any(|r| r.confidence == "exact"));
+        assert!(calls_to_function.iter().any(|r| r.confidence == "low"));
+
+        let calls_from_controller = callees(&conn, &pid, &controller, None).unwrap();
+        assert_eq!(calls_from_controller.len(), 1);
+        assert_eq!(calls_from_controller[0].confidence, "exact");
+
+        let implementers = implementations(&conn, &pid, &interface, None).unwrap();
+        assert_eq!(implementers.len(), 1);
+        assert_eq!(implementers[0].kind, "implements");
+        assert_eq!(implementers[0].source_symbol_id, class);
+
+        // `references` is kind-agnostic: the one edge targeting the
+        // interface (Implements) comes back even though it's not a call.
+        let refs_to_interface = references(&conn, &pid, &interface, None).unwrap();
+        assert_eq!(refs_to_interface.len(), 1);
+        assert_eq!(refs_to_interface[0].kind, "implements");
+    }
+
+    /// Spec scenario "Min-confidence filter": `--min-confidence high` keeps
+    /// only Exact/High callers, dropping the Low-confidence one.
+    #[test]
+    fn min_confidence_filter() {
+        let (mut conn, pid, _interface, class, function, controller) = seed_graph();
+        let file_id: String = conn
+            .query_row("SELECT id FROM files LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let relationships = vec![
+            RelationshipInput {
+                source_symbol_id: controller,
+                target_symbol_id: Some(function.clone()),
+                target_external: None,
+                kind: RelationshipKind::Calls,
+                provenance: Provenance::Extracted,
+                confidence: Confidence::Exact,
+                source_file_id: file_id.clone(),
+                start_line: Some(5),
+                start_column: Some(2),
+                reason: None,
+            },
+            RelationshipInput {
+                source_symbol_id: class,
+                target_symbol_id: Some(function.clone()),
+                target_external: None,
+                kind: RelationshipKind::Calls,
+                provenance: Provenance::Heuristic,
+                confidence: Confidence::Low,
+                source_file_id: file_id,
+                start_line: Some(9),
+                start_column: Some(2),
+                reason: Some("ambiguous receiver".to_string()),
+            },
+        ];
+        reindex(&mut conn, &pid, &graph_files(), &relationships, &[]).unwrap();
+
+        let filtered = callers(&conn, &pid, &function, Some(Confidence::High)).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].confidence, "exact");
+    }
+
+    /// Task 5a.3: bare-name lookups return every candidate with its id
+    /// (needed to resolve `--symbol-name` before a graph query), never just
+    /// the first match.
+    #[test]
+    fn find_candidates_by_name_lists_every_match() {
+        let (conn, pid, interface, ..) = seed_graph();
+        let hits = find_candidates_by_name(&conn, &pid, "IMemberService").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, interface);
+        assert_eq!(hits[0].qualified_name, "src/member.ts::IMemberService");
     }
 }
