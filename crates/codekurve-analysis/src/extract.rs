@@ -103,6 +103,22 @@ fn collect(node: Node, parent: Option<&str>, scope: Option<&str>, ctx: &mut Coll
             }
             return;
         }
+        "interface_declaration" => {
+            // Falls through to the shared recursion below (no early
+            // `return`) — interface members (`property_signature`/
+            // `method_signature`) aren't extracted as symbols in this phase,
+            // only the interface itself, so it can be a resolution target
+            // for `implements` clauses (spec "Class extends and implements").
+            push_named(
+                node,
+                source,
+                language,
+                relative_path,
+                SymbolKind::Interface,
+                parent,
+                &mut ctx.out,
+            );
+        }
         "method_definition" if parent.is_some() => {
             let Some(class_name) = parent else { return };
             let kind = method_kind(node, source);
@@ -183,6 +199,21 @@ fn collect(node: Node, parent: Option<&str>, scope: Option<&str>, ctx: &mut Coll
                 ctx.pending.push(PendingRel {
                     source_key: source_key.to_string(),
                     kind: RelationshipKind::Constructs,
+                    target_name,
+                    span: span_of(node),
+                });
+            }
+        }
+        // A type annotation (`: Foo`) on a variable/parameter/return type
+        // that names a real declared type — not a primitive, union, or
+        // other compound form (kept intentionally narrow). Falls through to
+        // the shared recursion below; nothing further needs custom handling
+        // inside a `type_annotation` node.
+        "type_annotation" => {
+            if let Some(target_name) = referenced_type_name(node, source) {
+                ctx.pending.push(PendingRel {
+                    source_key: reference_scope(parent, scope, relative_path),
+                    kind: RelationshipKind::References,
                     target_name,
                     span: span_of(node),
                 });
@@ -519,6 +550,12 @@ pub(crate) fn kind_matches(rel_kind: RelationshipKind, sym_kind: SymbolKind) -> 
         RelationshipKind::Inherits | RelationshipKind::Implements => {
             matches!(sym_kind, SymbolKind::Class | SymbolKind::Interface)
         }
+        RelationshipKind::References => {
+            matches!(
+                sym_kind,
+                SymbolKind::Class | SymbolKind::Interface | SymbolKind::TypeAlias
+            )
+        }
         RelationshipKind::Exports => {
             matches!(
                 sym_kind,
@@ -575,6 +612,30 @@ fn type_name(node: Node, source: &[u8]) -> Option<String> {
             .map(str::to_string),
         _ => node.utf8_text(source).ok().map(str::to_string),
     }
+}
+
+/// The plain named-type target of a `type_annotation` (`: Foo`), when it's a
+/// simple type reference. Deliberately narrow — primitives (`string`,
+/// `number`, ...), unions, and generics (`Array<Foo>`) are skipped so
+/// `References` edges only ever target a real declared type, not TypeScript
+/// built-ins or compound type expressions.
+fn referenced_type_name(node: Node, source: &[u8]) -> Option<String> {
+    let ty = node.named_child(0)?;
+    if ty.kind() == "type_identifier" {
+        return ty.utf8_text(source).ok().map(str::to_string);
+    }
+    None
+}
+
+/// The best-effort enclosing symbol for a `References` edge: the innermost
+/// function/method scope (parameter/return type), else the enclosing class
+/// (a field's type annotation), else the file itself (a top-level
+/// variable's type annotation).
+fn reference_scope(parent: Option<&str>, scope: Option<&str>, relative_path: &str) -> String {
+    scope
+        .map(str::to_string)
+        .or_else(|| parent.map(|p| qualified_name(relative_path, None, p)))
+        .unwrap_or_else(|| relative_path.to_string())
 }
 
 /// A function is top-level when it sits directly under the module, optionally
@@ -822,5 +883,57 @@ function alsoTop() {
             EdgeTarget::Local("src/widget.ts::Widget".to_string())
         );
         assert_eq!(construct.confidence, Confidence::Exact);
+    }
+
+    /// An `interface_declaration` is extracted as a `SymbolKind::Interface`
+    /// symbol, and a same-file `implements` clause now resolves to it
+    /// (spec "Class extends and implements" — the in-project case).
+    #[test]
+    fn interface_is_extracted_and_implements_resolves_locally() {
+        let source = "interface IFoo {}\nclass Foo implements IFoo {}\n";
+        let analysis = analyze(source, LanguageId::TypeScript, "src/iface.ts").unwrap();
+
+        let iface = analysis
+            .symbols
+            .iter()
+            .find(|s| s.name == "IFoo")
+            .expect("IFoo extracted as a symbol");
+        assert_eq!(iface.kind, SymbolKind::Interface);
+
+        let implements = analysis
+            .relationships
+            .iter()
+            .find(|r| r.kind == RelationshipKind::Implements)
+            .unwrap();
+        assert_eq!(
+            implements.target,
+            EdgeTarget::Local("src/iface.ts::IFoo".to_string())
+        );
+        assert_eq!(implements.confidence, Confidence::Exact);
+    }
+
+    /// A parameter/return type annotation naming a real declared type emits
+    /// a `References` edge (spec "Relationship Kind Extraction" — `Foo` is
+    /// one of the MUST-extracted kinds); a primitive type (`string`) does
+    /// not.
+    #[test]
+    fn type_annotation_emits_references_edge() {
+        let source =
+            "class Widget {}\nfunction build(): Widget { return new Widget(); }\nfunction id(x: string): string { return x; }\n";
+        let analysis = analyze(source, LanguageId::TypeScript, "src/refs.ts").unwrap();
+
+        let references: Vec<&ExtractedRelationship> = analysis
+            .relationships
+            .iter()
+            .filter(|r| r.kind == RelationshipKind::References)
+            .collect();
+        assert_eq!(references.len(), 1, "only Widget is a real type reference");
+        let reference = references[0];
+        assert_eq!(reference.source_local_key, "src/refs.ts::build");
+        assert_eq!(
+            reference.target,
+            EdgeTarget::Local("src/refs.ts::Widget".to_string())
+        );
+        assert_eq!(reference.confidence, Confidence::Exact);
     }
 }

@@ -4,13 +4,14 @@
 //! kind, one specific cross-file edge, and that an intentionally-unresolved
 //! reference is recorded rather than dropped (§18.3).
 //!
-//! `RelationshipKind::References` is never emitted by `extract::analyze` in
-//! this phase (no code path produces it yet) — not exercised here.
-//! `Implements` is deliberately never satisfied by this fixture either: no
-//! `Interface` symbols are extracted anywhere in this phase (a pre-existing
-//! gap, not introduced by PR4b), so `implements IFoo` doubles as this
-//! fixture's "real" unresolved-reference scenario rather than a known-gap
-//! path (default export / namespace import) being relied on.
+//! `base.ts` declares `IFoo` as a real interface, so `app.ts`'s
+//! `implements IFoo` resolves to a `Resolved`-provenance edge, matching spec
+//! scenario "Class extends and implements" (fixed post-verify remediation —
+//! previously this fixture asserted the opposite, that `Implements` never
+//! resolves, contradicting that scenario). `app.ts::build`'s `: Base` return
+//! type annotation also exercises the `References` kind, resolving
+//! cross-file to `base.ts::Base`. The only remaining unresolved reference is
+//! `./nonexistent` (spec "Zero-candidate import").
 
 use std::collections::HashMap;
 use std::fs;
@@ -51,13 +52,46 @@ fn multi_file_project_resolves_across_files() {
     assert_eq!(counts.get(&RelationshipKind::Calls), Some(&2));
     assert_eq!(counts.get(&RelationshipKind::Constructs), Some(&1));
     assert_eq!(counts.get(&RelationshipKind::Imports), Some(&2));
-    // `implements IFoo` never resolves to a `relationships` row (see module
-    // doc comment) — it lands in `unresolved` instead, asserted below.
-    assert!(!counts.contains_key(&RelationshipKind::Implements));
+    // `implements IFoo` now resolves — `base.ts` declares a real `IFoo`
+    // interface (spec "Class extends and implements", in-project case).
+    assert_eq!(counts.get(&RelationshipKind::Implements), Some(&1));
+    // `build(): Base` return type annotation (spec "Relationship Kind
+    // Extraction" — `references` is a MUST-extracted kind).
+    assert_eq!(counts.get(&RelationshipKind::References), Some(&1));
+
+    let app = analyses.iter().find(|a| a.file == "app.ts").unwrap();
+    let implements = app
+        .relationships
+        .iter()
+        .find(|r| r.kind == RelationshipKind::Implements)
+        .expect("implements edge resolves now that IFoo is a real interface");
+    assert_eq!(
+        implements.target,
+        EdgeTarget::Global {
+            file: "base.ts".to_string(),
+            qualified_name: "base.ts::IFoo".to_string(),
+        }
+    );
+    assert_eq!(implements.provenance, Provenance::Resolved);
+    assert_eq!(implements.confidence, Confidence::High);
+
+    let references = app
+        .relationships
+        .iter()
+        .find(|r| r.kind == RelationshipKind::References)
+        .expect("build()'s return type resolves to base.ts::Base");
+    assert_eq!(
+        references.target,
+        EdgeTarget::Global {
+            file: "base.ts".to_string(),
+            qualified_name: "base.ts::Base".to_string(),
+        }
+    );
+    assert_eq!(references.provenance, Provenance::Resolved);
+    assert_eq!(references.confidence, Confidence::High);
 
     // A specific cross-file edge: `helper()` called from `app.ts::Foo.run`
     // resolves to `utils.ts`'s exported `helper` function.
-    let app = analyses.iter().find(|a| a.file == "app.ts").unwrap();
     let cross_file_call = app
         .relationships
         .iter()
@@ -77,21 +111,16 @@ fn multi_file_project_resolves_across_files() {
     assert_eq!(cross_file_call.provenance, Provenance::Resolved);
     assert_eq!(cross_file_call.confidence, Confidence::High);
 
-    // Unresolved references are recorded, never dropped (§18.3): the
-    // `implements IFoo` heritage clause and the `./nonexistent` import.
+    // Unresolved references are recorded, never dropped (§18.3): now only
+    // the `./nonexistent` import — `implements IFoo` resolves above.
     let unresolved: Vec<_> = analyses.iter().flat_map(|a| a.unresolved.iter()).collect();
-    assert_eq!(unresolved.len(), 2);
-    assert!(unresolved
-        .iter()
-        .any(|u| u.relationship_kind == RelationshipKind::Implements
-            && u.target_text == "IFoo"
-            && u.candidate_count == 0));
+    assert_eq!(unresolved.len(), 1);
     assert!(unresolved
         .iter()
         .any(|u| u.relationship_kind == RelationshipKind::Imports
             && u.target_text == "./nonexistent"
             && u.candidate_count == 0));
 
-    assert_eq!(report.resolved, 5);
-    assert_eq!(report.unresolved, 2);
+    assert_eq!(report.resolved, 7);
+    assert_eq!(report.unresolved, 1);
 }

@@ -21,12 +21,13 @@ fn vertical_slice_init_index_search_symbol() {
         .arg(root)
         .assert()
         .success()
-        // `MemberService` contains `find` (Contains) and
-        // `createMemberService` constructs `MemberService` in the same file
-        // (Constructs, resolves Exact): 2 relationships, 0 unresolved.
+        // `MemberService` contains `find` (Contains), `createMemberService`
+        // constructs `MemberService` in the same file (Constructs, resolves
+        // Exact), and its `: MemberService` return type also references it
+        // (References, resolves Exact): 3 relationships, 0 unresolved.
         .stdout(
             predicate::str::contains("symbol")
-                .and(predicate::str::contains("2 relationship(s), 0 unresolved")),
+                .and(predicate::str::contains("3 relationship(s), 0 unresolved")),
         );
 
     ck().arg("search")

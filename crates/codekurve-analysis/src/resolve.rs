@@ -306,11 +306,13 @@ fn resolve_one(
         RelationshipKind::Calls
         | RelationshipKind::Constructs
         | RelationshipKind::Inherits
-        | RelationshipKind::Implements => {
+        | RelationshipKind::Implements
+        | RelationshipKind::References => {
             resolve_by_name(&rel, &text, table, new_rels, unresolved, report)
         }
-        // `References`/`Defines`/etc. aren't produced by `extract::analyze`
-        // yet — nothing to resolve, pass through unchanged.
+        // `Defines`/`Overrides`/`UsesType`/`Reads`/`Writes` aren't produced
+        // by `extract::analyze` yet — nothing to resolve, pass through
+        // unchanged.
         _ => new_rels.push(rel),
     }
 }

@@ -5,3 +5,5 @@ class Base {
 }
 
 export { Base };
+
+export interface IFoo {}
