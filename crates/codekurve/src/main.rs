@@ -10,7 +10,7 @@ use cli::Args;
 use commands::CommandError;
 
 const USAGE: &str = "usage: codekurve <version|init|index|search|symbol|doctor|references|callers|\
-callees|implementations> [args] [--root <path>]";
+callees|implementations|trace|impact> [args] [--root <path>]";
 
 fn main() -> ExitCode {
     let mut raw = std::env::args().skip(1);
@@ -44,6 +44,13 @@ fn main() -> ExitCode {
         "callers" => commands::callers(&query_args(&args)),
         "callees" => commands::callees(&query_args(&args)),
         "implementations" => commands::implementations(&query_args(&args)),
+        "impact" => commands::impact(&query_args(&args)),
+        "trace" => match args.positional(0) {
+            Some(to) => commands::trace(&query_args(&args), to),
+            None => Err(usage_error(
+                "usage: codekurve trace <to> [--symbol-id <id>|--symbol-name <name>] [--root <path>]",
+            )),
+        },
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -65,7 +72,7 @@ fn usage_error(message: &str) -> CommandError {
     CommandError::from(message.to_string())
 }
 
-/// Translates the raw string flags in `cli::Args` into the graph-query
+/// Translates the raw string flags in `cli::Args` into the six graph-query
 /// commands' shared, typed [`commands::QueryArgs`].
 fn query_args(args: &Args) -> commands::QueryArgs<'_> {
     commands::QueryArgs {
@@ -73,6 +80,7 @@ fn query_args(args: &Args) -> commands::QueryArgs<'_> {
         symbol_id: args.symbol_id.as_deref(),
         symbol_name: args.symbol_name.as_deref(),
         min_confidence: args.min_confidence.as_deref(),
+        depth: args.depth,
         limit: args.limit,
         offset: args.offset,
         json: args.json,

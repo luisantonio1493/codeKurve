@@ -5,12 +5,12 @@ use std::path::PathBuf;
 
 /// Parsed positional arguments and flags. Pre-PR5b commands only ever read
 /// `positionals`/`root`; the graph-query commands (§27.2) additionally read
-/// `min_confidence`/`json`/`symbol_id`/`symbol_name`/`limit`/`offset` — a
-/// `--depth` flag (`trace`/`impact`-only) lands in PR5b-2 alongside those
-/// commands.
+/// `min_confidence`/`json`/`symbol_id`/`symbol_name`/`limit`/`offset`, and
+/// `trace`/`impact` (PR5b-2) also read `depth`.
 pub struct Args {
     pub positionals: Vec<String>,
     pub root: PathBuf,
+    pub depth: Option<u32>,
     pub min_confidence: Option<String>,
     pub json: bool,
     pub symbol_id: Option<String>,
@@ -23,6 +23,7 @@ impl Args {
     pub fn parse<I: Iterator<Item = String>>(args: I) -> Self {
         let mut positionals = Vec::new();
         let mut root = PathBuf::from(".");
+        let mut depth = None;
         let mut min_confidence = None;
         let mut json = false;
         let mut symbol_id = None;
@@ -33,6 +34,7 @@ impl Args {
         while let Some(arg) = iter.next() {
             match arg.as_str() {
                 "--root" => root = iter.next().map_or(root, PathBuf::from),
+                "--depth" => depth = iter.next().and_then(|v| v.parse().ok()),
                 "--min-confidence" => min_confidence = iter.next(),
                 "--json" => json = true,
                 "--symbol-id" => symbol_id = iter.next(),
@@ -45,6 +47,7 @@ impl Args {
         Self {
             positionals,
             root,
+            depth,
             min_confidence,
             json,
             symbol_id,

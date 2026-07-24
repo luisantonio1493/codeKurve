@@ -1,10 +1,6 @@
-//! End-to-end coverage for the graph-query CLI commands (PR5b). PR5b-1 wires
-//! `references`/`callers`/`callees`/`implementations` and covers their two
-//! symbol-resolution scenarios here; PR5b-2 extends this file with
-//! `trace`/`impact`, the missing-index exit code, and the JSON envelope
-//! shape (shared preamble/printer code, exercised once the full command set
-//! lands). Fixture layout gives every scenario a controlled, deliberately
-//! ambiguous symbol name:
+//! End-to-end coverage for the six graph-query CLI commands (PR5b, §26/§27).
+//! Fixture layout gives every scenario a controlled, deliberately ambiguous
+//! symbol name:
 //! - `src/a.ts::getEligibility` — same-file caller `callLocal` (Exact,
 //!   extracted) + a cross-file ambiguous caller (Low, heuristic) via
 //!   `src/c.ts::callAmbiguous`, which calls the bare (unimported)
@@ -90,4 +86,83 @@ fn bare_name_ambiguity_exits_6_with_both_candidates() {
             predicate::str::contains("src/a.ts::getEligibility")
                 .and(predicate::str::contains("src/b.ts::getEligibility")),
         );
+}
+
+/// Spec "Query before first index": no prior `codekurve index` run -> exit
+/// 4, no query attempted.
+#[test]
+fn query_before_index_exits_4() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    ck().arg("init").arg(root).assert().success();
+
+    ck().arg("callers")
+        .arg("--symbol-name")
+        .arg("getEligibility")
+        .arg("--root")
+        .arg(root)
+        .assert()
+        .code(4);
+}
+
+/// Spec "JSON envelope shape": `--json` output is one JSON object with all
+/// five §27.5 fields.
+#[test]
+fn json_output_has_all_envelope_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    seed_project(root);
+
+    let output = ck()
+        .arg("callers")
+        .arg("--symbol-name")
+        .arg("src/a.ts::getEligibility")
+        .arg("--json")
+        .arg("--root")
+        .arg(root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let obj = envelope
+        .as_object()
+        .expect("envelope must be a JSON object");
+    for field in [
+        "schema_version",
+        "project",
+        "result",
+        "warnings",
+        "truncated",
+    ] {
+        assert!(obj.contains_key(field), "missing envelope field {field:?}");
+    }
+}
+
+/// `trace`/`impact` share the same BFS-backed envelope and command
+/// preamble; a smoke test that both run end to end without requiring a
+/// specific reachable path (fixture has no multi-hop chain).
+#[test]
+fn trace_and_impact_run_end_to_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    seed_project(root);
+
+    ck().arg("trace")
+        .arg("src/a.ts::getEligibility")
+        .arg("--symbol-name")
+        .arg("src/a.ts::callLocal")
+        .arg("--root")
+        .arg(root)
+        .assert()
+        .success();
+
+    ck().arg("impact")
+        .arg("--symbol-name")
+        .arg("src/a.ts::getEligibility")
+        .arg("--root")
+        .arg(root)
+        .assert()
+        .success();
 }

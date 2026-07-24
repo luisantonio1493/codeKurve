@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use codekurve_analysis::discovery::{self, DiscoveryOptions};
 use codekurve_analysis::extract;
@@ -15,7 +16,7 @@ use codekurve_store::db;
 use codekurve_store::repo::{
     self, FileInput, RelationshipInput, StoredSymbol, UnresolvedReferenceInput,
 };
-use codekurve_store::Connection;
+use codekurve_store::{traverse, Connection};
 
 /// Structured CLI error (§27, spec "Ambiguous name lookup"/"Query before
 /// first index"): code 1 = generic failure — `From<String>` keeps every
@@ -449,16 +450,23 @@ fn report(check: &str, ok: bool, detail: &str) {
     println!("[{mark}] {check}: {detail}");
 }
 
-/// Shared parameters for the four relationship-list graph-query commands
-/// (§27.2): one query subject via `symbol_id` (used verbatim) or
-/// `symbol_name` (bare or qualified, resolved through [`resolve_symbol`]),
-/// plus `min_confidence`/`limit`/`offset`/`json`. `trace`/`impact` (BFS
-/// traversal, PR5b-2) extend this shape with `depth`.
+const DEFAULT_MAX_DEPTH: u32 = 10;
+const DEFAULT_MAX_NODES: usize = 500;
+const DEFAULT_MAX_EDGES: usize = 2000;
+const DEFAULT_MAX_DURATION: Duration = Duration::from_secs(5);
+
+/// Shared parameters for the six graph-query commands (§27.2): one query
+/// subject via `symbol_id` (used verbatim) or `symbol_name` (bare or
+/// qualified, resolved through [`resolve_symbol`]), plus
+/// `min_confidence`/`depth`/`limit`/`offset`/`json`. `trace`'s second
+/// (target) symbol isn't part of this shared shape — it's a positional CLI
+/// argument, resolved the same way in [`trace`].
 pub struct QueryArgs<'a> {
     pub root: &'a Path,
     pub symbol_id: Option<&'a str>,
     pub symbol_name: Option<&'a str>,
     pub min_confidence: Option<&'a str>,
+    pub depth: Option<u32>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub json: bool,
@@ -512,6 +520,69 @@ fn relationship_command(args: &QueryArgs, query: RelationshipQueryFn) -> Result<
         print_relationships(&rows);
     }
     Ok(())
+}
+
+/// `codekurve trace <to> --symbol-id <id>|--symbol-name <from> --root <path>`
+/// — bounded forward BFS (§26.4) from the resolved source symbol to `to`,
+/// also resolved through [`resolve_symbol`] (an ambiguous target exits 6
+/// exactly like an ambiguous source).
+pub fn trace(args: &QueryArgs, to: &str) -> Result<(), CommandError> {
+    let (_, config, conn, project_id) = require_indexed_project(args.root)?;
+    let from = resolve_symbol(&conn, &project_id, args.symbol_id, args.symbol_name)?;
+    let target = resolve_symbol(&conn, &project_id, None, Some(to))?;
+    let min_confidence = parse_confidence(args.min_confidence)?;
+
+    let adjacency = traverse::load_adjacency(&conn, &project_id, false)
+        .map_err(|e| CommandError::from(e.to_string()))?;
+    let caps = bfs_caps(args.depth);
+    let outcome = traverse::bfs(
+        &adjacency,
+        &from,
+        Some(&target),
+        &caps,
+        None,
+        min_confidence,
+    );
+
+    if args.json {
+        let result = trace_json(&outcome);
+        print_envelope(&config.project.name, result, Vec::new(), outcome.truncated);
+    } else {
+        print_trace_result(&outcome, &target);
+    }
+    Ok(())
+}
+
+/// `codekurve impact --symbol-id <id>|--symbol-name <name> --root <path>` —
+/// bounded reverse BFS (§26.5): everything that potentially depends on the
+/// resolved symbol, never guaranteed, truncated rather than silently
+/// incomplete.
+pub fn impact(args: &QueryArgs) -> Result<(), CommandError> {
+    let (_, config, conn, project_id) = require_indexed_project(args.root)?;
+    let symbol_id = resolve_symbol(&conn, &project_id, args.symbol_id, args.symbol_name)?;
+    let min_confidence = parse_confidence(args.min_confidence)?;
+
+    let adjacency = traverse::load_adjacency(&conn, &project_id, true)
+        .map_err(|e| CommandError::from(e.to_string()))?;
+    let caps = bfs_caps(args.depth);
+    let outcome = traverse::bfs(&adjacency, &symbol_id, None, &caps, None, min_confidence);
+
+    if args.json {
+        let result = trace_json(&outcome);
+        print_envelope(&config.project.name, result, Vec::new(), outcome.truncated);
+    } else {
+        print_impact_result(&outcome);
+    }
+    Ok(())
+}
+
+fn bfs_caps(depth: Option<u32>) -> traverse::BfsCaps {
+    traverse::BfsCaps {
+        max_depth: depth.unwrap_or(DEFAULT_MAX_DEPTH),
+        max_nodes: DEFAULT_MAX_NODES,
+        max_edges: DEFAULT_MAX_EDGES,
+        max_duration: DEFAULT_MAX_DURATION,
+    }
 }
 
 /// Every graph-query command's preamble (spec "Query before first index"):
@@ -672,6 +743,77 @@ fn print_relationships(rows: &[repo::StoredRelationship]) {
             r.provenance,
             r.start_line.unwrap_or(0),
             r.start_column.unwrap_or(0)
+        );
+    }
+}
+
+fn edge_json(e: &traverse::Edge) -> serde_json::Value {
+    serde_json::json!({
+        "neighbor_symbol_id": e.neighbor_symbol_id,
+        "kind": e.kind,
+        "confidence": e.confidence,
+        "provenance": e.provenance,
+    })
+}
+
+fn reached_json(r: &traverse::Reached) -> serde_json::Value {
+    serde_json::json!({
+        "symbol_id": r.symbol_id,
+        "depth": r.depth,
+        "via": r.via.as_ref().map(edge_json),
+        "predecessor": r.predecessor,
+    })
+}
+
+fn trace_json(outcome: &traverse::BfsOutcome) -> serde_json::Value {
+    serde_json::json!({
+        "path": outcome.path.as_ref().map(|p| p.iter().map(edge_json).collect::<Vec<_>>()),
+        "reached": outcome.reached.iter().map(reached_json).collect::<Vec<_>>(),
+        "truncated_reason": outcome.truncated_reason.map(truncation_reason_str),
+    })
+}
+
+fn truncation_reason_str(r: traverse::TruncationReason) -> &'static str {
+    match r {
+        traverse::TruncationReason::MaxDepth => "max_depth",
+        traverse::TruncationReason::MaxNodes => "max_nodes",
+        traverse::TruncationReason::MaxEdges => "max_edges",
+        traverse::TruncationReason::MaxDuration => "max_duration",
+    }
+}
+
+fn print_trace_result(outcome: &traverse::BfsOutcome, target: &str) {
+    match &outcome.path {
+        Some(path) => {
+            println!("path to {target} found ({} hop(s)):", path.len());
+            for edge in path {
+                println!(
+                    "  -> {} [{}, {}]",
+                    edge.neighbor_symbol_id, edge.kind, edge.confidence
+                );
+            }
+        }
+        None => println!("no path to {target} found within the given caps"),
+    }
+    print_truncation(outcome);
+}
+
+fn print_impact_result(outcome: &traverse::BfsOutcome) {
+    println!("{} node(s) reached", outcome.reached.len());
+    for r in &outcome.reached {
+        println!("  {} (depth {})", r.symbol_id, r.depth);
+    }
+    print_truncation(outcome);
+}
+
+fn print_truncation(outcome: &traverse::BfsOutcome) {
+    if outcome.truncated {
+        println!(
+            "truncated: {}",
+            outcome
+                .truncated_reason
+                .map(truncation_reason_str)
+                .unwrap_or("unknown")
         );
     }
 }
