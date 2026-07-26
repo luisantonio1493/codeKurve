@@ -2,7 +2,6 @@
 //! rebuild its index transactionally, and query symbols. See
 //! CODEKURVE_MASTER_PLAN.md §24 (schema) and §Fase 1 (scope).
 
-use std::hash::{Hash, Hasher};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use codekurve_core::{Confidence, Provenance, RelationshipKind, SourceSpan, Symbol};
@@ -544,12 +543,16 @@ pub fn find_by_name(conn: &Connection, project_id: &str, name: &str) -> Result<V
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Stable content hash of the config text. ponytail: DefaultHasher is a
-/// placeholder; BLAKE3 replaces it when hashing lands in Phase 3.
+/// Stable BLAKE3 content hash of the config text.
 pub fn config_hash(config_text: &str) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    config_text.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    blake3::hash(config_text.as_bytes()).to_hex().to_string()
+}
+
+/// BLAKE3 content hash of a file's bytes (Phase 3: `files.content_hash`,
+/// the change-detection engine's confirm step after the mtime/size fast
+/// path).
+pub fn content_hash(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
 }
 
 fn map_stored(row: &Row) -> rusqlite::Result<StoredSymbol> {
@@ -571,9 +574,10 @@ fn map_stored(row: &Row) -> rusqlite::Result<StoredSymbol> {
 }
 
 fn hash_id(prefix: &str, input: &str) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    input.hash(&mut hasher);
-    format!("{prefix}-{:016x}", hasher.finish())
+    format!(
+        "{prefix}-{}",
+        &blake3::hash(input.as_bytes()).to_hex()[..32]
+    )
 }
 
 fn now_ts() -> String {
@@ -965,6 +969,35 @@ mod tests {
         let filtered = callers(&conn, &pid, &function, Some(Confidence::High)).unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].confidence, "exact");
+    }
+
+    /// PR1 task 1.5: BLAKE3-backed ids are stable (same input, same output
+    /// across repeated calls) and correctly shaped (32 lowercase hex chars,
+    /// prefixed) — `hash_id`/`config_hash`/`content_hash` all funnel through
+    /// `blake3::hash`, so `file_id` is enough to pin the shared behavior.
+    #[test]
+    fn blake3_ids_are_stable() {
+        let a = file_id("prj-1", "src/member.ts");
+        let b = file_id("prj-1", "src/member.ts");
+        assert_eq!(a, b);
+        assert!(a.starts_with("fil-"));
+        let hex = &a["fil-".len()..];
+        assert_eq!(hex.len(), 32);
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Different input must not collide with the fixture above.
+        let c = file_id("prj-1", "src/other.ts");
+        assert_ne!(a, c);
+    }
+
+    /// `config_hash`/`content_hash` are likewise stable and non-empty.
+    #[test]
+    fn config_and_content_hash_are_stable() {
+        assert_eq!(config_hash("hello"), config_hash("hello"));
+        assert_ne!(config_hash("hello"), config_hash("world"));
+        assert_eq!(content_hash(b"hello"), content_hash(b"hello"));
+        assert_ne!(content_hash(b"hello"), content_hash(b"world"));
+        assert_eq!(content_hash(b"hello").len(), 64); // full BLAKE3 hex digest
     }
 
     /// Task 5a.3: bare-name lookups return every candidate with its id

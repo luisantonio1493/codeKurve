@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::error::{Error, Result};
 
 /// Schema version applied by this build.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 const MIGRATION_0001: &str = r#"
 CREATE TABLE projects (
@@ -121,6 +121,32 @@ CREATE INDEX idx_relationships_project_kind ON relationships(project_id, kind);
 CREATE INDEX idx_unresolved_project_target ON unresolved_references(project_id, target_text);
 "#;
 
+/// Migration 0003 (Phase 3 design "Migration 0003"): additive
+/// `files.content_hash`/`modified_ns` for the change-detection engine, plus
+/// the new `index_state` freshness table. Also wipes every project-data
+/// table: ids move from `DefaultHasher` to BLAKE3 and `symbol_key` gains a
+/// `signature_fingerprint` component, so every previously stored id/key is
+/// invalid — this forces the one honest full reindex under the new scheme
+/// instead of leaving corrupt-but-queryable rows around.
+const MIGRATION_0003: &str = r#"
+ALTER TABLE files ADD COLUMN content_hash TEXT;
+ALTER TABLE files ADD COLUMN modified_ns INTEGER;
+
+CREATE TABLE index_state (
+    project_id TEXT PRIMARY KEY,
+    pending_files INTEGER NOT NULL DEFAULT 0,
+    last_verified_at TEXT,
+    updated_at TEXT NOT NULL
+);
+
+DELETE FROM relationships;
+DELETE FROM unresolved_references;
+DELETE FROM symbols_fts;
+DELETE FROM symbols;
+DELETE FROM files;
+DELETE FROM projects;
+"#;
+
 /// Apply all pending migrations. Idempotent: already-applied versions are
 /// skipped.
 pub fn apply(conn: &Connection) -> Result<()> {
@@ -159,6 +185,17 @@ pub fn apply(conn: &Connection) -> Result<()> {
         tx.commit()?;
     }
 
+    if current < 3 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_0003)
+            .map_err(|e| Error::Migration(format!("0003: {e}")))?;
+        tx.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (3, datetime('now'))",
+            [],
+        )?;
+        tx.commit()?;
+    }
+
     Ok(())
 }
 
@@ -179,11 +216,13 @@ mod tests {
     use crate::db;
 
     /// Spec scenario "Fresh database migration": a fresh DB ends at
-    /// `SCHEMA_VERSION` and both relationship-graph tables exist.
+    /// `SCHEMA_VERSION` (3), the pre-existing relationship-graph tables
+    /// still exist, and Phase 3's `index_state` table (plus the
+    /// `files.content_hash`/`modified_ns` columns) is present.
     #[test]
-    fn fresh_database_reaches_schema_version_2() {
+    fn fresh_database_reaches_schema_version_3() {
         let conn = db::open_in_memory().unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 2);
+        assert_eq!(current_version(&conn).unwrap(), 3);
 
         let table_exists = |name: &str| -> bool {
             conn.query_row(
@@ -195,6 +234,7 @@ mod tests {
         };
         assert!(table_exists("relationships"));
         assert!(table_exists("unresolved_references"));
+        assert!(table_exists("index_state"));
 
         let index_exists = |name: &str| -> bool {
             conn.query_row(
@@ -208,16 +248,27 @@ mod tests {
         assert!(index_exists("idx_relationships_target_kind"));
         assert!(index_exists("idx_relationships_project_kind"));
         assert!(index_exists("idx_unresolved_project_target"));
+
+        let column_exists = |table: &str, column: &str| -> bool {
+            conn.prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .filter_map(|c| c.ok())
+                .any(|c| c == column)
+        };
+        assert!(column_exists("files", "content_hash"));
+        assert!(column_exists("files", "modified_ns"));
     }
 
-    /// Migration 0002 must apply cleanly on top of an already-migrated 0001
-    /// database (forward-only, idempotent per §24.5).
+    /// Migrations must apply cleanly and idempotently on top of an
+    /// already-migrated database (forward-only, per §24.5).
     #[test]
-    fn migration_0002_applies_on_top_of_0001() {
+    fn migrations_apply_idempotently() {
         let conn = db::open_in_memory().unwrap();
         // Re-running apply() on an already-migrated connection must be a
         // no-op, not an error (idempotency).
         apply(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 2);
+        assert_eq!(current_version(&conn).unwrap(), 3);
     }
 }

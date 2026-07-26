@@ -30,11 +30,11 @@ Chain strategy: feature-branch-chain
 
 ## Phase 1: PR1 — BLAKE3 Foundation (req: incremental-index "Content Hash Tracked", symbol-index "Schema bump")
 
-- [ ] 1.1 Add `blake3 = "1"` to `crates/codekurve-store/Cargo.toml`.
-- [ ] 1.2 `repo.rs`: rewrite `hash_id`, `config_hash`, add `content_hash(bytes)`; drop `use std::hash::{Hash, Hasher}`.
-- [ ] 1.3 `migrations.rs`: add MIGRATION_0003 (`files.content_hash`/`modified_ns`, `index_state` table), `SCHEMA_VERSION = 3`, wipe DML.
-- [ ] 1.4 Extend `fresh_database_reaches_schema_version_2` → `_3`; assert `index_state` exists.
-- [ ] 1.5 Test: BLAKE3 id stability (same input → same id across calls).
+- [x] 1.1 Add `blake3 = "1"` to `crates/codekurve-store/Cargo.toml`.
+- [x] 1.2 `repo.rs`: rewrite `hash_id`, `config_hash`, add `content_hash(bytes)`; drop `use std::hash::{Hash, Hasher}`.
+- [x] 1.3 `migrations.rs`: add MIGRATION_0003 (`files.content_hash`/`modified_ns`, `index_state` table), `SCHEMA_VERSION = 3`, wipe DML.
+- [x] 1.4 Extend `fresh_database_reaches_schema_version_2` → `_3`; assert `index_state` exists.
+- [x] 1.5 Test: BLAKE3 id stability (same input → same id across calls).
 
 ## Phase 2: PR2 — symbol_key 5-Tuple + signature_fingerprint (req: symbol-index MODIFIED)
 
