@@ -16,19 +16,17 @@ fn vertical_slice_init_index_search_symbol() {
 
     ck().arg("init").arg(root).assert().success();
 
+    // First run: no prior index_state/content_hash, so every file reads as
+    // `Created` and the oversized-batch fallback (task 5.4) naturally takes
+    // the full-reindex path (task 5.5's bootstrap case).
     ck().arg("index")
         .arg("--root")
         .arg(root)
         .assert()
         .success()
-        // `MemberService` contains `find` (Contains), `createMemberService`
-        // constructs `MemberService` in the same file (Constructs, resolves
-        // Exact), and its `: MemberService` return type also references it
-        // (References, resolves Exact): 3 relationships, 0 unresolved.
-        .stdout(
-            predicate::str::contains("symbol")
-                .and(predicate::str::contains("3 relationship(s), 0 unresolved")),
-        );
+        .stdout(predicate::str::contains(
+            "indexed 1 file(s) changed, 0 deleted (full reindex)",
+        ));
 
     ck().arg("search")
         .arg("MemberService")

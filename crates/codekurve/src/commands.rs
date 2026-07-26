@@ -7,8 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use codekurve_analysis::discovery::{self, DiscoveryOptions};
-use codekurve_analysis::extract;
+use codekurve_analysis::discovery::DiscoveryOptions;
 use codekurve_analysis::ir::{EdgeTarget, FileAnalysis};
 use codekurve_analysis::resolve::{self, TsconfigAliases};
 use codekurve_core::{Confidence, Config, LanguageId, SourceSpan, Symbol, SymbolKind};
@@ -35,40 +34,17 @@ impl From<String> for CommandError {
     }
 }
 
-/// `codekurve index --root <path>` — two-pass pipeline (design §22): pass 1
-/// parses every discovered file in isolation; pass 2 resolves every edge
-/// against the whole-project symbol table before anything is persisted.
+/// `codekurve index --root <path>` (task 5.5, design's shared engine):
+/// delegates to [`crate::incremental::detect`] then
+/// [`crate::incremental::apply_batch`] instead of always running a full
+/// reindex. On a never-indexed project every discovered file is `Created`
+/// and the oversized-batch fallback (task 5.4) naturally takes the full
+/// [`repo::reindex`] path — no separate bootstrap case needed.
 pub fn index(root: &Path) -> Result<(), String> {
     let root = canonicalize(root)?;
     let config = load_config(&root)?;
-
     let options = discovery_options(&config);
-    let discovered = discovery::discover(&root, &options);
     let aliases = load_tsconfig_aliases(&root);
-
-    // Pass 1: parse only, no persistence — the whole batch must be in
-    // memory before pass 2 can resolve cross-file references (§22.2 accepts
-    // this for MVP scale).
-    let mut analyses: Vec<FileAnalysis> = Vec::new();
-    let mut file_meta: Vec<(LanguageId, u64)> = Vec::new();
-    let mut parse_errors = 0usize;
-    for file in &discovered {
-        let Ok(source) = fs::read_to_string(&file.absolute_path) else {
-            parse_errors += 1;
-            continue;
-        };
-        match extract::analyze(&source, file.language, &file.relative_path) {
-            Ok(analysis) => {
-                file_meta.push((file.language, source.len() as u64));
-                analyses.push(analysis);
-            }
-            Err(_) => parse_errors += 1,
-        }
-    }
-
-    // Pass 2: resolve every `Unresolved` edge in place against the
-    // whole-project symbol table.
-    resolve::resolve(&mut analyses, &aliases);
 
     let db_path = root.join(&config.storage.database);
     let mut conn = db::open(&db_path).map_err(|e| e.to_string())?;
@@ -81,28 +57,41 @@ pub fn index(root: &Path) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
-    // Composition-root mapping: analysis IR -> store's persist-input types,
-    // so `codekurve-store` never depends on `codekurve-analysis`.
-    let (files, symbol_ids) = build_file_inputs(&project_id, &analyses, &file_meta);
-    let relationships = build_relationships(&project_id, &analyses, &symbol_ids);
-    let unresolved = build_unresolved(&project_id, &analyses, &symbol_ids);
+    let changes = crate::incremental::detect(&conn, &project_id, &root, &options, None)?;
+    if changes.is_empty() {
+        println!("index up to date, no changes detected");
+        return Ok(());
+    }
 
-    let outcome = repo::reindex(&mut conn, &project_id, &files, &relationships, &unresolved)
-        .map_err(|e| e.to_string())?;
+    let ctx = crate::incremental::IndexContext {
+        root: &root,
+        project_id: &project_id,
+        aliases: &aliases,
+        options: &options,
+    };
+    let outcome = crate::incremental::apply_batch(&mut conn, &ctx, &changes)?;
 
     println!(
-        "indexed {} file(s), {} symbol(s), {} relationship(s), {} unresolved{}",
-        outcome.files,
-        outcome.symbols,
-        relationships.len(),
-        unresolved.len(),
-        if parse_errors > 0 {
-            format!(", {parse_errors} skipped")
+        "indexed {} file(s) changed, {} deleted{}",
+        outcome.files_changed,
+        outcome.files_deleted,
+        if outcome.fell_back_to_full_reindex {
+            " (full reindex)"
         } else {
-            String::new()
+            ""
         }
     );
     Ok(())
+}
+
+/// Per-file metadata `build_file_inputs` needs alongside each `FileAnalysis`
+/// — extended in Phase 3 with the change-detection engine's hash/mtime
+/// (design "Content Hash Tracked Per File").
+pub(crate) struct FileMeta {
+    pub language: LanguageId,
+    pub size_bytes: u64,
+    pub content_hash: String,
+    pub modified_ns: i64,
 }
 
 /// A symbol standing in for "this module", one per file. `Imports`/`Exports`
@@ -136,16 +125,17 @@ fn module_symbol(relative_path: &str, language: LanguageId) -> Symbol {
 /// Builds `repo::FileInput`s and a `(relative_path, qualified_name) ->
 /// symbol_id` lookup table, using the same deterministic id functions
 /// `repo::reindex` uses internally — so ids computed here match exactly
-/// what ends up in the `symbols` table.
-fn build_file_inputs(
+/// what ends up in the `symbols` table. `pub(crate)`: shared with
+/// `crate::incremental`'s per-batch and full-reindex-fallback paths.
+pub(crate) fn build_file_inputs(
     project_id: &str,
     analyses: &[FileAnalysis],
-    file_meta: &[(LanguageId, u64)],
+    file_meta: &[FileMeta],
 ) -> (Vec<FileInput>, HashMap<(String, String), String>) {
     let mut files = Vec::with_capacity(analyses.len());
     let mut symbol_ids: HashMap<(String, String), String> = HashMap::new();
 
-    for (analysis, (language, size_bytes)) in analyses.iter().zip(file_meta) {
+    for (analysis, meta) in analyses.iter().zip(file_meta) {
         let file_id = repo::file_id(project_id, &analysis.file);
         let mut symbols: Vec<Symbol> = analysis
             .symbols
@@ -160,11 +150,11 @@ fn build_file_inputs(
                 signature_fingerprint: s.signature_fingerprint.clone(),
             })
             .collect();
-        symbols.push(module_symbol(&analysis.file, *language));
+        symbols.push(module_symbol(&analysis.file, meta.language));
 
         for symbol in &symbols {
             let key = repo::symbol_key(
-                language.as_str(),
+                meta.language.as_str(),
                 &analysis.file,
                 symbol.kind.as_str(),
                 &symbol.qualified_name,
@@ -178,8 +168,10 @@ fn build_file_inputs(
 
         files.push(FileInput {
             relative_path: analysis.file.clone(),
-            language: language.as_str().to_string(),
-            size_bytes: *size_bytes,
+            language: meta.language.as_str().to_string(),
+            size_bytes: meta.size_bytes,
+            content_hash: meta.content_hash.clone(),
+            modified_ns: meta.modified_ns,
             symbols,
         });
     }
@@ -190,8 +182,9 @@ fn build_file_inputs(
 /// Maps every resolved `ExtractedRelationship` to a `RelationshipInput`.
 /// After `resolve::resolve`, every edge's target is `Local`, `Global`, or
 /// `External` (never `Unresolved` — zero-candidate edges moved to
-/// `analysis.unresolved` instead, §18.3).
-fn build_relationships(
+/// `analysis.unresolved` instead, §18.3). `pub(crate)`: shared with
+/// `crate::incremental`.
+pub(crate) fn build_relationships(
     project_id: &str,
     analyses: &[FileAnalysis],
     symbol_ids: &HashMap<(String, String), String>,
@@ -253,8 +246,9 @@ fn build_relationships(
 }
 
 /// Maps every `UnresolvedReference` left after resolution (never dropped,
-/// §18.3) to an `UnresolvedReferenceInput`.
-fn build_unresolved(
+/// §18.3) to an `UnresolvedReferenceInput`. `pub(crate)`: shared with
+/// `crate::incremental`.
+pub(crate) fn build_unresolved(
     project_id: &str,
     analyses: &[FileAnalysis],
     symbol_ids: &HashMap<(String, String), String>,
@@ -285,14 +279,9 @@ fn build_unresolved(
 /// re-resolution"): `codekurve-store::repo::resolution_snapshot`'s rows ->
 /// `codekurve-analysis::resolve::ProjectBaseline`. `codekurve-store` never
 /// depends on `codekurve-analysis`, so this glue lives here, matching
-/// `build_file_inputs`'s IR -> store-input mapping just above.
-///
-/// ponytail: not called yet — PR5's `apply_batch` is the first caller that
-/// has an incremental batch to seed. Wiring it here now ships the seam PR5
-/// needs without pulling `incremental.rs`/`apply_batch` (out of this PR's
-/// scope) forward.
-#[allow(dead_code)]
-fn project_baseline(snapshot: repo::ResolutionSnapshot) -> resolve::ProjectBaseline {
+/// `build_file_inputs`'s IR -> store-input mapping just above. `pub(crate)`:
+/// `crate::incremental::apply_batch` is its first caller (task 5.3).
+pub(crate) fn project_baseline(snapshot: repo::ResolutionSnapshot) -> resolve::ProjectBaseline {
     let symbols = snapshot
         .symbols
         .into_iter()

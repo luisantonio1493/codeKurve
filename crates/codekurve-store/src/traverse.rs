@@ -398,6 +398,8 @@ mod tests {
         let files = vec![repo::FileInput {
             relative_path: "src/graph.ts".to_string(),
             language: "typescript".to_string(),
+            content_hash: "test-hash".to_string(),
+            modified_ns: 0,
             size_bytes: 10,
             symbols: vec![
                 symbol("A", SymbolKind::Function),

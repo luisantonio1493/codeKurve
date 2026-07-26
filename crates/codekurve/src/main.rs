@@ -2,6 +2,7 @@
 
 mod cli;
 mod commands;
+mod incremental;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

@@ -15,6 +15,11 @@ pub struct FileInput {
     pub relative_path: String,
     pub language: String,
     pub size_bytes: u64,
+    /// BLAKE3 digest of the file's bytes at read time (Phase 3 "Content Hash
+    /// Tracked Per File") — the change-detection engine's confirm step.
+    pub content_hash: String,
+    /// Filesystem mtime, nanoseconds since epoch, at read time.
+    pub modified_ns: i64,
     pub symbols: Vec<Symbol>,
 }
 
@@ -166,77 +171,353 @@ pub fn reindex(
     };
 
     for file in files {
-        let file_id = file_id(project_id, &file.relative_path);
-        tx.execute(
-            "INSERT INTO files(id, project_id, relative_path, language, size_bytes,
-                 parse_status, generation, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'ok', 1, ?6, ?6)",
-            params![
-                file_id,
-                project_id,
-                file.relative_path,
-                file.language,
-                file.size_bytes as i64,
-                ts,
-            ],
-        )?;
         outcome.files += 1;
-
-        for symbol in &file.symbols {
-            let symbol_key = symbol_key(
-                symbol.language.as_str(),
-                &file.relative_path,
-                symbol.kind.as_str(),
-                &symbol.qualified_name,
-                &symbol.signature_fingerprint,
-            );
-            let symbol_id = symbol_id(&file_id, &symbol_key);
-            let qualified = &symbol.qualified_name;
-            tx.execute(
-                "INSERT INTO symbols(id, project_id, file_id, symbol_key, name, qualified_name,
-                     kind, language, start_byte, end_byte, start_line, start_column,
-                     end_line, end_column, provenance, confidence, generation,
-                     created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                     'tree-sitter', 'high', 1, ?15, ?15)",
-                params![
-                    symbol_id,
-                    project_id,
-                    file_id,
-                    symbol_key,
-                    symbol.name,
-                    qualified,
-                    symbol.kind.as_str(),
-                    symbol.language.as_str(),
-                    symbol.span.start_byte as i64,
-                    symbol.span.end_byte as i64,
-                    symbol.span.start_line as i64,
-                    symbol.span.start_column as i64,
-                    symbol.span.end_line as i64,
-                    symbol.span.end_column as i64,
-                    ts,
-                ],
-            )?;
-            tx.execute(
-                "INSERT INTO symbols_fts(symbol_id, name, qualified_name, kind, relative_path)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    symbol_id,
-                    symbol.name,
-                    qualified,
-                    symbol.kind.as_str(),
-                    file.relative_path
-                ],
-            )?;
-            outcome.symbols += 1;
-        }
+        outcome.symbols += insert_file_and_symbols(&tx, project_id, &ts, file)?;
     }
 
     persist_relationships(&tx, project_id, &ts, relationships)?;
     persist_unresolved(&tx, project_id, &ts, unresolved)?;
+    // Phase 3 "Freshness Metadata Written Inside the Data Transaction": a
+    // full reindex is itself a (maximal) batch, so it verifies the whole
+    // project and clears any pending count in the same transaction.
+    mark_verified(&tx, project_id, &ts)?;
 
     tx.commit()?;
     Ok(outcome)
+}
+
+/// Inserts (or, via `ON CONFLICT`, updates) one file's row and every symbol
+/// it owns. Shared by `reindex` (whole project, prior rows already wiped by
+/// the caller) and `apply_incremental` (one changed file at a time, prior
+/// rows cleared by `delete_file_owned_rows` first) — both need identical
+/// files/symbols/symbols_fts insert logic. Returns the symbol count written.
+fn insert_file_and_symbols(
+    tx: &Transaction,
+    project_id: &str,
+    ts: &str,
+    file: &FileInput,
+) -> Result<usize> {
+    let file_id = file_id(project_id, &file.relative_path);
+    tx.execute(
+        "INSERT INTO files(id, project_id, relative_path, language, size_bytes,
+             content_hash, modified_ns, parse_status, generation, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ok', 1, ?8, ?8)
+         ON CONFLICT(project_id, relative_path) DO UPDATE SET
+             language = excluded.language,
+             size_bytes = excluded.size_bytes,
+             content_hash = excluded.content_hash,
+             modified_ns = excluded.modified_ns,
+             updated_at = excluded.updated_at",
+        params![
+            file_id,
+            project_id,
+            file.relative_path,
+            file.language,
+            file.size_bytes as i64,
+            file.content_hash,
+            file.modified_ns,
+            ts,
+        ],
+    )?;
+
+    let mut count = 0;
+    for symbol in &file.symbols {
+        let symbol_key = symbol_key(
+            symbol.language.as_str(),
+            &file.relative_path,
+            symbol.kind.as_str(),
+            &symbol.qualified_name,
+            &symbol.signature_fingerprint,
+        );
+        let symbol_id = symbol_id(&file_id, &symbol_key);
+        let qualified = &symbol.qualified_name;
+        tx.execute(
+            "INSERT INTO symbols(id, project_id, file_id, symbol_key, name, qualified_name,
+                 kind, language, start_byte, end_byte, start_line, start_column,
+                 end_line, end_column, provenance, confidence, generation,
+                 created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                 'tree-sitter', 'high', 1, ?15, ?15)",
+            params![
+                symbol_id,
+                project_id,
+                file_id,
+                symbol_key,
+                symbol.name,
+                qualified,
+                symbol.kind.as_str(),
+                symbol.language.as_str(),
+                symbol.span.start_byte as i64,
+                symbol.span.end_byte as i64,
+                symbol.span.start_line as i64,
+                symbol.span.start_column as i64,
+                symbol.span.end_line as i64,
+                symbol.span.end_column as i64,
+                ts,
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO symbols_fts(symbol_id, name, qualified_name, kind, relative_path)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                symbol_id,
+                symbol.name,
+                qualified,
+                symbol.kind.as_str(),
+                file.relative_path
+            ],
+        )?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Deletes one file's own symbols (+ FTS shadow) and its own outbound
+/// relationships/unresolved rows (as source). Does NOT touch the `files` row
+/// itself — `insert_file_and_symbols`'s `ON CONFLICT` upserts it, and
+/// `delete_file` removes it outright for a genuine delete.
+fn delete_file_owned_rows(tx: &Transaction, project_id: &str, file_id: &str) -> Result<()> {
+    tx.execute(
+        "DELETE FROM relationships WHERE project_id = ?1 AND source_file_id = ?2",
+        params![project_id, file_id],
+    )?;
+    tx.execute(
+        "DELETE FROM unresolved_references WHERE project_id = ?1 AND source_file_id = ?2",
+        params![project_id, file_id],
+    )?;
+    tx.execute(
+        "DELETE FROM symbols_fts WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)",
+        params![file_id],
+    )?;
+    tx.execute("DELETE FROM symbols WHERE file_id = ?1", params![file_id])?;
+    Ok(())
+}
+
+/// Task 5.2 (spec "Per-File Delete Removes Symbols and Converts Inbound
+/// Edges to Unresolved"): removes a tracked file entirely — its own symbols,
+/// its own outbound edges, and its `files` row — and converts every inbound
+/// edge (a relationship from another file targeting one of this file's
+/// symbols) into an `unresolved_references` row instead of silently
+/// dropping it. `target_text` uses the target symbol's bare `name`, mirroring
+/// how by-name resolution (`resolve_by_name`/`resolve_binding`) already
+/// looks targets up.
+pub fn delete_file(
+    tx: &Transaction,
+    project_id: &str,
+    ts: &str,
+    relative_path: &str,
+) -> Result<()> {
+    let file_id = file_id(project_id, relative_path);
+
+    let mut stmt = tx.prepare(
+        "SELECT r.id, r.source_symbol_id, r.source_file_id, r.kind, s.name
+         FROM relationships r
+         JOIN symbols s ON s.id = r.target_symbol_id
+         WHERE r.project_id = ?1 AND s.file_id = ?2 AND r.source_file_id != ?2",
+    )?;
+    let inbound: Vec<(String, String, String, String, String)> = stmt
+        .query_map(params![project_id, file_id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    let mut unresolved = Vec::with_capacity(inbound.len());
+    for (rel_id, source_symbol_id, source_file_id, kind, target_name) in &inbound {
+        tx.execute("DELETE FROM relationships WHERE id = ?1", params![rel_id])?;
+        unresolved.push(UnresolvedReferenceInput {
+            source_symbol_id: Some(source_symbol_id.clone()),
+            source_file_id: source_file_id.clone(),
+            relationship_kind: parse_relationship_kind(kind),
+            target_text: target_name.clone(),
+            context_json: None,
+            candidate_count: 0,
+            reason: "target symbol's file was deleted".to_string(),
+            confidence: Confidence::Unresolved,
+        });
+    }
+    persist_unresolved(tx, project_id, ts, &unresolved)?;
+
+    delete_file_owned_rows(tx, project_id, &file_id)?;
+    tx.execute("DELETE FROM files WHERE id = ?1", params![file_id])?;
+    Ok(())
+}
+
+/// Task 5.3 (design "Batch Atomicity" T2): applies one incremental batch's
+/// data changes in the caller's transaction — every `deleted` path via
+/// [`delete_file`], then every `files[i]`'s stale rows replaced by its fresh
+/// ones via [`insert_file_and_symbols`]. `relationships`/`unresolved` cover
+/// every file in `files` together in one call each, keeping `stable_id`'s
+/// per-call ordinal (and therefore every row's id) identical to a full
+/// `reindex` over the same rows (design "Stable Row Ids" invariant). Does
+/// NOT write `index_state` — the caller stamps `pending_files`/
+/// `last_verified_at` in the same transaction via [`mark_verified`] before
+/// committing, so freshness metadata and data changes can never disagree.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_incremental(
+    tx: &Transaction,
+    project_id: &str,
+    ts: &str,
+    files: &[FileInput],
+    relationships: &[RelationshipInput],
+    unresolved: &[UnresolvedReferenceInput],
+    deleted: &[String],
+) -> Result<usize> {
+    for path in deleted {
+        delete_file(tx, project_id, ts, path)?;
+    }
+    for file in files {
+        delete_file_owned_rows(tx, project_id, &file_id(project_id, &file.relative_path))?;
+    }
+
+    let mut count = 0;
+    for file in files {
+        count += insert_file_and_symbols(tx, project_id, ts, file)?;
+    }
+    persist_relationships(tx, project_id, ts, relationships)?;
+    persist_unresolved(tx, project_id, ts, unresolved)?;
+    Ok(count)
+}
+
+/// Task 5.2 (`index_state` upsert): publishes the batch's pending count
+/// (T1 of the Batch Atomicity sequence) so an interrupted run honestly
+/// reports staleness until T2 commits.
+pub fn set_pending_files(tx: &Transaction, project_id: &str, ts: &str, count: i64) -> Result<()> {
+    tx.execute(
+        "INSERT INTO index_state(project_id, pending_files, updated_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(project_id) DO UPDATE SET
+             pending_files = excluded.pending_files,
+             updated_at = excluded.updated_at",
+        params![project_id, count, ts],
+    )?;
+    Ok(())
+}
+
+/// Task 5.2/5.3 (`index_state` upsert, T2 of Batch Atomicity): clears the
+/// pending count and stamps `last_verified_at`, meant to be called inside
+/// the same transaction as the batch's data writes (never a separate one —
+/// spec "Freshness Metadata Written Inside the Data Transaction").
+pub fn mark_verified(tx: &Transaction, project_id: &str, ts: &str) -> Result<()> {
+    tx.execute(
+        "INSERT INTO index_state(project_id, pending_files, last_verified_at, updated_at)
+         VALUES (?1, 0, ?2, ?2)
+         ON CONFLICT(project_id) DO UPDATE SET
+             pending_files = 0,
+             last_verified_at = excluded.last_verified_at,
+             updated_at = excluded.updated_at",
+        params![project_id, ts],
+    )?;
+    Ok(())
+}
+
+/// Count of tracked files, for the oversized-batch fallback check (task 5.4)
+/// — cheap, avoids a full row read just to size a threshold comparison.
+pub fn count_files(conn: &Connection, project_id: &str) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM files WHERE project_id = ?1",
+        params![project_id],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+
+/// Every currently stored symbol id owned by one of `relative_paths` — the
+/// "old" ids a changed/deleted file's symbols held before this batch,
+/// needed as the `target_symbol_ids` input to `dependents_by_target_symbol`
+/// (design "Dependent Re-Resolution Scope", trigger "B removed/renamed a
+/// symbol"). `file_id` is deterministic, so no path->id join query is
+/// needed to build the `file_id IN (...)` list.
+pub fn symbol_ids_for_files(
+    conn: &Connection,
+    project_id: &str,
+    relative_paths: &[String],
+) -> Result<Vec<String>> {
+    if relative_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let file_ids: Vec<String> = relative_paths
+        .iter()
+        .map(|p| file_id(project_id, p))
+        .collect();
+    let placeholders = file_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql =
+        format!("SELECT id FROM symbols WHERE project_id = ? AND file_id IN ({placeholders})");
+    let mut binds: Vec<&str> = vec![project_id];
+    binds.extend(file_ids.iter().map(String::as_str));
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter().copied()), |row| {
+        row.get::<_, String>(0)
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Every stored symbol id for a set of `(relative_path, qualified_name)`
+/// pairs — resolves an `apply_batch` batch's edges that target a *baseline*
+/// symbol (a file outside `B ∪ D`, not re-parsed this batch, so it has no
+/// freshly computed id to look up locally). One query per pair: the pair
+/// count is bounded by the batch's own edge count, not project size, so a
+/// join over an IN-tuple list isn't worth the complexity here.
+pub fn symbol_ids_by_qualified_names(
+    conn: &Connection,
+    project_id: &str,
+    pairs: &[(String, String)],
+) -> Result<HashMap<(String, String), String>> {
+    let mut out = HashMap::new();
+    if pairs.is_empty() {
+        return Ok(out);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT s.id FROM symbols s JOIN files f ON f.id = s.file_id
+         WHERE s.project_id = ?1 AND f.relative_path = ?2 AND s.qualified_name = ?3",
+    )?;
+    for (file, qualified_name) in pairs {
+        if let Ok(id) = stmt.query_row(params![project_id, file, qualified_name], |row| {
+            row.get::<_, String>(0)
+        }) {
+            out.insert((file.clone(), qualified_name.clone()), id);
+        }
+    }
+    Ok(out)
+}
+
+/// Per-file metadata read back for change detection (task 5.1's `detect`):
+/// the stored size/hash/mtime to compare against the file on disk.
+#[derive(Debug, Clone)]
+pub struct StoredFileMeta {
+    pub size_bytes: u64,
+    pub content_hash: Option<String>,
+    pub modified_ns: Option<i64>,
+}
+
+/// Every tracked file's change-detection metadata, keyed by relative path —
+/// `detect`'s single read of "what does storage currently believe" before
+/// walking the filesystem (design "Shared Change Detection Engine").
+pub fn file_snapshot(
+    conn: &Connection,
+    project_id: &str,
+) -> Result<HashMap<String, StoredFileMeta>> {
+    let mut stmt = conn.prepare(
+        "SELECT relative_path, size_bytes, content_hash, modified_ns
+         FROM files WHERE project_id = ?1",
+    )?;
+    let rows = stmt.query_map(params![project_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            StoredFileMeta {
+                size_bytes: row.get::<_, i64>(1)? as u64,
+                content_hash: row.get(2)?,
+                modified_ns: row.get(3)?,
+            },
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
 }
 
 /// Content-derived id; the ordinal only disambiguates rows whose entire
@@ -790,6 +1071,29 @@ fn parse_symbol_kind(s: &str) -> SymbolKind {
     }
 }
 
+/// Reverse of `RelationshipKind::as_str` (codekurve-core), for reconstructing
+/// an `UnresolvedReferenceInput` from a `relationships.kind` text column
+/// (`delete_file`'s inbound-edge conversion). Every stored value was written
+/// by `as_str` itself, so the fallback is unreachable in practice — kept
+/// total rather than panicking on a read path, mirroring `parse_symbol_kind`.
+fn parse_relationship_kind(s: &str) -> RelationshipKind {
+    match s {
+        "defines" => RelationshipKind::Defines,
+        "contains" => RelationshipKind::Contains,
+        "imports" => RelationshipKind::Imports,
+        "exports" => RelationshipKind::Exports,
+        "references" => RelationshipKind::References,
+        "calls" => RelationshipKind::Calls,
+        "constructs" => RelationshipKind::Constructs,
+        "inherits" => RelationshipKind::Inherits,
+        "implements" => RelationshipKind::Implements,
+        "overrides" => RelationshipKind::Overrides,
+        "usestype" => RelationshipKind::UsesType,
+        "reads" => RelationshipKind::Reads,
+        _ => RelationshipKind::Writes,
+    }
+}
+
 fn hash_id(prefix: &str, input: &str) -> String {
     format!(
         "{prefix}-{}",
@@ -797,7 +1101,9 @@ fn hash_id(prefix: &str, input: &str) -> String {
     )
 }
 
-fn now_ts() -> String {
+/// Public (task 5.3): `apply_batch`'s T1/T2 timestamps need the same clock
+/// `reindex` uses internally, from the binary crate.
+pub fn now_ts() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs().to_string())
@@ -835,6 +1141,8 @@ mod tests {
         let files = vec![FileInput {
             relative_path: "src/member.ts".to_string(),
             language: "typescript".to_string(),
+            content_hash: "test-hash".to_string(),
+            modified_ns: 0,
             size_bytes: 42,
             symbols: vec![
                 symbol("MemberService", SymbolKind::Class, 0),
@@ -879,6 +1187,8 @@ mod tests {
         let files = vec![FileInput {
             relative_path: "src/member.ts".to_string(),
             language: "typescript".to_string(),
+            content_hash: "test-hash".to_string(),
+            modified_ns: 0,
             size_bytes: 42,
             symbols: vec![symbol("MemberService", SymbolKind::Class, 0)],
         }];
@@ -913,6 +1223,8 @@ mod tests {
         let files = vec![FileInput {
             relative_path: "src/member.ts".to_string(),
             language: "typescript".to_string(),
+            content_hash: "test-hash".to_string(),
+            modified_ns: 0,
             size_bytes: 42,
             symbols: vec![
                 symbol("MemberService", SymbolKind::Class, 500),
@@ -952,6 +1264,8 @@ mod tests {
         let files = vec![FileInput {
             relative_path: "src/member.ts".to_string(),
             language: "typescript".to_string(),
+            content_hash: "test-hash".to_string(),
+            modified_ns: 0,
             size_bytes: 42,
             symbols: vec![
                 symbol("MemberService", SymbolKind::Class, 0),
@@ -974,6 +1288,8 @@ mod tests {
         let files = vec![FileInput {
             relative_path: "src/member.ts".to_string(),
             language: "typescript".to_string(),
+            content_hash: "test-hash".to_string(),
+            modified_ns: 0,
             size_bytes: 42,
             symbols: vec![symbol("MemberService", SymbolKind::Class, 0), resigned],
         }];
@@ -1016,6 +1332,8 @@ mod tests {
         let files = vec![FileInput {
             relative_path: "src/member.ts".to_string(),
             language: "typescript".to_string(),
+            content_hash: "test-hash".to_string(),
+            modified_ns: 0,
             size_bytes: 42,
             symbols: vec![
                 symbol("MemberService", SymbolKind::Class, 0),
@@ -1059,6 +1377,8 @@ mod tests {
             FileInput {
                 relative_path: "src/a.ts".to_string(),
                 language: "typescript".to_string(),
+                content_hash: "test-hash".to_string(),
+                modified_ns: 0,
                 size_bytes: 10,
                 symbols: vec![
                     symbol("Foo", SymbolKind::Class, 0),
@@ -1068,6 +1388,8 @@ mod tests {
             FileInput {
                 relative_path: "src/b.ts".to_string(),
                 language: "typescript".to_string(),
+                content_hash: "test-hash".to_string(),
+                modified_ns: 0,
                 size_bytes: 10,
                 symbols: vec![
                     symbol("Baz", SymbolKind::Class, 0),
@@ -1210,6 +1532,8 @@ mod tests {
         let files = vec![FileInput {
             relative_path: "src/member.ts".to_string(),
             language: "typescript".to_string(),
+            content_hash: "test-hash".to_string(),
+            modified_ns: 0,
             size_bytes: 42,
             symbols: vec![symbol("MemberService", SymbolKind::Class, 0)],
         }];
@@ -1245,6 +1569,8 @@ mod tests {
         vec![FileInput {
             relative_path: "src/member.ts".to_string(),
             language: "typescript".to_string(),
+            content_hash: "test-hash".to_string(),
+            modified_ns: 0,
             size_bytes: 42,
             symbols: vec![
                 symbol("IMemberService", SymbolKind::Interface, 0),
@@ -1445,18 +1771,24 @@ mod tests {
             FileInput {
                 relative_path: "src/a.ts".to_string(),
                 language: "typescript".to_string(),
+                content_hash: "test-hash".to_string(),
+                modified_ns: 0,
                 size_bytes: 10,
                 symbols: vec![symbol("doWork", SymbolKind::Function, 0)],
             },
             FileInput {
                 relative_path: "src/b.ts".to_string(),
                 language: "typescript".to_string(),
+                content_hash: "test-hash".to_string(),
+                modified_ns: 0,
                 size_bytes: 10,
                 symbols: vec![symbol("run", SymbolKind::Function, 0)],
             },
             FileInput {
                 relative_path: "src/c.ts".to_string(),
                 language: "typescript".to_string(),
+                content_hash: "test-hash".to_string(),
+                modified_ns: 0,
                 size_bytes: 10,
                 symbols: vec![symbol("unrelated", SymbolKind::Function, 0)],
             },
@@ -1516,12 +1848,16 @@ mod tests {
             FileInput {
                 relative_path: "src/c.ts".to_string(),
                 language: "typescript".to_string(),
+                content_hash: "test-hash".to_string(),
+                modified_ns: 0,
                 size_bytes: 10,
                 symbols: vec![],
             },
             FileInput {
                 relative_path: "src/d.ts".to_string(),
                 language: "typescript".to_string(),
+                content_hash: "test-hash".to_string(),
+                modified_ns: 0,
                 size_bytes: 10,
                 symbols: vec![],
             },
@@ -1593,6 +1929,8 @@ mod tests {
         let files = vec![FileInput {
             relative_path: "src/member.ts".to_string(),
             language: "typescript".to_string(),
+            content_hash: "test-hash".to_string(),
+            modified_ns: 0,
             size_bytes: 42,
             symbols: vec![
                 symbol("MemberService", SymbolKind::Class, 0),
@@ -1629,5 +1967,182 @@ mod tests {
             .find(|s| s.name == "MemberService")
             .unwrap();
         assert!(!member_service.exported);
+    }
+
+    /// Task 5.7 (design "Batch Atomicity"): mirrors
+    /// `reindex_rolls_back_completely_on_relationship_error` at the
+    /// incremental engine's own primitives — T1 (`set_pending_files`)
+    /// followed by a T2 that fails on a bogus relationship must roll back
+    /// `apply_incremental` in full, AND must leave `pending_files` exactly
+    /// as T1 set it (`mark_verified` never ran, so it's not reset to 0).
+    #[test]
+    fn apply_incremental_rolls_back_and_leaves_pending_files_set() {
+        let mut conn = seed();
+        let pid = project_id(&conn);
+        let symbols_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+            .unwrap();
+        let files_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+
+        // T1: a prior `detect()` found one pending file.
+        {
+            let tx = conn.transaction().unwrap();
+            set_pending_files(&tx, &pid, "ts-t1", 1).unwrap();
+            tx.commit().unwrap();
+        }
+
+        // T2: a legitimate file update alongside a relationship that
+        // violates the `source_symbol_id` foreign key — the whole batch
+        // transaction must roll back before `mark_verified` ever runs.
+        let result = (|| -> Result<()> {
+            let tx = conn.transaction()?;
+            let files = vec![FileInput {
+                relative_path: "src/member.ts".to_string(),
+                language: "typescript".to_string(),
+                content_hash: "new-hash".to_string(),
+                modified_ns: 999,
+                size_bytes: 42,
+                symbols: vec![symbol("MemberService", SymbolKind::Class, 0)],
+            }];
+            let bogus = vec![RelationshipInput {
+                source_symbol_id: "sym-does-not-exist".to_string(),
+                target_symbol_id: None,
+                target_external: None,
+                kind: RelationshipKind::Contains,
+                provenance: Provenance::Extracted,
+                confidence: Confidence::Exact,
+                source_file_id: "fil-does-not-exist".to_string(),
+                start_line: None,
+                start_column: None,
+                reason: None,
+            }];
+            apply_incremental(&tx, &pid, "ts-t2", &files, &bogus, &[], &[])?;
+            mark_verified(&tx, &pid, "ts-t2")?;
+            tx.commit()?;
+            Ok(())
+        })();
+        assert!(result.is_err());
+
+        let symbols_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+            .unwrap();
+        let files_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(symbols_after, symbols_before, "previous generation intact");
+        assert_eq!(files_after, files_before, "previous generation intact");
+
+        let pending: i64 = conn
+            .query_row(
+                "SELECT pending_files FROM index_state WHERE project_id = ?1",
+                params![pid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1, "T1's pending count survives T2's rollback");
+    }
+
+    /// Task 5.2 (spec "Per-File Delete Removes Symbols and Converts Inbound
+    /// Edges to Unresolved"): deleting `src/a.ts` removes its own symbols,
+    /// and `src/b.ts`'s dangling call edge becomes an
+    /// `unresolved_references` row rather than disappearing silently.
+    #[test]
+    fn delete_file_converts_inbound_edge_to_unresolved() {
+        let mut conn = db::open_in_memory().unwrap();
+        let project = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        let files = vec![
+            FileInput {
+                relative_path: "src/a.ts".to_string(),
+                language: "typescript".to_string(),
+                content_hash: "hash-a".to_string(),
+                modified_ns: 0,
+                size_bytes: 10,
+                symbols: vec![symbol("doWork", SymbolKind::Function, 0)],
+            },
+            FileInput {
+                relative_path: "src/b.ts".to_string(),
+                language: "typescript".to_string(),
+                content_hash: "hash-b".to_string(),
+                modified_ns: 0,
+                size_bytes: 10,
+                symbols: vec![symbol("run", SymbolKind::Function, 0)],
+            },
+        ];
+        reindex(&mut conn, &project, &files, &[], &[]).unwrap();
+
+        let sym_id = |path: &str, name: &str| -> String {
+            conn.query_row(
+                "SELECT s.id FROM symbols s JOIN files f ON f.id = s.file_id
+                 WHERE f.relative_path = ?1 AND s.name = ?2",
+                params![path, name],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let fil_id = |path: &str| -> String {
+            conn.query_row(
+                "SELECT id FROM files WHERE relative_path = ?1",
+                params![path],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let do_work = sym_id("src/a.ts", "doWork");
+        let run = sym_id("src/b.ts", "run");
+        let file_b = fil_id("src/b.ts");
+
+        let relationships = vec![RelationshipInput {
+            source_symbol_id: run.clone(),
+            target_symbol_id: Some(do_work.clone()),
+            target_external: None,
+            kind: RelationshipKind::Calls,
+            provenance: Provenance::Extracted,
+            confidence: Confidence::Exact,
+            source_file_id: file_b,
+            start_line: Some(1),
+            start_column: Some(0),
+            reason: None,
+        }];
+        reindex(&mut conn, &project, &files, &relationships, &[]).unwrap();
+
+        {
+            let tx = conn.transaction().unwrap();
+            delete_file(&tx, &project, "ts-delete", "src/a.ts").unwrap();
+            tx.commit().unwrap();
+        }
+
+        let a_files: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE relative_path = 'src/a.ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(a_files, 0);
+
+        let remaining_calls: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM relationships WHERE source_symbol_id = ?1",
+                params![run],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining_calls, 0,
+            "the dangling edge was removed, not left dangling"
+        );
+
+        let (target_text, kind): (String, String) = conn
+            .query_row(
+                "SELECT target_text, relationship_kind FROM unresolved_references
+                 WHERE source_symbol_id = ?1",
+                params![run],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(target_text, "doWork");
+        assert_eq!(kind, "calls");
     }
 }

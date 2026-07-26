@@ -63,13 +63,13 @@ Chain strategy: feature-branch-chain
 
 ## Phase 5: PR5 — Incremental Engine (req: incremental-index core, symbol-index "Skips Unchanged")
 
-- [ ] 5.1 Create `crates/codekurve/src/incremental.rs`: `FileChange` enum, `detect()` (mtime/size fast path, hash confirm).
-- [ ] 5.2 `repo.rs`: per-file create/update primitives + delete cascade (own symbols/outbound edges removed, inbound edges → `unresolved_references`) + `index_state` upsert.
-- [ ] 5.3 `apply_batch()`: T1 (`pending_files` count) → parse+resolve `B ∪ D` (no DB writes) → T2 (per-file delete+reinsert, `pending_files=0`, `last_verified_at`), all per design's Batch Atomicity section.
-- [ ] 5.4 Oversized-batch fallback: `|B ∪ D| > full_reindex_threshold_pct` → call existing `reindex`.
-- [ ] 5.5 `commands.rs`: rewire `index()` to call `detect`/`apply_batch` instead of always-full reindex.
-- [ ] 5.6 Test: `detect` classifies touch-only/changed/deleted correctly (tempdir + in-memory DB).
-- [ ] 5.7 Test: failed batch rolls back fully, `pending_files` stays nonzero (mirrors `reindex_rolls_back_completely_on_relationship_error`).
+- [x] 5.1 Create `crates/codekurve/src/incremental.rs`: `FileChange` enum, `detect()` (mtime/size fast path, hash confirm).
+- [x] 5.2 `repo.rs`: per-file create/update primitives + delete cascade (own symbols/outbound edges removed, inbound edges → `unresolved_references`) + `index_state` upsert.
+- [x] 5.3 `apply_batch()`: T1 (`pending_files` count) → parse+resolve `B ∪ D` (no DB writes) → T2 (per-file delete+reinsert, `pending_files=0`, `last_verified_at`), all per design's Batch Atomicity section.
+- [x] 5.4 Oversized-batch fallback: `|B ∪ D| > full_reindex_threshold_pct` → call existing `reindex`.
+- [x] 5.5 `commands.rs`: rewire `index()` to call `detect`/`apply_batch` instead of always-full reindex.
+- [x] 5.6 Test: `detect` classifies touch-only/changed/deleted correctly (tempdir + in-memory DB).
+- [x] 5.7 Test: failed batch rolls back fully, `pending_files` stays nonzero (mirrors `reindex_rolls_back_completely_on_relationship_error`).
 
 ## Phase 6: PR6 — Watch Command (req: file-watcher, all requirements)
 
