@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use codekurve_core::{Confidence, Provenance, RelationshipKind, SourceSpan, Symbol};
+use codekurve_core::{Confidence, Provenance, RelationshipKind, SourceSpan, Symbol, SymbolKind};
 use rusqlite::{params, Connection, Row, Transaction};
 
 use crate::error::Result;
@@ -599,6 +599,142 @@ pub fn find_by_name(conn: &Connection, project_id: &str, name: &str) -> Result<V
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// One stored symbol as needed by `codekurve-analysis::resolve::BaselineSymbol`
+/// (design "Baseline for re-resolution", task 4.3). `codekurve-store` never
+/// depends on `codekurve-analysis` — the caller (`codekurve/src/commands.rs`,
+/// task 4.4) maps this into the analysis-side type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineSymbolRow {
+    pub name: String,
+    pub relative_path: String,
+    pub qualified_name: String,
+    pub kind: SymbolKind,
+    /// Mirrors `SymbolTable::build`'s own `exports` fallback (resolve.rs):
+    /// true when a persisted `kind = 'exports'` relationship targets this
+    /// symbol, i.e. it was resolvable as an import binding at index time.
+    pub exported: bool,
+}
+
+/// Every currently stored file path plus symbol row for `project_id` —
+/// everything `resolve::ProjectBaseline` needs (task 4.3). Module stand-in
+/// symbols (`kind = 'module'`, `commands.rs`'s `module_symbol`) are excluded:
+/// they're a storage-only construct, never part of a fresh
+/// `SymbolTable::build`'s input.
+#[derive(Debug, Clone, Default)]
+pub struct ResolutionSnapshot {
+    pub files: Vec<String>,
+    pub symbols: Vec<BaselineSymbolRow>,
+}
+
+/// Reads back the whole-project baseline `resolve::resolve_with` needs to
+/// re-resolve an incremental batch without re-parsing every already-indexed
+/// file (design "Baseline for re-resolution"). Unlike the dependent-set
+/// queries below, this isn't scoped to a changed set — it's the full prior
+/// index, cheap to read back (design: "Reading rows is far cheaper than
+/// tree-sitter").
+pub fn resolution_snapshot(conn: &Connection, project_id: &str) -> Result<ResolutionSnapshot> {
+    let mut file_stmt = conn.prepare("SELECT relative_path FROM files WHERE project_id = ?1")?;
+    let files = file_stmt
+        .query_map(params![project_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut sym_stmt = conn.prepare(
+        "SELECT s.name, f.relative_path, s.qualified_name, s.kind,
+                EXISTS(SELECT 1 FROM relationships r
+                       WHERE r.target_symbol_id = s.id AND r.kind = 'exports') AS exported
+         FROM symbols s
+         JOIN files f ON f.id = s.file_id
+         WHERE s.project_id = ?1 AND s.kind != 'module'",
+    )?;
+    let symbols = sym_stmt
+        .query_map(params![project_id], |row| {
+            let kind: String = row.get(3)?;
+            Ok(BaselineSymbolRow {
+                name: row.get(0)?,
+                relative_path: row.get(1)?,
+                qualified_name: row.get(2)?,
+                kind: parse_symbol_kind(&kind),
+                exported: row.get::<_, i64>(4)? != 0,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(ResolutionSnapshot { files, symbols })
+}
+
+/// Dependent-set query 1 (design "Dependent Re-Resolution Scope", trigger
+/// "B removed/renamed a symbol"): every file (outside `changed_files`, i.e.
+/// `B`) with a relationship pointing at one of `target_symbol_ids` — a
+/// symbol the incremental batch just changed or deleted. Bounded by
+/// `idx_relationships_target_kind`: `target_symbol_id` is its leading
+/// column, so an IN-list lookup stays a set of index seeks.
+pub fn dependents_by_target_symbol(
+    conn: &Connection,
+    project_id: &str,
+    target_symbol_ids: &[String],
+    changed_files: &[String],
+) -> Result<Vec<String>> {
+    if target_symbol_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = target_symbol_ids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT DISTINCT f.relative_path
+         FROM relationships r
+         JOIN files f ON f.id = r.source_file_id
+         WHERE r.project_id = ? AND r.target_symbol_id IN ({placeholders})"
+    );
+    let mut binds: Vec<&str> = vec![project_id];
+    binds.extend(target_symbol_ids.iter().map(String::as_str));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter().copied()), |row| {
+        row.get::<_, String>(0)
+    })?;
+    let mut out = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    out.retain(|path| !changed_files.iter().any(|f| f == path));
+    Ok(out)
+}
+
+/// Dependent-set query 2 (design "Dependent Re-Resolution Scope", trigger
+/// "B added a symbol / new file others import"): every file with an
+/// `unresolved_references` row whose `target_text` matches one of
+/// `target_texts` (names/module specifiers the incremental batch might now
+/// satisfy). Bounded by `idx_unresolved_project_target`
+/// (`project_id, target_text`).
+pub fn dependents_by_unresolved_target(
+    conn: &Connection,
+    project_id: &str,
+    target_texts: &[String],
+) -> Result<Vec<String>> {
+    if target_texts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = target_texts
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT DISTINCT f.relative_path
+         FROM unresolved_references u
+         JOIN files f ON f.id = u.source_file_id
+         WHERE u.project_id = ? AND u.target_text IN ({placeholders})"
+    );
+    let mut binds: Vec<&str> = vec![project_id];
+    binds.extend(target_texts.iter().map(String::as_str));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter().copied()), |row| {
+        row.get::<_, String>(0)
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Stable BLAKE3 content hash of the config text.
 pub fn config_hash(config_text: &str) -> String {
     blake3::hash(config_text.as_bytes()).to_hex().to_string()
@@ -627,6 +763,31 @@ fn map_stored(row: &Row) -> rusqlite::Result<StoredSymbol> {
             end_column: row.get::<_, i64>(10)? as usize,
         },
     })
+}
+
+/// Reverse of `SymbolKind::as_str` (codekurve-core), for reading `symbols.kind`
+/// text columns back into the enum (`resolution_snapshot`). Every stored
+/// value was written by `as_str` itself (`reindex`), so the fallback is
+/// unreachable in practice — kept total rather than panicking on a read path.
+fn parse_symbol_kind(s: &str) -> SymbolKind {
+    match s {
+        "namespace" => SymbolKind::Namespace,
+        "class" => SymbolKind::Class,
+        "interface" => SymbolKind::Interface,
+        "struct" => SymbolKind::Struct,
+        "enum" => SymbolKind::Enum,
+        "function" => SymbolKind::Function,
+        "method" => SymbolKind::Method,
+        "constructor" => SymbolKind::Constructor,
+        "property" => SymbolKind::Property,
+        "field" => SymbolKind::Field,
+        "variable" => SymbolKind::Variable,
+        "parameter" => SymbolKind::Parameter,
+        "typealias" => SymbolKind::TypeAlias,
+        "import" => SymbolKind::Import,
+        "export" => SymbolKind::Export,
+        _ => SymbolKind::Module,
+    }
 }
 
 fn hash_id(prefix: &str, input: &str) -> String {
@@ -1269,5 +1430,204 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, interface);
         assert_eq!(hits[0].qualified_name, "src/member.ts::IMemberService");
+    }
+
+    /// Task 4.6 (design "Dependent Re-Resolution Scope", relationship-graph
+    /// MODIFIED "Affected-Set Resolution for Incremental Batches"): `a.ts`
+    /// exports `doWork`, `b.ts` calls it, `c.ts` is unrelated. When `a.ts`
+    /// changes, `dependents_by_target_symbol` must surface `b.ts` and must
+    /// NOT surface `c.ts`.
+    #[test]
+    fn dependents_by_target_symbol_finds_only_true_dependents() {
+        let mut conn = db::open_in_memory().unwrap();
+        let project = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        let files = vec![
+            FileInput {
+                relative_path: "src/a.ts".to_string(),
+                language: "typescript".to_string(),
+                size_bytes: 10,
+                symbols: vec![symbol("doWork", SymbolKind::Function, 0)],
+            },
+            FileInput {
+                relative_path: "src/b.ts".to_string(),
+                language: "typescript".to_string(),
+                size_bytes: 10,
+                symbols: vec![symbol("run", SymbolKind::Function, 0)],
+            },
+            FileInput {
+                relative_path: "src/c.ts".to_string(),
+                language: "typescript".to_string(),
+                size_bytes: 10,
+                symbols: vec![symbol("unrelated", SymbolKind::Function, 0)],
+            },
+        ];
+        reindex(&mut conn, &project, &files, &[], &[]).unwrap();
+
+        let sym_id = |path: &str, name: &str| -> String {
+            conn.query_row(
+                "SELECT s.id FROM symbols s JOIN files f ON f.id = s.file_id
+                 WHERE f.relative_path = ?1 AND s.name = ?2",
+                params![path, name],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let fil_id = |path: &str| -> String {
+            conn.query_row(
+                "SELECT id FROM files WHERE relative_path = ?1",
+                params![path],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let do_work = sym_id("src/a.ts", "doWork");
+        let run = sym_id("src/b.ts", "run");
+        let file_b = fil_id("src/b.ts");
+
+        let relationships = vec![RelationshipInput {
+            source_symbol_id: run,
+            target_symbol_id: Some(do_work.clone()),
+            target_external: None,
+            kind: RelationshipKind::Calls,
+            provenance: Provenance::Extracted,
+            confidence: Confidence::Exact,
+            source_file_id: file_b,
+            start_line: Some(1),
+            start_column: Some(0),
+            reason: None,
+        }];
+        reindex(&mut conn, &project, &files, &relationships, &[]).unwrap();
+
+        let dependents =
+            dependents_by_target_symbol(&conn, &project, &[do_work], &["src/a.ts".to_string()])
+                .unwrap();
+        assert_eq!(dependents, vec!["src/b.ts".to_string()]);
+    }
+
+    /// Task 4.6, `unresolved_references` side: `c.ts` has an unresolved
+    /// `doStuff` reference; `dependents_by_unresolved_target` must surface it
+    /// when `doStuff` is one of the newly-satisfiable target texts, and must
+    /// NOT surface an unrelated `d.ts` with a different unresolved target.
+    #[test]
+    fn dependents_by_unresolved_target_finds_only_matching_targets() {
+        let mut conn = db::open_in_memory().unwrap();
+        let project = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        let files = vec![
+            FileInput {
+                relative_path: "src/c.ts".to_string(),
+                language: "typescript".to_string(),
+                size_bytes: 10,
+                symbols: vec![],
+            },
+            FileInput {
+                relative_path: "src/d.ts".to_string(),
+                language: "typescript".to_string(),
+                size_bytes: 10,
+                symbols: vec![],
+            },
+        ];
+        reindex(&mut conn, &project, &files, &[], &[]).unwrap();
+        let fil_id = |path: &str| -> String {
+            conn.query_row(
+                "SELECT id FROM files WHERE relative_path = ?1",
+                params![path],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let unresolved = vec![
+            UnresolvedReferenceInput {
+                source_symbol_id: None,
+                source_file_id: fil_id("src/c.ts"),
+                relationship_kind: RelationshipKind::Calls,
+                target_text: "doStuff".to_string(),
+                context_json: None,
+                candidate_count: 0,
+                reason: "zero candidates".to_string(),
+                confidence: Confidence::Unresolved,
+            },
+            UnresolvedReferenceInput {
+                source_symbol_id: None,
+                source_file_id: fil_id("src/d.ts"),
+                relationship_kind: RelationshipKind::Calls,
+                target_text: "doOther".to_string(),
+                context_json: None,
+                candidate_count: 0,
+                reason: "zero candidates".to_string(),
+                confidence: Confidence::Unresolved,
+            },
+        ];
+        reindex(&mut conn, &project, &files, &[], &unresolved).unwrap();
+
+        let dependents =
+            dependents_by_unresolved_target(&conn, &project, &["doStuff".to_string()]).unwrap();
+        assert_eq!(dependents, vec!["src/c.ts".to_string()]);
+    }
+
+    /// Task 4.3: `resolution_snapshot` reads back every file plus every
+    /// non-module symbol, tagging `exported` from the persisted `exports`
+    /// relationship — `MemberService`'s class-decl fallback path never
+    /// stores an `exports` edge in this fixture, so `findMember` (explicitly
+    /// exported below) is the one asserted true.
+    #[test]
+    fn resolution_snapshot_reads_files_and_symbols() {
+        let mut conn = seed();
+        let pid = project_id(&conn);
+        let source_id: String = conn
+            .query_row(
+                "SELECT id FROM symbols WHERE name = 'MemberService'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let target_id: String = conn
+            .query_row(
+                "SELECT id FROM symbols WHERE name = 'findMember'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let file_id: String = conn
+            .query_row("SELECT id FROM files LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let files = vec![FileInput {
+            relative_path: "src/member.ts".to_string(),
+            language: "typescript".to_string(),
+            size_bytes: 42,
+            symbols: vec![
+                symbol("MemberService", SymbolKind::Class, 0),
+                symbol("findMember", SymbolKind::Function, 100),
+            ],
+        }];
+        let relationships = vec![RelationshipInput {
+            source_symbol_id: source_id,
+            target_symbol_id: Some(target_id.clone()),
+            target_external: None,
+            kind: RelationshipKind::Exports,
+            provenance: Provenance::Extracted,
+            confidence: Confidence::Exact,
+            source_file_id: file_id,
+            start_line: None,
+            start_column: None,
+            reason: None,
+        }];
+        reindex(&mut conn, &pid, &files, &relationships, &[]).unwrap();
+
+        let snapshot = resolution_snapshot(&conn, &pid).unwrap();
+        assert_eq!(snapshot.files, vec!["src/member.ts".to_string()]);
+        assert_eq!(snapshot.symbols.len(), 2);
+        let find_member = snapshot
+            .symbols
+            .iter()
+            .find(|s| s.name == "findMember")
+            .unwrap();
+        assert_eq!(find_member.kind, SymbolKind::Function);
+        assert!(find_member.exported);
+        let member_service = snapshot
+            .symbols
+            .iter()
+            .find(|s| s.name == "MemberService")
+            .unwrap();
+        assert!(!member_service.exported);
     }
 }

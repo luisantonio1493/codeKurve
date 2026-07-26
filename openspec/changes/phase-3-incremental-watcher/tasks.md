@@ -54,12 +54,12 @@ Chain strategy: feature-branch-chain
 
 ## Phase 4: PR4 — Affected-Set Resolution (req: relationship-graph "Affected-Set Resolution")
 
-- [ ] 4.1 `resolve.rs`: add `ProjectBaseline` + `resolve_with(files, aliases, baseline)`; `resolve()` delegates with `EMPTY`.
-- [ ] 4.2 `SymbolTable::build` seeds `by_name`/`exports` from baseline before folding fresh analyses.
-- [ ] 4.3 `repo.rs`: add `resolution_snapshot(conn, project_id)` (files/symbols/exports queries per design table).
-- [ ] 4.4 `commands.rs`: map store rows → `ProjectBaseline`.
-- [ ] 4.5 Add dependent-set queries: target-symbol lookup (`idx_relationships_target_kind`) and unresolved-target lookup (`idx_unresolved_project_target`).
-- [ ] 4.6 Test: incremental batch re-resolves only the affected dependent set, not unrelated files.
+- [x] 4.1 `resolve.rs`: add `ProjectBaseline` + `resolve_with(files, aliases, baseline)`; `resolve()` delegates with `EMPTY`.
+- [x] 4.2 `SymbolTable::build` seeds `by_name`/`exports` from baseline before folding fresh analyses.
+- [x] 4.3 `repo.rs`: add `resolution_snapshot(conn, project_id)` (files/symbols/exports queries per design table).
+- [x] 4.4 `commands.rs`: map store rows → `ProjectBaseline`.
+- [x] 4.5 Add dependent-set queries: target-symbol lookup (`idx_relationships_target_kind`) and unresolved-target lookup (`idx_unresolved_project_target`).
+- [x] 4.6 Test: incremental batch re-resolves only the affected dependent set, not unrelated files.
 
 ## Phase 5: PR5 — Incremental Engine (req: incremental-index core, symbol-index "Skips Unchanged")
 

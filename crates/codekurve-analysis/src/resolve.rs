@@ -36,6 +36,50 @@ pub(crate) struct ProjectSymbol {
     pub(crate) kind: SymbolKind,
 }
 
+/// One symbol read back from prior storage — everything `SymbolTable::build`
+/// needs to seed `by_name`/`exports` without re-parsing the file it came
+/// from (design "Baseline for re-resolution", Phase 3 task 4.2). `exported`
+/// mirrors what a fresh parse's `SymbolTable::build` fallback records: every
+/// top-level Class/Function/Interface counts as its own module's export
+/// (see the fallback loop below) — the store side
+/// (`codekurve-store::repo::resolution_snapshot`) derives the same signal
+/// from a persisted `kind = 'exports'` relationship targeting the symbol.
+#[derive(Debug, Clone)]
+pub struct BaselineSymbol {
+    pub name: String,
+    pub file: String,
+    pub qualified_name: String,
+    pub kind: SymbolKind,
+    pub exported: bool,
+}
+
+/// Prior-index snapshot fed into `resolve_with` for an incremental batch
+/// (design "Baseline for re-resolution"): symbols and known file paths from
+/// files this batch is NOT re-parsing, so cross-file resolution against
+/// already-indexed files works without re-parsing them. `EMPTY` is what
+/// `resolve()`'s full-reindex path seeds with — every file is freshly
+/// parsed there, so there is nothing to seed.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectBaseline {
+    files: Vec<String>,
+    symbols: Vec<BaselineSymbol>,
+}
+
+impl ProjectBaseline {
+    pub const EMPTY: ProjectBaseline = ProjectBaseline {
+        files: Vec::new(),
+        symbols: Vec::new(),
+    };
+
+    /// Composition-root constructor (task 4.4): `codekurve/src/commands.rs`
+    /// maps `codekurve-store::repo::resolution_snapshot`'s rows into this —
+    /// `codekurve-store` never depends on `codekurve-analysis`, so the glue
+    /// lives in the binary crate instead.
+    pub fn new(files: Vec<String>, symbols: Vec<BaselineSymbol>) -> Self {
+        Self { files, symbols }
+    }
+}
+
 /// Whole-project symbol index built from every file's `FileAnalysis`.
 pub struct SymbolTable {
     /// Bare name -> every symbol in the project sharing it, for by-name
@@ -48,7 +92,35 @@ pub struct SymbolTable {
 
 impl SymbolTable {
     pub fn build(files: &[FileAnalysis]) -> Self {
+        Self::build_with(files, &ProjectBaseline::EMPTY)
+    }
+
+    /// Task 4.2 (design "Baseline for re-resolution"): seeds `by_name`/
+    /// `exports` from `baseline` BEFORE folding in `files`' fresh per-file
+    /// analyses below, so a batch that only reparsed the affected set still
+    /// resolves against every already-indexed symbol without re-parsing it.
+    pub(crate) fn build_with(files: &[FileAnalysis], baseline: &ProjectBaseline) -> Self {
         let mut by_name: HashMap<String, Vec<ProjectSymbol>> = HashMap::new();
+        let mut exports: HashMap<String, HashMap<String, ProjectSymbol>> = HashMap::new();
+
+        for entry in &baseline.symbols {
+            let ps = ProjectSymbol {
+                file: entry.file.clone(),
+                qualified_name: entry.qualified_name.clone(),
+                kind: entry.kind,
+            };
+            by_name
+                .entry(entry.name.clone())
+                .or_default()
+                .push(ps.clone());
+            if entry.exported {
+                exports
+                    .entry(entry.file.clone())
+                    .or_default()
+                    .insert(entry.name.clone(), ps);
+            }
+        }
+
         for file in files {
             for sym in &file.symbols {
                 by_name
@@ -62,7 +134,6 @@ impl SymbolTable {
             }
         }
 
-        let mut exports: HashMap<String, HashMap<String, ProjectSymbol>> = HashMap::new();
         for file in files {
             let by_local_key: HashMap<&str, &crate::ir::ExtractedSymbol> = file
                 .symbols
@@ -234,10 +305,25 @@ pub struct ResolutionReport {
 /// against the whole-project `SymbolTable`, in place. Zero-candidate edges
 /// move to `FileAnalysis.unresolved` (never dropped, §18.3); multi-candidate
 /// edges become one Low-confidence edge per candidate (never pick first,
-/// §20.4).
+/// §20.4). Thin wrapper (task 4.1) — a full reindex has already parsed
+/// every file, so there is no baseline to seed `resolve_with` from.
 pub fn resolve(files: &mut [FileAnalysis], aliases: &TsconfigAliases) -> ResolutionReport {
-    let table = SymbolTable::build(&*files);
-    let known_files: HashSet<String> = files.iter().map(|f| f.file.clone()).collect();
+    resolve_with(files, aliases, &ProjectBaseline::EMPTY)
+}
+
+/// Task 4.1 (design "Baseline for re-resolution"): same as `resolve`, but
+/// seeds the whole-project `SymbolTable` from `baseline` first — an
+/// incremental batch's affected-set files can then resolve cross-file edges
+/// (both by-name and module-specifier imports) against already-indexed
+/// files without re-parsing them.
+pub fn resolve_with(
+    files: &mut [FileAnalysis],
+    aliases: &TsconfigAliases,
+    baseline: &ProjectBaseline,
+) -> ResolutionReport {
+    let table = SymbolTable::build_with(&*files, baseline);
+    let mut known_files: HashSet<String> = files.iter().map(|f| f.file.clone()).collect();
+    known_files.extend(baseline.files.iter().cloned());
     let mut report = ResolutionReport::default();
 
     for file in files.iter_mut() {
@@ -733,6 +819,62 @@ mod tests {
         assert!(calls.iter().all(|r| r.confidence == Confidence::Low));
         assert!(calls.iter().all(|r| r.provenance == Provenance::Heuristic));
         assert!(files[0].unresolved.is_empty());
+    }
+
+    /// Task 4.1/4.2 (design "Baseline for re-resolution"): `resolve_with`
+    /// resolves a batch file's call/import against a `ProjectBaseline`
+    /// symbol from a file that is NOT in `files` at all (never re-parsed),
+    /// exercising both `by_name` (`Calls`) and `exports`/`known_files`
+    /// (`Imports`) seeding in one pass.
+    #[test]
+    fn resolve_with_baseline_resolves_against_unparsed_file() {
+        let mut files = vec![analyzed(
+            "src/caller.ts",
+            "import { doWork } from './worker';\nfunction run() { return doWork(); }\n",
+        )];
+        let baseline = ProjectBaseline::new(
+            vec!["src/worker.ts".to_string()],
+            vec![BaselineSymbol {
+                name: "doWork".to_string(),
+                file: "src/worker.ts".to_string(),
+                qualified_name: "src/worker.ts::doWork".to_string(),
+                kind: SymbolKind::Function,
+                exported: true,
+            }],
+        );
+
+        let report = resolve_with(&mut files, &TsconfigAliases::new(), &baseline);
+        assert_eq!(report.unresolved, 0);
+
+        let expected = EdgeTarget::Global {
+            file: "src/worker.ts".to_string(),
+            qualified_name: "src/worker.ts::doWork".to_string(),
+        };
+        let import = files[0]
+            .relationships
+            .iter()
+            .find(|r| r.kind == RelationshipKind::Imports)
+            .unwrap();
+        assert_eq!(import.target, expected);
+        let call = files[0]
+            .relationships
+            .iter()
+            .find(|r| r.kind == RelationshipKind::Calls)
+            .unwrap();
+        assert_eq!(call.target, expected);
+    }
+
+    /// `resolve()` still delegates to `EMPTY` (zero regression, task 4.1):
+    /// with no baseline, the same unparsed-file import is legitimately
+    /// unresolved.
+    #[test]
+    fn resolve_without_baseline_leaves_unparsed_file_unresolved() {
+        let mut files = vec![analyzed(
+            "src/caller.ts",
+            "import { doWork } from './worker';\n",
+        )];
+        let report = resolve(&mut files, &TsconfigAliases::new());
+        assert_eq!(report.unresolved, 1);
     }
 
     /// Zero candidates anywhere in the project -> `UnresolvedReference`,

@@ -281,6 +281,32 @@ fn build_unresolved(
     out
 }
 
+/// Composition-root mapping (task 4.4, design "Baseline for
+/// re-resolution"): `codekurve-store::repo::resolution_snapshot`'s rows ->
+/// `codekurve-analysis::resolve::ProjectBaseline`. `codekurve-store` never
+/// depends on `codekurve-analysis`, so this glue lives here, matching
+/// `build_file_inputs`'s IR -> store-input mapping just above.
+///
+/// ponytail: not called yet — PR5's `apply_batch` is the first caller that
+/// has an incremental batch to seed. Wiring it here now ships the seam PR5
+/// needs without pulling `incremental.rs`/`apply_batch` (out of this PR's
+/// scope) forward.
+#[allow(dead_code)]
+fn project_baseline(snapshot: repo::ResolutionSnapshot) -> resolve::ProjectBaseline {
+    let symbols = snapshot
+        .symbols
+        .into_iter()
+        .map(|row| resolve::BaselineSymbol {
+            name: row.name,
+            file: row.relative_path,
+            qualified_name: row.qualified_name,
+            kind: row.kind,
+            exported: row.exported,
+        })
+        .collect();
+    resolve::ProjectBaseline::new(snapshot.files, symbols)
+}
+
 /// Minimal `tsconfig.json` `compilerOptions.paths` loader (design's
 /// minimal-scope decision): single-`*`-prefix pattern -> first array entry
 /// only, no `baseUrl` chains, no full JSON parser (`serde_json` is scoped to
