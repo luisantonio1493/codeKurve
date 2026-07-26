@@ -48,9 +48,9 @@ Chain strategy: feature-branch-chain
 
 ## Phase 3: PR3 — Stable Relationship/Unresolved Ids (req: relationship-graph "Atomic Persistence")
 
-- [ ] 3.1 `repo.rs`: add `stable_id(prefix, seen, parts)` helper.
-- [ ] 3.2 Rewrite `persist_relationships`/`persist_unresolved` to use it with the design's tuples.
-- [ ] 3.3 Test: same rows persisted in one batch vs. per-file batches yield identical id sets.
+- [x] 3.1 `repo.rs`: add `stable_id(prefix, seen, parts)` helper.
+- [x] 3.2 Rewrite `persist_relationships`/`persist_unresolved` to use it with the design's tuples.
+- [x] 3.3 Test: same rows persisted in one batch vs. per-file batches yield identical id sets.
 
 ## Phase 4: PR4 — Affected-Set Resolution (req: relationship-graph "Affected-Set Resolution")
 

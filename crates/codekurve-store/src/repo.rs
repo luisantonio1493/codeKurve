@@ -2,6 +2,7 @@
 //! rebuild its index transactionally, and query symbols. See
 //! CODEKURVE_MASTER_PLAN.md §24 (schema) and §Fase 1 (scope).
 
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use codekurve_core::{Confidence, Provenance, RelationshipKind, SourceSpan, Symbol};
@@ -238,14 +239,46 @@ pub fn reindex(
     Ok(outcome)
 }
 
+/// Content-derived id; the ordinal only disambiguates rows whose entire
+/// content tuple is identical (e.g. the same call twice on one line).
+/// Design "Stable Row Ids": replaces deriving `rel`/`unr` ids from a
+/// positional index, which churns under per-batch (incremental) persistence
+/// since the same logical row lands at a different index per batch.
+fn stable_id(prefix: &str, seen: &mut HashMap<String, u32>, parts: &[&str]) -> String {
+    let base = parts.join("\u{1f}");
+    let n = seen.entry(base.clone()).or_default();
+    let id = hash_id(prefix, &format!("{base}\u{1f}{n}"));
+    *n += 1;
+    id
+}
+
 fn persist_relationships(
     tx: &Transaction,
     project_id: &str,
     ts: &str,
     relationships: &[RelationshipInput],
 ) -> Result<()> {
-    for (i, rel) in relationships.iter().enumerate() {
-        let id = hash_id("rel", &format!("{project_id}/{}/{i}", rel.source_symbol_id));
+    let mut seen = HashMap::new();
+    for rel in relationships {
+        let target = rel
+            .target_symbol_id
+            .as_deref()
+            .or(rel.target_external.as_deref())
+            .unwrap_or("");
+        let start_line = rel.start_line.map(|v| v.to_string()).unwrap_or_default();
+        let start_column = rel.start_column.map(|v| v.to_string()).unwrap_or_default();
+        let id = stable_id(
+            "rel",
+            &mut seen,
+            &[
+                project_id,
+                &rel.source_symbol_id,
+                rel.kind.as_str(),
+                target,
+                &start_line,
+                &start_column,
+            ],
+        );
         tx.execute(
             "INSERT INTO relationships(id, project_id, source_symbol_id, target_symbol_id,
                  target_external, kind, provenance, confidence, source_file_id,
@@ -277,8 +310,20 @@ fn persist_unresolved(
     ts: &str,
     unresolved: &[UnresolvedReferenceInput],
 ) -> Result<()> {
-    for (i, u) in unresolved.iter().enumerate() {
-        let id = hash_id("unr", &format!("{project_id}/{}/{i}", u.source_file_id));
+    let mut seen = HashMap::new();
+    for u in unresolved {
+        let source_symbol = u.source_symbol_id.as_deref().unwrap_or("");
+        let id = stable_id(
+            "unr",
+            &mut seen,
+            &[
+                project_id,
+                &u.source_file_id,
+                source_symbol,
+                u.relationship_kind.as_str(),
+                &u.target_text,
+            ],
+        );
         tx.execute(
             "INSERT INTO unresolved_references(id, project_id, source_symbol_id, source_file_id,
                  relationship_kind, target_text, context_json, candidate_count, reason,
@@ -839,6 +884,151 @@ mod tests {
             .unwrap();
         assert_eq!(kind, "contains");
         assert_eq!(target.as_deref(), Some(target_id.as_str()));
+    }
+
+    /// PR3 task 3.3 (design "Stable Row Ids"): the same logical relationship
+    /// rows must get identical ids whether persisted in one full-batch call
+    /// or split across two per-file calls — the shape the incremental engine
+    /// (PR5) will use, one `persist_relationships` call per changed file.
+    #[test]
+    fn relationship_ids_match_full_batch_vs_split_by_file() {
+        let mut conn = db::open_in_memory().unwrap();
+        let project = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        let files = vec![
+            FileInput {
+                relative_path: "src/a.ts".to_string(),
+                language: "typescript".to_string(),
+                size_bytes: 10,
+                symbols: vec![
+                    symbol("Foo", SymbolKind::Class, 0),
+                    symbol("bar", SymbolKind::Function, 20),
+                ],
+            },
+            FileInput {
+                relative_path: "src/b.ts".to_string(),
+                language: "typescript".to_string(),
+                size_bytes: 10,
+                symbols: vec![
+                    symbol("Baz", SymbolKind::Class, 0),
+                    symbol("qux", SymbolKind::Function, 20),
+                ],
+            },
+        ];
+        reindex(&mut conn, &project, &files, &[], &[]).unwrap();
+
+        let sym_id = |path: &str, name: &str| -> String {
+            conn.query_row(
+                "SELECT s.id FROM symbols s JOIN files f ON f.id = s.file_id
+                 WHERE f.relative_path = ?1 AND s.name = ?2",
+                params![path, name],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let fil_id = |path: &str| -> String {
+            conn.query_row(
+                "SELECT id FROM files WHERE relative_path = ?1",
+                params![path],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let (foo, bar) = (sym_id("src/a.ts", "Foo"), sym_id("src/a.ts", "bar"));
+        let (baz, qux) = (sym_id("src/b.ts", "Baz"), sym_id("src/b.ts", "qux"));
+        let (file_a, file_b) = (fil_id("src/a.ts"), fil_id("src/b.ts"));
+
+        fn rel(source: &str, target: &str, file: &str) -> RelationshipInput {
+            RelationshipInput {
+                source_symbol_id: source.to_string(),
+                target_symbol_id: Some(target.to_string()),
+                target_external: None,
+                kind: RelationshipKind::Calls,
+                provenance: Provenance::Extracted,
+                confidence: Confidence::Exact,
+                source_file_id: file.to_string(),
+                start_line: Some(1),
+                start_column: Some(0),
+                reason: None,
+            }
+        }
+
+        let ids_of = |conn: &mut Connection, batches: Vec<Vec<RelationshipInput>>| -> Vec<String> {
+            let tx = conn.transaction().unwrap();
+            tx.execute("DELETE FROM relationships", []).unwrap();
+            for batch in &batches {
+                persist_relationships(&tx, &project, "ts1", batch).unwrap();
+            }
+            let mut ids = tx
+                .prepare("SELECT id FROM relationships")
+                .unwrap()
+                .query_map([], |r: &Row| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            tx.commit().unwrap();
+            ids.sort();
+            ids
+        };
+
+        let full_batch = vec![vec![rel(&foo, &bar, &file_a), rel(&baz, &qux, &file_b)]];
+        let full_ids = ids_of(&mut conn, full_batch);
+
+        let split_batches = vec![
+            vec![rel(&foo, &bar, &file_a)],
+            vec![rel(&baz, &qux, &file_b)],
+        ];
+        let split_ids = ids_of(&mut conn, split_batches);
+
+        assert_eq!(full_ids, split_ids);
+        assert_eq!(full_ids.len(), 2);
+    }
+
+    /// PR3 task 3.3, `unresolved_references` side of the same guarantee.
+    #[test]
+    fn unresolved_ids_match_full_batch_vs_split_by_file() {
+        let mut conn = db::open_in_memory().unwrap();
+        let project = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+
+        fn unr(file: &str, target: &str) -> UnresolvedReferenceInput {
+            UnresolvedReferenceInput {
+                source_symbol_id: None,
+                source_file_id: file.to_string(),
+                relationship_kind: RelationshipKind::Calls,
+                target_text: target.to_string(),
+                context_json: None,
+                candidate_count: 0,
+                reason: "zero candidates".to_string(),
+                confidence: Confidence::Low,
+            }
+        }
+
+        let ids_of =
+            |conn: &mut Connection, batches: Vec<Vec<UnresolvedReferenceInput>>| -> Vec<String> {
+                let tx = conn.transaction().unwrap();
+                tx.execute("DELETE FROM unresolved_references", []).unwrap();
+                for batch in &batches {
+                    persist_unresolved(&tx, &project, "ts1", batch).unwrap();
+                }
+                let mut ids = tx
+                    .prepare("SELECT id FROM unresolved_references")
+                    .unwrap()
+                    .query_map([], |r: &Row| r.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                tx.commit().unwrap();
+                ids.sort();
+                ids
+            };
+
+        let full_batch = vec![vec![unr("fil-a", "doStuff"), unr("fil-b", "doOther")]];
+        let full_ids = ids_of(&mut conn, full_batch);
+
+        let split_batches = vec![vec![unr("fil-a", "doStuff")], vec![unr("fil-b", "doOther")]];
+        let split_ids = ids_of(&mut conn, split_batches);
+
+        assert_eq!(full_ids, split_ids);
+        assert_eq!(full_ids.len(), 2);
     }
 
     /// PR4b task 4b.6 / spec scenario "Atomic persistence on failure": a
