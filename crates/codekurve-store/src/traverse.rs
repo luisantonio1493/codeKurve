@@ -385,6 +385,7 @@ mod tests {
                 end_column: 1,
             },
             parent: None,
+            signature_fingerprint: String::new(),
         }
     }
 

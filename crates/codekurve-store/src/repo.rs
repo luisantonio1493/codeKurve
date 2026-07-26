@@ -75,10 +75,20 @@ pub fn file_id(project_id: &str, relative_path: &str) -> String {
     hash_id("fil", &format!("{project_id}/{relative_path}"))
 }
 
-/// §16.3: excludes `start_byte` so unrelated edits shifting later byte
-/// offsets don't change unaffected symbols' identity.
-pub fn symbol_key(language: &str, relative_path: &str, kind: &str, qualified_name: &str) -> String {
-    format!("{language}/{relative_path}/{kind}/{qualified_name}")
+/// §16.3 + Phase 3: BLAKE3 over the 5-tuple, still excluding `start_byte`.
+/// `\x1f` (unit separator) delimits components so a path containing `/`
+/// cannot shift a boundary and forge another symbol's key.
+pub fn symbol_key(
+    language: &str,
+    relative_path: &str,
+    kind: &str,
+    qualified_name: &str,
+    signature_fingerprint: &str,
+) -> String {
+    let input = format!(
+        "{language}\u{1f}{relative_path}\u{1f}{kind}\u{1f}{qualified_name}\u{1f}{signature_fingerprint}"
+    );
+    blake3::hash(input.as_bytes()).to_hex().to_string()
 }
 
 /// Deterministic symbol storage id from a precomputed `file_id`/`symbol_key`
@@ -177,6 +187,7 @@ pub fn reindex(
                 &file.relative_path,
                 symbol.kind.as_str(),
                 &symbol.qualified_name,
+                &symbol.signature_fingerprint,
             );
             let symbol_id = symbol_id(&file_id, &symbol_key);
             let qualified = &symbol.qualified_name;
@@ -608,6 +619,7 @@ mod tests {
                 end_column: 1,
             },
             parent: None,
+            signature_fingerprint: String::new(),
         }
     }
 
@@ -711,6 +723,63 @@ mod tests {
             )
             .unwrap();
         assert_eq!(before, after);
+    }
+
+    /// Task 2.7 (symbol-index MODIFIED "Stable Symbol Key ... Uses BLAKE3"):
+    /// `signature_fingerprint` is the 5th `symbol_key` component. A
+    /// position-only reindex (blank-line-only edit, same pattern as
+    /// `symbol_key_excludes_start_byte`) must not change the key; a
+    /// signature edit (params/return type) must.
+    #[test]
+    fn symbol_key_changes_on_signature_edit() {
+        let mut conn = seed();
+        let pid = project_id(&conn);
+        let before: String = conn
+            .query_row(
+                "SELECT symbol_key FROM symbols WHERE name = 'findMember'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // Same signature (empty fingerprint), only position shifted.
+        let files = vec![FileInput {
+            relative_path: "src/member.ts".to_string(),
+            language: "typescript".to_string(),
+            size_bytes: 42,
+            symbols: vec![
+                symbol("MemberService", SymbolKind::Class, 0),
+                symbol("findMember", SymbolKind::Function, 200),
+            ],
+        }];
+        reindex(&mut conn, &pid, &files, &[], &[]).unwrap();
+        let unchanged: String = conn
+            .query_row(
+                "SELECT symbol_key FROM symbols WHERE name = 'findMember'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, unchanged, "blank-line-only edit must not re-key");
+
+        // Signature changed (e.g. a parameter added).
+        let mut resigned = symbol("findMember", SymbolKind::Function, 200);
+        resigned.signature_fingerprint = "\u{1f}(id: string)\u{1f}void".to_string();
+        let files = vec![FileInput {
+            relative_path: "src/member.ts".to_string(),
+            language: "typescript".to_string(),
+            size_bytes: 42,
+            symbols: vec![symbol("MemberService", SymbolKind::Class, 0), resigned],
+        }];
+        reindex(&mut conn, &pid, &files, &[], &[]).unwrap();
+        let after: String = conn
+            .query_row(
+                "SELECT symbol_key FROM symbols WHERE name = 'findMember'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(before, after, "signature edit must re-key");
     }
 
     /// PR3 task 3.3: `persist_relationships` (wired in PR2 with empty vecs)

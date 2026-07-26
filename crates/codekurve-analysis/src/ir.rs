@@ -28,6 +28,11 @@ pub struct ExtractedSymbol {
     pub span: SourceSpan,
     pub parent: Option<String>,
     pub is_exported: bool,
+    /// Whitespace-normalized `type_parameters`/`parameters`/`return_type`
+    /// declaration text, `\x1f`-joined; empty for kinds with no call
+    /// signature (class/interface). Feeds `symbol_key`'s 5th tuple element
+    /// (design "symbol_key and signature_fingerprint").
+    pub signature_fingerprint: String,
 }
 
 /// A relationship edge extracted from one file, before its target is

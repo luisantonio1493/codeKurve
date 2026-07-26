@@ -160,4 +160,8 @@ pub struct Symbol {
     pub span: SourceSpan,
     /// Enclosing symbol name (e.g. the class a method belongs to), if any.
     pub parent: Option<String>,
+    /// See `ExtractedSymbol::signature_fingerprint` (codekurve-analysis
+    /// ir.rs) — carried through unchanged to feed `symbol_key`'s 5th
+    /// tuple element.
+    pub signature_fingerprint: String,
 }

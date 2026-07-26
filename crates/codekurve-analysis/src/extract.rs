@@ -700,8 +700,22 @@ fn push_named(
         // ponytail: export detection deferred to import/export edge
         // extraction (whole-project resolution, later phase slice).
         is_exported: false,
+        signature_fingerprint: signature_fingerprint(node, source),
     });
     Some(name)
+}
+
+/// design "symbol_key and signature_fingerprint": whitespace-normalized
+/// declaration text of `type_parameters`/`parameters`/`return_type`,
+/// `\x1f`-joined. Empty for declarations without a call signature
+/// (class/interface/module stand-in).
+fn signature_fingerprint(node: Node, source: &[u8]) -> String {
+    ["type_parameters", "parameters", "return_type"]
+        .iter()
+        .filter_map(|f| node.child_by_field_name(f)?.utf8_text(source).ok())
+        .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join("\u{1f}")
 }
 
 fn span_of(node: Node) -> SourceSpan {
@@ -935,5 +949,67 @@ function alsoTop() {
             EdgeTarget::Local("src/refs.ts::Widget".to_string())
         );
         assert_eq!(reference.confidence, Confidence::Exact);
+    }
+
+    /// design "symbol_key and signature_fingerprint": params/return-type
+    /// text feeds the fingerprint (whitespace-normalized); a class has no
+    /// call signature, so its fingerprint is empty.
+    #[test]
+    fn signature_fingerprint_reflects_params_and_return_type() {
+        let source = "function id(x: string): string { return x; }\nclass Empty {}\n";
+        let analysis = analyze(source, LanguageId::TypeScript, "src/sig.ts").unwrap();
+
+        let func = analysis.symbols.iter().find(|s| s.name == "id").unwrap();
+        assert_eq!(func.signature_fingerprint, "(x: string)\u{1f}: string");
+
+        let class = analysis.symbols.iter().find(|s| s.name == "Empty").unwrap();
+        assert_eq!(class.signature_fingerprint, "");
+    }
+
+    /// Extra internal whitespace within the parameter list (that doesn't
+    /// shift what touches the surrounding parens/brackets) collapses to the
+    /// same fingerprint — `split_whitespace().join(" ")` normalizes runs of
+    /// whitespace, not token adjacency.
+    #[test]
+    fn signature_fingerprint_ignores_extra_internal_whitespace() {
+        let a = analyze(
+            "function f(x: string): void {}\n",
+            LanguageId::TypeScript,
+            "src/sig.ts",
+        )
+        .unwrap();
+        let b = analyze(
+            "function f(x:    string): void {}\n",
+            LanguageId::TypeScript,
+            "src/sig.ts",
+        )
+        .unwrap();
+        assert_eq!(
+            a.symbols[0].signature_fingerprint,
+            b.symbols[0].signature_fingerprint
+        );
+    }
+
+    /// A genuine signature change (parameter added) must change the
+    /// fingerprint (spec "Rename changes identity" applies equally to
+    /// signature edits feeding `symbol_key`).
+    #[test]
+    fn signature_fingerprint_changes_when_parameters_differ() {
+        let a = analyze(
+            "function f(x: string): void {}\n",
+            LanguageId::TypeScript,
+            "src/sig.ts",
+        )
+        .unwrap();
+        let b = analyze(
+            "function f(x: string, y: number): void {}\n",
+            LanguageId::TypeScript,
+            "src/sig.ts",
+        )
+        .unwrap();
+        assert_ne!(
+            a.symbols[0].signature_fingerprint,
+            b.symbols[0].signature_fingerprint
+        );
     }
 }

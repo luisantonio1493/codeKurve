@@ -128,6 +128,8 @@ fn module_symbol(relative_path: &str, language: LanguageId) -> Symbol {
             end_column: 0,
         },
         parent: None,
+        // A module stand-in has no call signature.
+        signature_fingerprint: String::new(),
     }
 }
 
@@ -155,6 +157,7 @@ fn build_file_inputs(
                 language: s.language,
                 span: s.span,
                 parent: s.parent.clone(),
+                signature_fingerprint: s.signature_fingerprint.clone(),
             })
             .collect();
         symbols.push(module_symbol(&analysis.file, *language));
@@ -165,6 +168,7 @@ fn build_file_inputs(
                 &analysis.file,
                 symbol.kind.as_str(),
                 &symbol.qualified_name,
+                &symbol.signature_fingerprint,
             );
             symbol_ids.insert(
                 (analysis.file.clone(), symbol.qualified_name.clone()),

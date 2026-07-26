@@ -38,13 +38,13 @@ Chain strategy: feature-branch-chain
 
 ## Phase 2: PR2 — symbol_key 5-Tuple + signature_fingerprint (req: symbol-index MODIFIED)
 
-- [ ] 2.1 `codekurve-analysis/src/ir.rs`: add `ExtractedSymbol.signature_fingerprint: String`.
-- [ ] 2.2 `extract.rs`: add `signature_fingerprint(node, source)` helper; wire into `push_named`.
-- [ ] 2.3 `codekurve-core/src/symbol.rs`: add `Symbol.signature_fingerprint: String`.
-- [ ] 2.4 Update `traverse.rs:373-386` and `repo.rs:592-604` test-helper `Symbol { .. }` literals with the new field.
-- [ ] 2.5 `repo.rs`: `symbol_key` takes 5 args, BLAKE3-hashed, `\x1f`-delimited.
-- [ ] 2.6 `commands.rs`: `build_file_inputs` copies field; `module_symbol` uses `String::new()`; `reindex` passes 5th arg.
-- [ ] 2.7 Test: reindex after signature edit changes `symbol_key`; blank-line edit does not (sibling of `symbol_key_excludes_start_byte`).
+- [x] 2.1 `codekurve-analysis/src/ir.rs`: add `ExtractedSymbol.signature_fingerprint: String`.
+- [x] 2.2 `extract.rs`: add `signature_fingerprint(node, source)` helper; wire into `push_named`.
+- [x] 2.3 `codekurve-core/src/symbol.rs`: add `Symbol.signature_fingerprint: String`.
+- [x] 2.4 Update `traverse.rs:373-386` and `repo.rs:592-604` test-helper `Symbol { .. }` literals with the new field.
+- [x] 2.5 `repo.rs`: `symbol_key` takes 5 args, BLAKE3-hashed, `\x1f`-delimited.
+- [x] 2.6 `commands.rs`: `build_file_inputs` copies field; `module_symbol` uses `String::new()`; `reindex` passes 5th arg.
+- [x] 2.7 Test: reindex after signature edit changes `symbol_key`; blank-line edit does not (sibling of `symbol_key_excludes_start_byte`).
 
 ## Phase 3: PR3 — Stable Relationship/Unresolved Ids (req: relationship-graph "Atomic Persistence")
 
