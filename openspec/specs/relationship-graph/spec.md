@@ -66,7 +66,9 @@ Call and construct edges MUST carry confidence Exact, High, Medium, or Low per �
 
 ### Requirement: Unresolved Reference Handling
 
-A reference with zero resolution candidates, or insufficient context to attempt resolution, MUST be recorded in `unresolved_references` and never dropped silently (§18.3). A reference with one or more candidates MUST NOT be recorded there.
+A reference with zero resolution candidates, or insufficient context to attempt resolution, **or whose previously resolved target symbol was deleted**, MUST be recorded in `unresolved_references` and never dropped silently (§18.3). A reference with one or more candidates MUST NOT be recorded there.
+
+(Phase 3 addition: references whose previously resolved targets are deleted must convert to unresolved, never silently dropped or left pointing at a nonexistent symbol row.)
 
 #### Scenario: Zero-candidate import
 
@@ -80,9 +82,15 @@ A reference with zero resolution candidates, or insufficient context to attempt 
 - WHEN indexed
 - THEN a Low-confidence `relationships` row is created for the best candidate; no `unresolved_references` row is created for this reference
 
+#### Scenario: Deleting a symbol's file unresolves its inbound edges
+
+- GIVEN `src/b.ts` has a `Resolved` `calls` edge into a function exported from `src/a.ts`
+- WHEN `src/a.ts` is deleted and the batch is applied
+- THEN the `Resolved` edge is removed and an `unresolved_references` row is created recording the now-missing target, not silently dropped and not left pointing at a nonexistent symbol row
+
 ### Requirement: Two-Pass Whole-Project Resolution
 
-Relationships MUST be resolved against a whole-project symbol table built after all files are parsed, not single-file context alone, and one index run's relationships and unresolved references MUST persist in a single atomic transaction (§22.3).
+Relationships MUST be resolved against a whole-project symbol table built after all files are parsed, not single-file context alone (§22.3).
 
 #### Scenario: Cross-file call resolution
 
@@ -90,11 +98,35 @@ Relationships MUST be resolved against a whole-project symbol table built after 
 - WHEN indexing completes
 - THEN the `calls` edge resolves to `b.ts`'s symbol regardless of parse order
 
-#### Scenario: Atomic persistence on failure
+### Requirement: Affected-Set Resolution for Incremental Batches
 
-- GIVEN an index run that fails mid-resolution
-- WHEN the run aborts
-- THEN no partial `relationships` or `unresolved_references` rows from that run are visible
+For an incremental batch, relationships MUST be re-resolved against the changed files' symbols plus every symbol whose existing relationships reference (or previously referenced) a changed or deleted symbol — the affected set — rather than the whole project's symbol table. A full reindex (whether run directly or as the oversized-batch fallback) MUST still resolve against the whole-project symbol table built after all files are parsed.
+
+(Previously: relationships were always resolved against a whole-project symbol table built after all files are parsed, with no incremental/affected-set mode, because every index run was a full reindex.)
+
+#### Scenario: Cross-file call resolution within a full reindex
+
+- GIVEN `a.ts` calls a function exported from `b.ts`, both indexed in the same full reindex
+- WHEN indexing completes
+- THEN the `calls` edge resolves to `b.ts`'s symbol regardless of parse order
+
+#### Scenario: Incremental batch re-resolves only affected dependents
+
+- GIVEN `b.ts` exports a function called from `a.ts`, both previously indexed, and only `b.ts`'s export signature changes
+- WHEN the incremental batch containing `b.ts` is applied
+- THEN `a.ts`'s call edge into `b.ts` is re-resolved as part of the affected set, but unrelated files with no relationship to `b.ts`'s changed symbol are not re-resolved
+
+### Requirement: Atomic Persistence Per Batch
+
+One batch's relationships and unresolved references (whether the batch is a full reindex or an incremental per-file batch) MUST persist in a single atomic transaction; a failed or interrupted batch MUST leave no partial `relationships` or `unresolved_references` rows visible.
+
+(Previously: atomicity was scoped to "one index run", which was always a full reindex; there was no smaller incremental-batch unit.)
+
+#### Scenario: Atomic persistence on incremental batch failure
+
+- GIVEN an incremental batch that fails mid-resolution
+- WHEN the batch aborts
+- THEN no partial `relationships` or `unresolved_references` rows from that batch are visible, and the previously committed graph state is unchanged
 
 ### Requirement: Schema Migration 0002
 
