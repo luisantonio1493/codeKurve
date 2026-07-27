@@ -11,6 +11,7 @@ codekurve-core = { path = "../codekurve-core" }
 codekurve-analysis = { path = "../codekurve-analysis" }
 codekurve-store = { path = "../codekurve-store" }
 serde_json = "1"
+notify = "6"
 
 [dev-dependencies]
 assert_cmd = "2"

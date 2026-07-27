@@ -5,8 +5,9 @@ use std::path::PathBuf;
 
 /// Parsed positional arguments and flags. Pre-PR5b commands only ever read
 /// `positionals`/`root`; the graph-query commands (§27.2) additionally read
-/// `min_confidence`/`json`/`symbol_id`/`symbol_name`/`limit`/`offset`, and
-/// `trace`/`impact` (PR5b-2) also read `depth`.
+/// `min_confidence`/`json`/`symbol_id`/`symbol_name`/`limit`/`offset`,
+/// `trace`/`impact` (PR5b-2) also read `depth`, and `watch` (PR6) reads
+/// `debounce_ms`.
 pub struct Args {
     pub positionals: Vec<String>,
     pub root: PathBuf,
@@ -17,6 +18,7 @@ pub struct Args {
     pub symbol_name: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    pub debounce_ms: Option<u64>,
 }
 
 impl Args {
@@ -30,6 +32,7 @@ impl Args {
         let mut symbol_name = None;
         let mut limit = None;
         let mut offset = None;
+        let mut debounce_ms = None;
         let mut iter = args;
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -41,6 +44,7 @@ impl Args {
                 "--symbol-name" => symbol_name = iter.next(),
                 "--limit" => limit = iter.next().and_then(|v| v.parse().ok()),
                 "--offset" => offset = iter.next().and_then(|v| v.parse().ok()),
+                "--debounce-ms" => debounce_ms = iter.next().and_then(|v| v.parse().ok()),
                 _ => positionals.push(arg),
             }
         }
@@ -54,6 +58,7 @@ impl Args {
             symbol_name,
             limit,
             offset,
+            debounce_ms,
         }
     }
 

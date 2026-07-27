@@ -47,6 +47,22 @@ pub struct Index {
     pub follow_symlinks: bool,
     pub include_hidden: bool,
     pub store_source: bool,
+    #[serde(default)]
+    pub watch: IndexWatch,
+}
+
+/// `codekurve watch` debounce/fallback tuning (Phase 3 design "Debounce" +
+/// "Oversized Batch Falls Back to Full Reindex").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexWatch {
+    /// Sliding quiet-window: flush once no new event arrives for this long.
+    pub debounce_ms: u64,
+    /// Hard cap: flush even under continuous events after this long since
+    /// the batch's first pending event.
+    pub max_batch_wait_ms: u64,
+    /// A batch touching more than this percent of tracked files falls back
+    /// to a full `reindex` instead of the incremental path.
+    pub full_reindex_threshold_pct: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +118,17 @@ impl Default for Index {
             follow_symlinks: false,
             include_hidden: false,
             store_source: false,
+            watch: IndexWatch::default(),
+        }
+    }
+}
+
+impl Default for IndexWatch {
+    fn default() -> Self {
+        Self {
+            debounce_ms: 750,
+            max_batch_wait_ms: 5000,
+            full_reindex_threshold_pct: 25,
         }
     }
 }

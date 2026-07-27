@@ -73,11 +73,11 @@ Chain strategy: feature-branch-chain
 
 ## Phase 6: PR6 — Watch Command (req: file-watcher, all requirements)
 
-- [ ] 6.1 Add `notify = "6"` to `crates/codekurve/Cargo.toml`.
-- [ ] 6.2 Create `crates/codekurve/src/watch.rs`: notify setup + hand-rolled debounce loop per design's pseudocode.
-- [ ] 6.3 `codekurve-core/src/config.rs`: add `[index.watch]` (`debounce_ms=750`, `max_batch_wait_ms=5000`, `full_reindex_threshold_pct=25`).
-- [ ] 6.4 `cli.rs`: add `--debounce-ms` flag; `main.rs`: dispatch `watch` (reconcile-on-start via full-sweep `detect`, then event loop).
-- [ ] 6.5 Test: synthetic `mpsc` sender proves burst coalesces into one batch; `max_batch_wait` cap fires under continuous events.
+- [x] 6.1 Add `notify = "6"` to `crates/codekurve/Cargo.toml`.
+- [x] 6.2 Create `crates/codekurve/src/watch.rs`: notify setup + hand-rolled debounce loop per design's pseudocode.
+- [x] 6.3 `codekurve-core/src/config.rs`: add `[index.watch]` (`debounce_ms=750`, `max_batch_wait_ms=5000`, `full_reindex_threshold_pct=25`).
+- [x] 6.4 `cli.rs`: add `--debounce-ms` flag; `main.rs`: dispatch `watch` (reconcile-on-start via full-sweep `detect`, then event loop).
+- [x] 6.5 Test: synthetic `mpsc` sender proves burst coalesces into one batch; `max_batch_wait` cap fires under continuous events.
 
 ## Phase 7: PR7 — Status, Stale Warning, Golden Tests (req: incremental-index "Status", graph-queries)
 

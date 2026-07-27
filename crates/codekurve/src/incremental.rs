@@ -34,6 +34,10 @@ pub struct IndexContext<'a> {
     pub project_id: &'a str,
     pub aliases: &'a TsconfigAliases,
     pub options: &'a DiscoveryOptions,
+    /// PR6's `[index.watch]` config (design's File Changes table); `index`
+    /// and `watch` both read it from `Config`, so there is one source of
+    /// truth instead of a literal duplicated per caller.
+    pub full_reindex_threshold_pct: u32,
 }
 
 /// Summary of one `apply_batch` call, for `index`'s (and later `watch`'s)
@@ -44,12 +48,6 @@ pub struct BatchOutcome {
     pub files_deleted: usize,
     pub fell_back_to_full_reindex: bool,
 }
-
-/// ponytail: `full_reindex_threshold_pct` is scaffolded in PR6's
-/// `[index.watch]` config section (design's File Changes table); until that
-/// config exists, use the design's own proposed default (25%) as a literal
-/// here rather than pulling PR6's config plumbing forward.
-const FULL_REINDEX_THRESHOLD_PCT: usize = 25;
 
 /// Task 5.1 (design "Interfaces"): classifies every file the shared engine
 /// needs to look at against what's currently stored. `filter = None` is a
@@ -150,21 +148,21 @@ pub fn apply_batch(
     // that's a deliberately accepted edge case (D only ever narrows what
     // gets reparsed further, it never breaks correctness).
     let tracked = repo::count_files(conn, ctx.project_id).map_err(|e| e.to_string())?;
-    if is_oversized(changes.len(), tracked) {
+    if is_oversized(changes.len(), tracked, ctx.full_reindex_threshold_pct) {
         return apply_via_full_reindex(conn, ctx);
     }
 
     apply_incremental_changes(conn, ctx, changes, &ts)
 }
 
-fn is_oversized(changed: usize, tracked: usize) -> bool {
+fn is_oversized(changed: usize, tracked: usize, threshold_pct: u32) -> bool {
     if tracked == 0 {
         // Bootstrap: nothing tracked yet, so every discovered file reads as
         // `Created` — naturally the whole project, exactly what `reindex`
         // already handles well (task 5.5's "first run" requirement).
         return changed > 0;
     }
-    changed * 100 > tracked * FULL_REINDEX_THRESHOLD_PCT
+    changed * 100 > tracked * threshold_pct as usize
 }
 
 /// Task 5.4: the existing full-reindex path, reused rather than duplicated.

@@ -34,20 +34,28 @@ impl From<String> for CommandError {
     }
 }
 
-/// `codekurve index --root <path>` (task 5.5, design's shared engine):
-/// delegates to [`crate::incremental::detect`] then
-/// [`crate::incremental::apply_batch`] instead of always running a full
-/// reindex. On a never-indexed project every discovered file is `Created`
-/// and the oversized-batch fallback (task 5.4) naturally takes the full
-/// [`repo::reindex`] path — no separate bootstrap case needed.
-pub fn index(root: &Path) -> Result<(), String> {
+/// Everything a project-rooted command (`index`, `watch`) needs before it
+/// can call the shared `incremental` engine — canonicalized root, parsed
+/// config, an open connection, and the project row. Factored out of `index`
+/// (PR6) so `watch`'s reconcile-on-start and event-loop batches share one
+/// setup path instead of duplicating it.
+pub(crate) struct IndexSetup {
+    pub root: PathBuf,
+    pub config: Config,
+    pub conn: Connection,
+    pub project_id: String,
+    pub options: DiscoveryOptions,
+    pub aliases: TsconfigAliases,
+}
+
+pub(crate) fn setup_index(root: &Path) -> Result<IndexSetup, String> {
     let root = canonicalize(root)?;
     let config = load_config(&root)?;
     let options = discovery_options(&config);
     let aliases = load_tsconfig_aliases(&root);
 
     let db_path = root.join(&config.storage.database);
-    let mut conn = db::open(&db_path).map_err(|e| e.to_string())?;
+    let conn = db::open(&db_path).map_err(|e| e.to_string())?;
     let config_text = config.to_toml().map_err(|e| e.to_string())?;
     let project_id = repo::upsert_project(
         &conn,
@@ -57,19 +65,45 @@ pub fn index(root: &Path) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
-    let changes = crate::incremental::detect(&conn, &project_id, &root, &options, None)?;
+    Ok(IndexSetup {
+        root,
+        config,
+        conn,
+        project_id,
+        options,
+        aliases,
+    })
+}
+
+/// `codekurve index --root <path>` (task 5.5, design's shared engine):
+/// delegates to [`crate::incremental::detect`] then
+/// [`crate::incremental::apply_batch`] instead of always running a full
+/// reindex. On a never-indexed project every discovered file is `Created`
+/// and the oversized-batch fallback (task 5.4) naturally takes the full
+/// [`repo::reindex`] path — no separate bootstrap case needed.
+pub fn index(root: &Path) -> Result<(), String> {
+    let mut setup = setup_index(root)?;
+
+    let changes = crate::incremental::detect(
+        &setup.conn,
+        &setup.project_id,
+        &setup.root,
+        &setup.options,
+        None,
+    )?;
     if changes.is_empty() {
         println!("index up to date, no changes detected");
         return Ok(());
     }
 
     let ctx = crate::incremental::IndexContext {
-        root: &root,
-        project_id: &project_id,
-        aliases: &aliases,
-        options: &options,
+        root: &setup.root,
+        project_id: &setup.project_id,
+        aliases: &setup.aliases,
+        options: &setup.options,
+        full_reindex_threshold_pct: setup.config.index.watch.full_reindex_threshold_pct,
     };
-    let outcome = crate::incremental::apply_batch(&mut conn, &ctx, &changes)?;
+    let outcome = crate::incremental::apply_batch(&mut setup.conn, &ctx, &changes)?;
 
     println!(
         "indexed {} file(s) changed, {} deleted{}",
