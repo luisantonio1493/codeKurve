@@ -118,6 +118,70 @@ pub fn index(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// `codekurve status --root <path> [--json]` (task 7.1, design "`codekurve
+/// status` and Stale Warning"): counts plus stored freshness metadata, read
+/// without a filesystem walk (spec "Status Command Reports Pending Count and
+/// Last Verified Time").
+pub fn status(root: &Path, json: bool) -> Result<(), String> {
+    let root = canonicalize(root)?;
+    let config = load_config(&root)?;
+    let conn = open_existing_db(&root, &config)?;
+    let pid = project_id(&conn, &root)?;
+
+    let s = repo::index_status(&conn, &pid).map_err(|e| e.to_string())?;
+    let schema_version =
+        codekurve_store::migrations::current_version(&conn).map_err(|e| e.to_string())?;
+    let stale = s.pending_files > 0;
+
+    if json {
+        let result = serde_json::json!({
+            "schema_version": schema_version,
+            "files": s.files,
+            "symbols": s.symbols,
+            "relationships": s.relationships,
+            "relationships_unresolved": s.relationships_unresolved,
+            "pending_files": s.pending_files,
+            "last_verified_at": s.last_verified_at,
+            "stale": stale,
+        });
+        print_envelope(&config.project.name, result, Vec::new(), false);
+    } else {
+        println!("project: {}", config.project.name);
+        println!(
+            "database: {} (schema {schema_version})",
+            config.storage.database
+        );
+        println!(
+            "files: {}   symbols: {}   relationships: {} ({} unresolved)",
+            s.files, s.symbols, s.relationships, s.relationships_unresolved
+        );
+        println!(
+            "last verified: {}",
+            s.last_verified_at.as_deref().unwrap_or("never")
+        );
+        println!("pending files: {}", s.pending_files);
+        println!("status: {}", if stale { "stale" } else { "fresh" });
+    }
+    Ok(())
+}
+
+/// Task 7.2 (design "`codekurve status` and Stale Warning"): prints exactly
+/// one stderr warning when stored freshness metadata shows pending files,
+/// without a filesystem walk. Called from [`require_indexed_project`] (the
+/// six graph commands) plus one line each in [`search`]/[`symbol`] — stdout,
+/// JSON, and exit codes are never touched (spec "Stale Index Warning on
+/// Stderr").
+fn warn_if_stale(conn: &Connection, project_id: &str) {
+    if let Ok(s) = repo::index_status(conn, project_id) {
+        if s.pending_files > 0 {
+            eprintln!(
+                "warning: index is stale ({} pending file(s)); run `codekurve index`",
+                s.pending_files
+            );
+        }
+    }
+}
+
 /// Per-file metadata `build_file_inputs` needs alongside each `FileAnalysis`
 /// — extended in Phase 3 with the change-detection engine's hash/mtime
 /// (design "Content Hash Tracked Per File").
@@ -409,6 +473,7 @@ pub fn search(root: &Path, query: &str) -> Result<(), String> {
     let config = load_config(&root)?;
     let conn = open_existing_db(&root, &config)?;
     let project_id = project_id(&conn, &root)?;
+    warn_if_stale(&conn, &project_id);
 
     let hits = repo::search(&conn, &project_id, query, config.queries.default_limit)
         .map_err(|e| e.to_string())?;
@@ -431,6 +496,7 @@ pub fn symbol(root: &Path, name: &str) -> Result<(), String> {
     let config = load_config(&root)?;
     let conn = open_existing_db(&root, &config)?;
     let project_id = project_id(&conn, &root)?;
+    warn_if_stale(&conn, &project_id);
 
     let hits = repo::find_by_name(&conn, &project_id, name).map_err(|e| e.to_string())?;
     if hits.is_empty() {
@@ -660,6 +726,7 @@ fn require_indexed_project(
         code: 4,
         message: e,
     })?;
+    warn_if_stale(&conn, &pid);
     Ok((root, config, conn, pid))
 }
 

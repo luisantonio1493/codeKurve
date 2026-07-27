@@ -133,9 +133,9 @@ fn apply_flush(setup: &mut IndexSetup, paths: &HashSet<PathBuf>) {
 
 /// Absolute event paths -> `discovery`-style relative slash paths, dropping
 /// anything outside `root`. A raw directory path (macOS FSEvents) survives
-/// this conversion but won't equal any file's `relative_path`, so `detect`'s
-/// filter silently drops it this batch — the design's task 7.6 gap, not
-/// attempted here.
+/// this conversion as a directory-relative path; `incremental::detect`'s
+/// `filter_matches` treats it as a slash-prefix match against every file
+/// underneath it (task 7.6, design "walk-intersection").
 fn relative_paths(root: &Path, paths: &HashSet<PathBuf>) -> HashSet<String> {
     paths
         .iter()

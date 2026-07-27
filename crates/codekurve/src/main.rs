@@ -11,8 +11,8 @@ use std::process::ExitCode;
 use cli::Args;
 use commands::CommandError;
 
-const USAGE: &str = "usage: codekurve <version|init|index|watch|search|symbol|doctor|references|\
-callers|callees|implementations|trace|impact> [args] [--root <path>] [--debounce-ms <n>]";
+const USAGE: &str = "usage: codekurve <version|init|index|watch|status|search|symbol|doctor|\
+references|callers|callees|implementations|trace|impact> [args] [--root <path>] [--debounce-ms <n>]";
 
 fn main() -> ExitCode {
     let mut raw = std::env::args().skip(1);
@@ -30,6 +30,7 @@ fn main() -> ExitCode {
         "init" => run_init(&args).map_err(CommandError::from),
         "index" => commands::index(&args.root).map_err(CommandError::from),
         "watch" => watch::run(&args.root, args.debounce_ms).map_err(CommandError::from),
+        "status" => commands::status(&args.root, args.json).map_err(CommandError::from),
         "search" => match args.positional(0) {
             Some(query) => commands::search(&args.root, query).map_err(CommandError::from),
             None => Err(usage_error(

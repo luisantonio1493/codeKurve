@@ -81,9 +81,9 @@ Chain strategy: feature-branch-chain
 
 ## Phase 7: PR7 — Status, Stale Warning, Golden Tests (req: incremental-index "Status", graph-queries)
 
-- [ ] 7.1 `commands.rs`: add `status()` command (schema version, counts, `pending_files`, `last_verified_at`; `--json` via `print_envelope`).
-- [ ] 7.2 Add `warn_if_stale(conn, project_id)`; call from `require_indexed_project` plus one line each in `search`/`symbol`.
-- [ ] 7.3 `main.rs`: dispatch `status`.
-- [ ] 7.4 Integration test: golden incremental-result == full-reindex-result after a mixed create/update/delete batch.
-- [ ] 7.5 Integration test: deleting a file's cross-file callee converts the inbound edge to `unresolved_references`.
-- [ ] 7.6 Test: directory-level watch event (macOS FSEvents) still resolves via walk-intersection.
+- [x] 7.1 `commands.rs`: add `status()` command (schema version, counts, `pending_files`, `last_verified_at`; `--json` via `print_envelope`).
+- [x] 7.2 Add `warn_if_stale(conn, project_id)`; call from `require_indexed_project` plus one line each in `search`/`symbol`.
+- [x] 7.3 `main.rs`: dispatch `status`.
+- [x] 7.4 Integration test: golden incremental-result == full-reindex-result after a mixed create/update/delete batch.
+- [x] 7.5 Integration test: deleting a file's cross-file callee converts the inbound edge to `unresolved_references`.
+- [x] 7.6 Test: directory-level watch event (macOS FSEvents) still resolves via walk-intersection.

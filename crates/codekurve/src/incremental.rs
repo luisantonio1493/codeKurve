@@ -49,12 +49,17 @@ pub struct BatchOutcome {
     pub fell_back_to_full_reindex: bool,
 }
 
-/// Task 5.1 (design "Interfaces"): classifies every file the shared engine
-/// needs to look at against what's currently stored. `filter = None` is a
-/// full sweep (`index`, watch's reconcile-on-start); `filter = Some(paths)`
-/// restricts both the walk-derived candidates and the deletion check to a
-/// debounced batch (PR6, not exercised by this PR's only caller). Fast
-/// path: `(size_bytes, modified_ns)` equal to stored -> unchanged, no read.
+/// Task 5.1/7.6 (design "Interfaces" + "walk-intersection handles it"):
+/// classifies every file the shared engine needs to look at against what's
+/// currently stored. `filter = None` is a full sweep (`index`, watch's
+/// reconcile-on-start); `filter = Some(paths)` restricts both the
+/// walk-derived candidates and the deletion check to a debounced batch. A
+/// filter entry matches either a file's exact relative path or a
+/// slash-prefix directory of it (`filter_matches`) — macOS FSEvents can
+/// report a directory path instead of the individual files that changed
+/// inside it, and `discovery::discover`'s walk is what actually knows which
+/// files live under that directory (design "walk-intersection"). Fast path:
+/// `(size_bytes, modified_ns)` equal to stored -> unchanged, no read.
 /// Otherwise confirm via BLAKE3 `content_hash` before calling it `Modified`
 /// (spec "Mtime touch without content change is not a false positive").
 pub fn detect(
@@ -71,7 +76,7 @@ pub fn detect(
     let mut seen: HashSet<String> = HashSet::new();
 
     for file in discovered {
-        if filter.is_some_and(|f| !f.contains(&file.relative_path)) {
+        if filter.is_some_and(|f| !filter_matches(f, &file.relative_path)) {
             continue;
         }
         seen.insert(file.relative_path.clone());
@@ -105,7 +110,7 @@ pub fn detect(
         if seen.contains(path) {
             continue;
         }
-        if filter.is_some_and(|f| !f.contains(path)) {
+        if filter.is_some_and(|f| !filter_matches(f, path)) {
             continue;
         }
         changes.push(FileChange::Deleted {
@@ -114,6 +119,23 @@ pub fn detect(
     }
 
     Ok(changes)
+}
+
+/// Task 7.6: `relative_path` matches `filter` if it's an exact entry, or a
+/// filter entry is a slash-separated directory prefix of it — the
+/// walk-intersection the design promises for a directory-level watch event
+/// (e.g. filter = `{"src"}`, `relative_path` = `"src/a.ts"` matches; `filter
+/// = {"src2"}` does not, since `"src2"` isn't a full path component of
+/// `"src/a.ts"`).
+fn filter_matches(filter: &HashSet<String>, relative_path: &str) -> bool {
+    if filter.contains(relative_path) {
+        return true;
+    }
+    filter.iter().any(|f| {
+        relative_path.len() > f.len()
+            && relative_path.starts_with(f.as_str())
+            && relative_path.as_bytes()[f.len()] == b'/'
+    })
 }
 
 /// Task 5.3/5.4 (design "Batch Atomicity" + "Oversized Batch Falls Back to
@@ -506,5 +528,54 @@ mod tests {
         ));
         // Exactly touched (skipped) excluded: changed + added + removed = 3.
         assert_eq!(changes.len(), 3);
+    }
+
+    /// Task 7.6 (design's open question: "`watch` on macOS FSEvents may
+    /// report directory-level events; batch flush must tolerate a directory
+    /// path in `pending`"). `notify` can hand `watch::relative_paths` a bare
+    /// directory (`"src"`) instead of the individual file that changed
+    /// inside it; `detect`'s filter must still resolve that file via
+    /// walk-intersection instead of silently dropping the whole batch.
+    #[test]
+    fn directory_level_filter_entry_resolves_files_underneath_via_walk_intersection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std_fs::create_dir_all(root.join("src")).unwrap();
+        std_fs::write(root.join("src/a.ts"), "export const a = 1;\n").unwrap();
+        std_fs::write(root.join("top.ts"), "export const b = 1;\n").unwrap();
+
+        let mut conn = db::open_in_memory().unwrap();
+        let project = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        seed_indexed(&mut conn, &project, root, &["src/a.ts", "top.ts"]);
+
+        std_fs::write(root.join("src/a.ts"), "export const a = 2;\n").unwrap();
+
+        // A raw directory path, exactly what a macOS FSEvents batch can
+        // hand `watch::relative_paths` — not `src/a.ts` itself.
+        let filter: HashSet<String> = ["src".to_string()].into_iter().collect();
+        let changes = detect(&conn, &project, root, &discovery_opts(), Some(&filter)).unwrap();
+
+        assert_eq!(
+            changes,
+            vec![FileChange::Modified(
+                discovery::discover(root, &discovery_opts())
+                    .into_iter()
+                    .find(|f| f.relative_path == "src/a.ts")
+                    .unwrap()
+            )]
+        );
+    }
+
+    #[test]
+    fn filter_matches_exact_path_and_directory_prefix_only() {
+        let filter: HashSet<String> = ["src".to_string()].into_iter().collect();
+        assert!(filter_matches(&filter, "src/a.ts"));
+        assert!(filter_matches(&filter, "src/nested/b.ts"));
+        assert!(!filter_matches(&filter, "src2/a.ts"));
+        assert!(!filter_matches(&filter, "other.ts"));
+
+        let exact: HashSet<String> = ["top.ts".to_string()].into_iter().collect();
+        assert!(filter_matches(&exact, "top.ts"));
+        assert!(!filter_matches(&exact, "top.ts.bak"));
     }
 }

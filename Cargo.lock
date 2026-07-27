@@ -125,6 +125,7 @@ dependencies = [
  "codekurve-store",
  "notify",
  "predicates",
+ "rusqlite",
  "serde_json",
  "tempfile",
 ]

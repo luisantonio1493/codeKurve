@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use codekurve_core::{Confidence, Provenance, RelationshipKind, SourceSpan, Symbol, SymbolKind};
-use rusqlite::{params, Connection, Row, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 
 use crate::error::Result;
 
@@ -426,6 +426,58 @@ pub fn count_files(conn: &Connection, project_id: &str) -> Result<usize> {
         |row| row.get(0),
     )?;
     Ok(count as usize)
+}
+
+/// `codekurve status` (task 7.1) and the stale-warning helper (task 7.2):
+/// counts plus stored freshness metadata, read without a filesystem walk
+/// (spec "Status Command Reports Pending Count and Last Verified Time").
+/// `last_verified_at`/`pending_files` default to "never verified"/`0` when
+/// `index_state` has no row yet (pre-Phase-3 project, first index in flight).
+pub struct IndexStatus {
+    pub files: usize,
+    pub symbols: usize,
+    pub relationships: usize,
+    /// Relationships whose `confidence = 'unresolved'` (design's `status`
+    /// example: "relationships: 9214 (1204 unresolved)") — a different count
+    /// from the `unresolved_references` table, which holds zero-candidate
+    /// references that never became a `relationships` row at all.
+    pub relationships_unresolved: usize,
+    pub pending_files: i64,
+    pub last_verified_at: Option<String>,
+}
+
+pub fn index_status(conn: &Connection, project_id: &str) -> Result<IndexStatus> {
+    let symbols: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM symbols WHERE project_id = ?1",
+        params![project_id],
+        |row| row.get(0),
+    )?;
+    let relationships: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM relationships WHERE project_id = ?1",
+        params![project_id],
+        |row| row.get(0),
+    )?;
+    let relationships_unresolved: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM relationships WHERE project_id = ?1 AND confidence = 'unresolved'",
+        params![project_id],
+        |row| row.get(0),
+    )?;
+    let (pending_files, last_verified_at) = conn
+        .query_row(
+            "SELECT pending_files, last_verified_at FROM index_state WHERE project_id = ?1",
+            params![project_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?
+        .unwrap_or((0, None));
+    Ok(IndexStatus {
+        files: count_files(conn, project_id)?,
+        symbols: symbols as usize,
+        relationships: relationships as usize,
+        relationships_unresolved: relationships_unresolved as usize,
+        pending_files,
+        last_verified_at,
+    })
 }
 
 /// Every currently stored symbol id owned by one of `relative_paths` — the
