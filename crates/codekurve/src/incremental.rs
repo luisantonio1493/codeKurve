@@ -566,6 +566,29 @@ mod tests {
         );
     }
 
+    /// Task 5.4 (design "Oversized Batch Falls Back to Full Reindex"):
+    /// `is_oversized`'s threshold arithmetic with a non-zero tracked count —
+    /// the bootstrap branch (`tracked == 0`) is covered separately via
+    /// `vertical_slice.rs`. `changed * 100 > tracked * threshold_pct` must
+    /// stay false right at the threshold and flip true just past it.
+    #[test]
+    fn is_oversized_crosses_threshold_with_nonzero_tracked_count() {
+        // 100 tracked files, 50% threshold: exactly 50 changed is NOT
+        // oversized (50*100 == 100*50, not strictly greater); 51 is.
+        assert!(!is_oversized(50, 100, 50));
+        assert!(is_oversized(51, 100, 50));
+
+        // Small tracked count, integer-division edge: 3 tracked, 50%
+        // threshold -> boundary is 1.5 changed files. 1 stays under, 2 tips
+        // over.
+        assert!(!is_oversized(1, 3, 50));
+        assert!(is_oversized(2, 3, 50));
+
+        // Well below threshold stays incremental; well above falls back.
+        assert!(!is_oversized(1, 100, 50));
+        assert!(is_oversized(100, 100, 50));
+    }
+
     #[test]
     fn filter_matches_exact_path_and_directory_prefix_only() {
         let filter: HashSet<String> = ["src".to_string()].into_iter().collect();

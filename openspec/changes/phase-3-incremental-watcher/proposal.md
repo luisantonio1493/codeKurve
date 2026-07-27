@@ -71,9 +71,9 @@ Revert the commits and delete `.codekurve/index.db`; `codekurve index` rebuilds 
 
 ## Success Criteria
 
-- [ ] Modifying one file does not trigger a full reindex.
-- [ ] Deleting a file removes its symbols and relationships; inbound edges become unresolved.
-- [ ] A 50-file `git checkout` becomes one debounced batch.
-- [ ] Ctrl+C mid-batch leaves a consistent index with those files still pending.
-- [ ] A failed batch leaves the previous index intact.
-- [ ] `status` reports pending count and last verified time.
+- [x] Modifying one file does not trigger a full reindex.
+- [x] Deleting a file removes its symbols and relationships; inbound edges become unresolved.
+- [x] A 50-file `git checkout` becomes one debounced batch.
+- [x] Ctrl+C mid-batch leaves a consistent index with those files still pending.
+- [x] A failed batch leaves the previous index intact.
+- [x] `status` reports pending count and last verified time.
