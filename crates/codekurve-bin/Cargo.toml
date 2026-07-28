@@ -1,0 +1,16 @@
+[package]
+name = "codekurve-bin"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "codekurve"
+path = "src/main.rs"
+
+[dependencies]
+codekurve = { path = "../codekurve" }
+codekurve-core = { path = "../codekurve-core" }
+codekurve-mcp = { path = "../codekurve-mcp" }

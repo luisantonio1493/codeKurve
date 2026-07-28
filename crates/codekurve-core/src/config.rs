@@ -31,6 +31,8 @@ pub struct Config {
     pub storage: Storage,
     #[serde(default)]
     pub queries: Queries,
+    #[serde(default)]
+    pub mcp: Mcp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +86,15 @@ pub struct Queries {
     pub max_snippet_bytes: u32,
 }
 
+/// `[mcp]` config (design "Config"): additive, same `#[serde(default)]`
+/// pattern as `[index.watch]` — older config files without this section
+/// parse unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mcp {
+    #[serde(default)]
+    pub allow_reindex: bool,
+}
+
 fn default_version() -> u32 {
     CONFIG_VERSION
 }
@@ -97,6 +108,7 @@ impl Default for Config {
             ignore: Ignore::default(),
             storage: Storage::default(),
             queries: Queries::default(),
+            mcp: Mcp::default(),
         }
     }
 }
