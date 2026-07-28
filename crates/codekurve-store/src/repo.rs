@@ -62,9 +62,13 @@ pub struct IndexOutcome {
     pub symbols: usize,
 }
 
-/// A symbol as read back from storage (display model).
+/// A symbol as read back from storage (display model). `id` (PR3, additive):
+/// lets a caller chain a `search`/`find_by_name` hit straight into
+/// `find_symbol_by_id` — CLI text output is unaffected since it only prints
+/// name/kind/path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredSymbol {
+    pub id: String,
     pub name: String,
     pub qualified_name: String,
     pub kind: String,
@@ -893,7 +897,7 @@ pub fn search(
     // tokenization/prefix search can come later.
     let fts_query = format!("\"{}\"", query.replace('"', "\"\""));
     let mut stmt = conn.prepare(
-        "SELECT s.name, s.qualified_name, s.kind, s.language, f.relative_path,
+        "SELECT s.id, s.name, s.qualified_name, s.kind, s.language, f.relative_path,
                 s.start_byte, s.end_byte, s.start_line, s.start_column, s.end_line, s.end_column
          FROM symbols s
          JOIN files f ON f.id = s.file_id
@@ -921,7 +925,7 @@ pub fn find_project(conn: &Connection, root_path: &str) -> Result<Option<String>
 /// Exact-name lookup for the `symbol` command.
 pub fn find_by_name(conn: &Connection, project_id: &str, name: &str) -> Result<Vec<StoredSymbol>> {
     let mut stmt = conn.prepare(
-        "SELECT s.name, s.qualified_name, s.kind, s.language, f.relative_path,
+        "SELECT s.id, s.name, s.qualified_name, s.kind, s.language, f.relative_path,
                 s.start_byte, s.end_byte, s.start_line, s.start_column, s.end_line, s.end_column
          FROM symbols s
          JOIN files f ON f.id = s.file_id
@@ -929,6 +933,37 @@ pub fn find_by_name(conn: &Connection, project_id: &str, name: &str) -> Result<V
          ORDER BY f.relative_path, s.start_byte",
     )?;
     let rows = stmt.query_map(params![project_id, name], map_stored)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// One symbol by its storage id (PR3, `get_symbol`'s data source): `None`
+/// when the id doesn't resolve, rather than an error — the caller decides
+/// whether that's a hard failure.
+pub fn find_symbol_by_id(conn: &Connection, id: &str) -> Result<Option<StoredSymbol>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.id, s.name, s.qualified_name, s.kind, s.language, f.relative_path,
+                s.start_byte, s.end_byte, s.start_line, s.start_column, s.end_line, s.end_column
+         FROM symbols s
+         JOIN files f ON f.id = s.file_id
+         WHERE s.id = ?1",
+    )?;
+    Ok(stmt.query_row(params![id], map_stored).optional()?)
+}
+
+/// Per-language file counts for `project_overview` (PR3 store addition) —
+/// `files.language` is nullable (parse failures/unrecognized extensions),
+/// grouped under `"unknown"` rather than dropped.
+pub fn language_breakdown(conn: &Connection, project_id: &str) -> Result<Vec<(String, usize)>> {
+    let mut stmt = conn.prepare(
+        "SELECT COALESCE(language, 'unknown') AS lang, COUNT(*)
+         FROM files
+         WHERE project_id = ?1
+         GROUP BY lang
+         ORDER BY COUNT(*) DESC, lang",
+    )?;
+    let rows = stmt.query_map(params![project_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+    })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -1082,18 +1117,19 @@ pub fn content_hash(bytes: &[u8]) -> String {
 
 fn map_stored(row: &Row) -> rusqlite::Result<StoredSymbol> {
     Ok(StoredSymbol {
-        name: row.get(0)?,
-        qualified_name: row.get(1)?,
-        kind: row.get(2)?,
-        language: row.get(3)?,
-        relative_path: row.get(4)?,
+        id: row.get(0)?,
+        name: row.get(1)?,
+        qualified_name: row.get(2)?,
+        kind: row.get(3)?,
+        language: row.get(4)?,
+        relative_path: row.get(5)?,
         span: SourceSpan {
-            start_byte: row.get::<_, i64>(5)? as usize,
-            end_byte: row.get::<_, i64>(6)? as usize,
-            start_line: row.get::<_, i64>(7)? as usize,
-            start_column: row.get::<_, i64>(8)? as usize,
-            end_line: row.get::<_, i64>(9)? as usize,
-            end_column: row.get::<_, i64>(10)? as usize,
+            start_byte: row.get::<_, i64>(6)? as usize,
+            end_byte: row.get::<_, i64>(7)? as usize,
+            start_line: row.get::<_, i64>(8)? as usize,
+            start_column: row.get::<_, i64>(9)? as usize,
+            end_line: row.get::<_, i64>(10)? as usize,
+            end_column: row.get::<_, i64>(11)? as usize,
         },
     })
 }

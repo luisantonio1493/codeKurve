@@ -40,8 +40,8 @@ Chain strategy: feature-branch-chain
 
 - [x] 2.1 `crates/codekurve/src/query.rs`: add `Session` (`Session::open(root)`). Deviation: implemented as a struct, `Indexed`-only — the `NotIndexed` variant needs PR3's degraded-session/`warnings()` work and is deferred there per PR2's explicit scope (6 graph-query commands only).
 - [x] 2.2 `query.rs`: add `Page<T>{rows,total,truncated}` and `envelope(project,result,warnings,truncated,total:Option<usize>)` — `total` key emitted only when `Some`.
-- [ ] 2.3 `query.rs`: `search(s,&SearchInput) -> Result<Page<SymbolHit>,CommandError>` — extract logic from `commands::search`. Deferred to PR3: `SymbolHit`/`search --json` needs `StoredSymbol.id` (task 3.1), out of PR2 scope.
-- [ ] 2.4 `query.rs`: `get_symbol(s,id,ctx_lines) -> Result<SymbolDetail,CommandError>` — extract logic from `commands::symbol`. Deferred to PR3: needs `find_symbol_by_id` (task 3.2), which doesn't exist until PR3.
+- [x] 2.3 `query.rs`: `search(s,&SearchInput) -> Result<Page<SymbolHit>,CommandError>` — extract logic from `commands::search`. Landed in PR3 (needed `StoredSymbol.id`, task 3.1): `query::search` returns `Page<StoredSymbol>` (id-carrying; ponytail — reuses `StoredSymbol` instead of a parallel `SymbolHit` type with identical fields). `commands::search` itself is intentionally left on its own independent preamble (hard constraint: zero edits to existing golden tests).
+- [x] 2.4 `query.rs`: `get_symbol(s,id,ctx_lines) -> Result<SymbolDetail,CommandError>` — new capability (PR3, needs `find_symbol_by_id`, task 3.2) resolving a single symbol by id for a future MCP client chaining off a `search` hit. `commands::symbol` (name-based, possibly multi-hit) is unrelated and untouched.
 - [x] 2.5 `query.rs`: `relationships(s,kind:RelKind,&QueryArgs) -> Result<Page<StoredRelationship>,CommandError>` — extract shared logic behind `references`/`callers`/`callees`/`implementations`.
 - [x] 2.6 `query.rs`: `trace(s,&QueryArgs,to) -> Result<traverse::BfsOutcome,CommandError>` and `impact(s,&QueryArgs) -> Result<traverse::BfsOutcome,CommandError>` — extract from `commands::trace`/`commands::impact`.
 - [x] 2.7 `commands.rs`: rewrite `references`/`callers`/`callees`/`implementations`/`trace`/`impact` as thin wrappers (`Session::open` + `query::*` call + existing print logic), byte-identical stdout strings. `search`/`symbol` untouched — deferred to PR3 alongside 2.3/2.4.
@@ -52,15 +52,15 @@ Chain strategy: feature-branch-chain
 
 ## Phase 3: PR3 — Query Extraction: Status/Doctor/Overview + Store Additions (req: mcp-server "project_status Tool", "doctor Tool"; design Interfaces)
 
-- [ ] 3.1 `codekurve-store/src/repo.rs`: `StoredSymbol` gains `id` field; `search`/`find_by_name` select `s.id` (additive; CLI text output unchanged since it prints name/kind/path only).
-- [ ] 3.2 `codekurve-store/src/repo.rs`: add `find_symbol_by_id(conn, id)` query.
-- [ ] 3.3 `codekurve-store/src/repo.rs`: add `language_breakdown(conn, project_id)` query for `project_overview`.
-- [ ] 3.4 `query.rs`: `status(s) -> Result<StatusData,CommandError>`, `overview(s) -> Result<OverviewData,CommandError>`, `doctor(s) -> DoctorReport` — extract from `commands::status`/`commands::project_overview` (new)/`commands::doctor`.
-- [ ] 3.5 `query.rs`: `Session::warnings(&self) -> Vec<String>` — single stale-source helper (pending files / not-indexed reason), one wording for both CLI stderr and MCP `warnings`.
-- [ ] 3.6 `commands.rs`: rewire `warn_if_stale` to call `query::warnings` internally instead of duplicating the pending-files check.
-- [ ] 3.7 Test: `query::warnings(&Session)` returns identical `Vec<String>` regardless of caller (unit test, feeds both CLI and MCP paths).
-- [ ] 3.8 Test: `Session::open` on missing config is fatal (`Err`); on missing/empty DB returns `NotIndexed` (degraded, not `Err`).
-- [ ] 3.9 Run existing `crates/codekurve/tests/*` golden suite with zero edits; confirm `status`/`doctor` stdout unchanged.
+- [x] 3.1 `codekurve-store/src/repo.rs`: `StoredSymbol` gains `id` field; `search`/`find_by_name` select `s.id` (additive; CLI text output unchanged since it prints name/kind/path only).
+- [x] 3.2 `codekurve-store/src/repo.rs`: add `find_symbol_by_id(conn, id)` query.
+- [x] 3.3 `codekurve-store/src/repo.rs`: add `language_breakdown(conn, project_id)` query for `project_overview`.
+- [x] 3.4 `query.rs`: `status(s) -> Result<StatusData,CommandError>`, `overview(s) -> Result<OverviewData,CommandError>`, `doctor(s) -> DoctorReport` — new data functions sourced from the same repo calls/probes `commands::status`/`commands::doctor` use. `commands::status`/`commands::doctor` keep their own independent, fatal-on-missing preambles unchanged (hard constraint: zero edits to existing golden tests; `doctor` must keep reporting partial results even when `root` fails to canonicalize, which a `Session`-gated version — fatal on bad root — could never do). `project_overview` has no CLI command; PR6 wires the MCP tool.
+- [x] 3.5 `query.rs`: `Session::warnings(&self) -> Vec<String>` — single stale-source helper (pending files / not-indexed reason), one wording for both CLI stderr and MCP `warnings`.
+- [x] 3.6 `commands.rs`: rewire `warn_if_stale` to call `query::pending_warning` (the shared helper `Session::warnings` itself calls for the `Indexed` case) internally instead of duplicating the pending-files check.
+- [x] 3.7 Test: `warnings_wording_identical_regardless_of_caller` — `Session::warnings` and a direct `pending_warning(conn, project_id)` call return identical `Vec<String>` off the same session.
+- [x] 3.8 Test: `session_open_missing_config_is_fatal` / `session_open_missing_db_is_not_indexed` — `Session::open` on missing config is fatal (`Err`); on missing/empty DB returns `NotIndexed` (degraded, not `Err`); `Session::indexed()` still turns `NotIndexed` back into the same code-4 error the six graph-query commands rely on (also covered end-to-end by `graph_queries.rs`'s `query_before_index_exits_4`).
+- [x] 3.9 Run existing `crates/codekurve/tests/*` golden suite with zero edits; confirm `status`/`doctor` stdout unchanged.
 
 ## Phase 4: PR4 — MCP Skeleton, rmcp Pin, One-Tool Walking Skeleton (req: mcp-server "Stdio Transport Only", "stdout Carries JSON-RPC Only", "Single Project Root Per Server Instance"; design "rmcp Risk")
 

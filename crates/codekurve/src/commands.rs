@@ -174,13 +174,8 @@ pub fn status(root: &Path, json: bool) -> Result<(), String> {
 /// JSON, and exit codes are never touched (spec "Stale Index Warning on
 /// Stderr").
 fn warn_if_stale(conn: &Connection, project_id: &str) {
-    if let Ok(s) = repo::index_status(conn, project_id) {
-        if s.pending_files > 0 {
-            eprintln!(
-                "warning: index is stale ({} pending file(s)); run `codekurve index`",
-                s.pending_files
-            );
-        }
+    for w in query::pending_warning(conn, project_id) {
+        eprintln!("warning: {w}");
     }
 }
 
@@ -619,11 +614,17 @@ pub fn implementations(args: &QueryArgs) -> Result<(), CommandError> {
 /// MCP, PR5+, passes `Some(page.total)`).
 fn relationship_command(args: &QueryArgs, kind: query::RelKind) -> Result<(), CommandError> {
     let s = query::Session::open(args.root)?;
+    if let query::Session::Indexed {
+        conn, project_id, ..
+    } = &s
+    {
+        warn_if_stale(conn, project_id);
+    }
     let page = query::relationships(&s, kind, args)?;
 
     if args.json {
         let result = serde_json::Value::Array(page.rows.iter().map(relationship_json).collect());
-        print_envelope(&s.config.project.name, result, Vec::new(), page.truncated);
+        print_envelope(&s.config().project.name, result, Vec::new(), page.truncated);
     } else {
         print_relationships(&page.rows);
     }
@@ -640,13 +641,20 @@ fn relationship_command(args: &QueryArgs, kind: query::RelKind) -> Result<(), Co
 /// type.
 pub fn trace(args: &QueryArgs, to: &str) -> Result<(), CommandError> {
     let s = query::Session::open(args.root)?;
+    if let query::Session::Indexed {
+        conn, project_id, ..
+    } = &s
+    {
+        warn_if_stale(conn, project_id);
+    }
     let outcome = query::trace(&s, args, to)?;
 
     if args.json {
         let result = trace_json(&outcome);
-        print_envelope(&s.config.project.name, result, Vec::new(), outcome.truncated);
+        print_envelope(&s.config().project.name, result, Vec::new(), outcome.truncated);
     } else {
-        let target = resolve_symbol(&s.conn, &s.project_id, None, Some(to))?;
+        let (conn, project_id) = s.indexed()?;
+        let target = resolve_symbol(conn, project_id, None, Some(to))?;
         print_trace_result(&outcome, &target);
     }
     Ok(())
@@ -658,11 +666,17 @@ pub fn trace(args: &QueryArgs, to: &str) -> Result<(), CommandError> {
 /// incomplete.
 pub fn impact(args: &QueryArgs) -> Result<(), CommandError> {
     let s = query::Session::open(args.root)?;
+    if let query::Session::Indexed {
+        conn, project_id, ..
+    } = &s
+    {
+        warn_if_stale(conn, project_id);
+    }
     let outcome = query::impact(&s, args)?;
 
     if args.json {
         let result = trace_json(&outcome);
-        print_envelope(&s.config.project.name, result, Vec::new(), outcome.truncated);
+        print_envelope(&s.config().project.name, result, Vec::new(), outcome.truncated);
     } else {
         print_impact_result(&outcome);
     }
@@ -678,13 +692,11 @@ pub(crate) fn bfs_caps(depth: Option<u32>) -> traverse::BfsCaps {
     }
 }
 
-/// Every graph-query command's preamble (spec "Query before first index"):
-/// resolve `root`, load config, open the DB, find the project row — any
-/// failure here means "no completed index run", always exit code 4.
-/// `pub(crate)`: `query::Session::open` (PR2) drives the same preamble.
-pub(crate) fn require_indexed_project(
-    root: &Path,
-) -> Result<(PathBuf, Config, Connection, String), CommandError> {
+/// Fatal half (code 4) of the old `require_indexed_project` preamble:
+/// resolve `root`, load config. `pub(crate)`: [`query::Session::open`] calls
+/// this first — a missing project root/config is always fatal, degraded or
+/// not (design "Missing index").
+pub(crate) fn load_project_config(root: &Path) -> Result<(PathBuf, Config), CommandError> {
     let root = canonicalize(root).map_err(|e| CommandError {
         code: 4,
         message: e,
@@ -693,16 +705,28 @@ pub(crate) fn require_indexed_project(
         code: 4,
         message: e,
     })?;
-    let conn = open_existing_db(&root, &config).map_err(|e| CommandError {
+    Ok((root, config))
+}
+
+/// The other half: open the DB, find the project row. `pub(crate)`:
+/// [`query::Session::open`] downgrades a failure here to `NotIndexed`
+/// instead of propagating it — the six graph-query commands (via
+/// [`query::Session::indexed`]) turn that back into the exact same code-4
+/// `CommandError` this function used to return directly, so their behavior
+/// is unchanged.
+pub(crate) fn open_project_index(
+    root: &Path,
+    config: &Config,
+) -> Result<(Connection, String), CommandError> {
+    let conn = open_existing_db(root, config).map_err(|e| CommandError {
         code: 4,
         message: e,
     })?;
-    let pid = project_id(&conn, &root).map_err(|e| CommandError {
+    let pid = project_id(&conn, root).map_err(|e| CommandError {
         code: 4,
         message: e,
     })?;
-    warn_if_stale(&conn, &pid);
-    Ok((root, config, conn, pid))
+    Ok((conn, pid))
 }
 
 /// Resolves one query subject. `--symbol-id` is used verbatim (already
