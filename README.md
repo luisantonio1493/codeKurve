@@ -32,6 +32,26 @@ The intended short-term workflow is `codekurve init`, `index`, `search`,
 
 TypeScript/JavaScript first, C# second (§1, §6).
 
+## MCP server
+
+`codekurve mcp` serves the query layer over MCP stdio for agent clients
+(Claude Code, Codex) instead of ad-hoc grepping. Full rules and client setup:
+`docs/AGENT_USAGE.md`.
+
+Quick start (Claude Code, `.mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "codekurve": {
+      "command": "/absolute/path/to/target/release/codekurve",
+      "args": ["mcp", "--root", "/absolute/path/to/project"],
+      "transport": "stdio"
+    }
+  }
+}
+```
+
 ## Security promise
 
 Local-only, no network, no telemetry, respects `.gitignore`, never executes

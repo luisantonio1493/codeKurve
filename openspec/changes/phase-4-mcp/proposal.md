@@ -70,13 +70,13 @@ Revert the commits. The MCP crate is additive; the CLI-side split is behavior-pr
 
 ## Success Criteria
 
-- [ ] At least one real client (Claude Code or Codex) connects and lists all enabled tools.
-- [ ] Every tool call is reproducible and returns a valid JSON envelope.
-- [ ] stdout contains only JSON-RPC; logs appear on stderr.
-- [ ] Every result set is bounded and reports total count plus truncation.
-- [ ] A stale index is visible in every tool response.
-- [ ] `reindex` is absent from the tool list unless explicitly enabled.
-- [ ] `docs/AGENT_USAGE.md` documents the 8 §28.4 rules and client installation.
+- [ ] At least one real client (Claude Code or Codex) connects and lists all enabled tools. Not verified in this sandboxed session (no interactive client available, see task 4.11); `handshake.rs` exercises the identical wire protocol against the real binary as the strongest available substitute. Left for the human running this PR locally.
+- [x] Every tool call is reproducible and returns a valid JSON envelope.
+- [x] stdout contains only JSON-RPC; logs appear on stderr.
+- [x] Every result set is bounded and reports total count plus truncation.
+- [x] A stale index is visible in every tool response.
+- [x] `reindex` is absent from the tool list unless explicitly enabled.
+- [x] `docs/AGENT_USAGE.md` documents the 8 §28.4 rules and client installation.
 
 ## Confirmed Decisions
 

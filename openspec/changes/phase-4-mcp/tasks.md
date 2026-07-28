@@ -110,7 +110,7 @@ Chain strategy: feature-branch-chain
 
 ## Phase 7: PR7 — Docs and Final Regression (req: mcp-server "AGENT_USAGE.md Documents the §28.4 Rules")
 
-- [ ] 7.1 Create `docs/AGENT_USAGE.md`: document the 8 §28.4 rules verbatim (query before broad exploration; direct text search for literal strings; verify current source before editing; don't trust low-confidence edges for critical changes; use `trace_path` for flows; treat `analyze_impact` as a candidate list, not a guarantee; wait for watcher/run reindex after large changes; if a response says stale, read the current file).
-- [ ] 7.2 `docs/AGENT_USAGE.md`: document client installation for connecting to `codekurve mcp` over stdio (Claude Code, Codex).
-- [ ] 7.3 `README.md`: add MCP server section pointing to `docs/AGENT_USAGE.md` + quick-start config snippet.
-- [ ] 7.4 Run the full pre-existing `crates/codekurve/tests/*` CLI golden suite one final time with zero edits; run all `codekurve-mcp` integration tests; confirm both pass on the merged chain.
+- [x] 7.1 Create `docs/AGENT_USAGE.md`: document the 8 §28.4 rules verbatim (query before broad exploration; direct text search for literal strings; verify current source before editing; don't trust low-confidence edges for critical changes; use `trace_path` for flows; treat `analyze_impact` as a candidate list, not a guarantee; wait for watcher/run reindex after large changes; if a response says stale, read the current file). Quoted verbatim in Spanish as written in `CODEKURVE_MASTER_PLAN.md` §28.4, with an English gloss under each rule for readability.
+- [x] 7.2 `docs/AGENT_USAGE.md`: document client installation for connecting to `codekurve mcp` over stdio (Claude Code, Codex).
+- [x] 7.3 `README.md`: add MCP server section pointing to `docs/AGENT_USAGE.md` + quick-start config snippet.
+- [x] 7.4 Run the full pre-existing `crates/codekurve/tests/*` CLI golden suite one final time with zero edits; run all `codekurve-mcp` integration tests; confirm both pass on the merged chain. Deviation: CLI golden suite actually lives in `crates/codekurve-bin/tests/*` since PR4's binary-crate split (task 4.9); ran `cargo test --workspace` — all suites (codekurve-bin CLI goldens, codekurve-mcp handshake/reindex/tools integration tests, codekurve-store unit tests) pass, 0 failures.
