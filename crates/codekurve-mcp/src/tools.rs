@@ -24,7 +24,8 @@ impl CodeKurve {
         Parameters(ProjectStatusInput {}): Parameters<ProjectStatusInput>,
     ) -> Result<CallToolResult, McpError> {
         let session = self.session.lock().unwrap();
-        let data = query::status(&session).map_err(|e| McpError::internal_error(e.message, None))?;
+        let data =
+            query::status(&session).map_err(|e| McpError::internal_error(e.message, None))?;
         let warnings = session.warnings();
         let project = session.config().project.name.clone();
         drop(session);

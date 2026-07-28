@@ -651,7 +651,12 @@ pub fn trace(args: &QueryArgs, to: &str) -> Result<(), CommandError> {
 
     if args.json {
         let result = trace_json(&outcome);
-        print_envelope(&s.config().project.name, result, Vec::new(), outcome.truncated);
+        print_envelope(
+            &s.config().project.name,
+            result,
+            Vec::new(),
+            outcome.truncated,
+        );
     } else {
         let (conn, project_id) = s.indexed()?;
         let target = resolve_symbol(conn, project_id, None, Some(to))?;
@@ -676,7 +681,12 @@ pub fn impact(args: &QueryArgs) -> Result<(), CommandError> {
 
     if args.json {
         let result = trace_json(&outcome);
-        print_envelope(&s.config().project.name, result, Vec::new(), outcome.truncated);
+        print_envelope(
+            &s.config().project.name,
+            result,
+            Vec::new(),
+            outcome.truncated,
+        );
     } else {
         print_impact_result(&outcome);
     }
@@ -941,8 +951,16 @@ fn print_truncation(outcome: &traverse::BfsOutcome) {
 /// `truncated` — every field, every command, every time. Delegates to
 /// [`query::envelope`] with `total: None`, so CLI `--json` output stays
 /// byte-identical (the `total` key is only ever emitted when `Some`).
-fn print_envelope(project: &str, result: serde_json::Value, warnings: Vec<String>, truncated: bool) {
-    println!("{}", query::envelope(project, result, warnings, truncated, None));
+fn print_envelope(
+    project: &str,
+    result: serde_json::Value,
+    warnings: Vec<String>,
+    truncated: bool,
+) {
+    println!(
+        "{}",
+        query::envelope(project, result, warnings, truncated, None)
+    );
 }
 
 fn discovery_options(config: &Config) -> DiscoveryOptions {

@@ -96,8 +96,13 @@ fn handshake_and_project_status_call_stay_clean_jsonrpc() {
     assert_eq!(tool_names, vec!["codekurve_project_status"]);
 
     let call_result: serde_json::Value = serde_json::from_str(lines[2].trim()).unwrap();
-    assert_eq!(call_result["result"]["isError"], serde_json::Value::Bool(false));
-    let text = call_result["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(
+        call_result["result"]["isError"],
+        serde_json::Value::Bool(false)
+    );
+    let text = call_result["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
     let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
     assert_eq!(envelope["schema_version"], 1);
     assert!(envelope["result"]["stale"].is_boolean());
@@ -118,6 +123,9 @@ fn assert_all_lines_are_jsonrpc(lines: &[String]) {
         assert!(!trimmed.is_empty(), "blank line on stdout");
         let value: serde_json::Value = serde_json::from_str(trimmed)
             .unwrap_or_else(|e| panic!("non-JSON-RPC line on stdout: {trimmed:?} ({e})"));
-        assert_eq!(value["jsonrpc"], "2.0", "line missing jsonrpc 2.0: {trimmed}");
+        assert_eq!(
+            value["jsonrpc"], "2.0",
+            "line missing jsonrpc 2.0: {trimmed}"
+        );
     }
 }

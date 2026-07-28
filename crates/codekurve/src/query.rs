@@ -254,8 +254,8 @@ pub struct SearchInput<'a> {
 pub fn search(s: &Session, q: &SearchInput) -> Result<Page<StoredSymbol>, CommandError> {
     let (conn, project_id) = s.indexed()?;
     let limit = q.limit.unwrap_or(s.config().queries.default_limit);
-    let rows =
-        repo::search(conn, project_id, q.query, limit).map_err(|e| CommandError::from(e.to_string()))?;
+    let rows = repo::search(conn, project_id, q.query, limit)
+        .map_err(|e| CommandError::from(e.to_string()))?;
     let total = rows.len();
     Ok(Page {
         rows,
@@ -307,8 +307,8 @@ pub fn status(s: &Session) -> Result<StatusData, CommandError> {
         Session::Indexed {
             conn, project_id, ..
         } => {
-            let st =
-                repo::index_status(conn, project_id).map_err(|e| CommandError::from(e.to_string()))?;
+            let st = repo::index_status(conn, project_id)
+                .map_err(|e| CommandError::from(e.to_string()))?;
             let schema_version =
                 migrations::current_version(conn).map_err(|e| CommandError::from(e.to_string()))?;
             Ok(StatusData {
@@ -350,8 +350,8 @@ pub fn overview(s: &Session) -> Result<OverviewData, CommandError> {
         Session::Indexed {
             conn, project_id, ..
         } => {
-            let st =
-                repo::index_status(conn, project_id).map_err(|e| CommandError::from(e.to_string()))?;
+            let st = repo::index_status(conn, project_id)
+                .map_err(|e| CommandError::from(e.to_string()))?;
             let languages = repo::language_breakdown(conn, project_id)
                 .map_err(|e| CommandError::from(e.to_string()))?;
             Ok(OverviewData {
@@ -473,7 +473,13 @@ mod tests {
     /// today's `--json` golden shape — no `total` key, same five fields.
     #[test]
     fn envelope_without_total_matches_existing_shape() {
-        let v = envelope("demo", serde_json::json!([1, 2]), vec!["w".into()], true, None);
+        let v = envelope(
+            "demo",
+            serde_json::json!([1, 2]),
+            vec!["w".into()],
+            true,
+            None,
+        );
         let obj = v.as_object().unwrap();
         assert_eq!(obj.len(), 5);
         assert!(!obj.contains_key("total"));
