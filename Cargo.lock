@@ -169,13 +169,10 @@ dependencies = [
 name = "codekurve"
 version = "0.1.0"
 dependencies = [
- "assert_cmd",
  "codekurve-analysis",
  "codekurve-core",
  "codekurve-store",
  "notify",
- "predicates",
- "rusqlite",
  "serde_json",
  "tempfile",
 ]
@@ -195,9 +192,15 @@ dependencies = [
 name = "codekurve-bin"
 version = "0.1.0"
 dependencies = [
+ "assert_cmd",
  "codekurve",
  "codekurve-core",
  "codekurve-mcp",
+ "codekurve-store",
+ "predicates",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
