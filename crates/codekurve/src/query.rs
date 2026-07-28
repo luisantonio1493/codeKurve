@@ -575,6 +575,35 @@ pub fn doctor(s: &Session) -> DoctorReport {
     DoctorReport { checks, ok }
 }
 
+/// Backing function for `codekurve_reindex` (design "reindex Gated Off by
+/// Default", spec "reindex Gated Off by Default"): the same
+/// setup/detect/apply_batch path `commands::index` drives, minus the
+/// `println!`s — this crate's callers (the MCP server) must never write to
+/// stdout outside their own JSON-RPC response. Runs a fresh `setup_index`
+/// (its own `Connection`) rather than reusing `Session`'s — the caller (the
+/// tool body) reopens its `Session` afterward so subsequent tool calls see
+/// the refreshed index (works whether the session started `Indexed` or
+/// `NotIndexed`).
+pub fn reindex(root: &Path) -> Result<crate::incremental::BatchOutcome, CommandError> {
+    let mut setup = commands::setup_index(root).map_err(CommandError::from)?;
+    let changes = crate::incremental::detect(
+        &setup.conn,
+        &setup.project_id,
+        &setup.root,
+        &setup.options,
+        None,
+    )
+    .map_err(CommandError::from)?;
+    let ctx = crate::incremental::IndexContext {
+        root: &setup.root,
+        project_id: &setup.project_id,
+        aliases: &setup.aliases,
+        options: &setup.options,
+        full_reindex_threshold_pct: setup.config.index.watch.full_reindex_threshold_pct,
+    };
+    crate::incremental::apply_batch(&mut setup.conn, &ctx, &changes).map_err(CommandError::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

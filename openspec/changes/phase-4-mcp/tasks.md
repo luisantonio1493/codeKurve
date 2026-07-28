@@ -99,14 +99,14 @@ Chain strategy: feature-branch-chain
 
 ## Phase 6: PR6 — project_overview, doctor, Gated reindex (req: mcp-server "doctor Tool", "Missing or Stale Index Served Degraded, Never Auto-Indexed", "reindex Gated Off by Default")
 
-- [ ] 6.1 `tools.rs`: `codekurve_project_overview` — maps to `query::overview` (counts + `language_breakdown`).
-- [ ] 6.2 `tools.rs`: `codekurve_doctor` — maps to `query::doctor`, same checks as CLI `doctor` (schema/version compatibility, index integrity, config validity).
-- [ ] 6.3 `tools.rs`: `codekurve_reindex` registered only when `self.allow_reindex`; body triggers existing `commands::reindex`/`incremental::apply_batch` path.
-- [ ] 6.4 `server.rs`: `tools/list` conditionally omits `codekurve_reindex` when `allow_reindex == false`; calling `reindex` while disabled fails as unknown tool.
-- [ ] 6.5 Test: `NotIndexed` session → query tools return degraded response/tool error with warning, no index run triggered; `project_status`/`doctor` still answer (degraded), never auto-index.
-- [ ] 6.6 Test: stale index (`pending_files > 0`) is served as-is with the stale warning set — no auto-reindex triggered by a query tool call.
-- [ ] 6.7 Spawned-process test (extends PR4's harness): `tools/list` omits `codekurve_reindex` by default; with `[mcp] allow_reindex = true`, `reindex` appears and a call triggers an index run.
-- [ ] 6.8 Golden tests for `project_overview` and `doctor` tool responses.
+- [x] 6.1 `tools.rs`: `codekurve_project_overview` — maps to `query::overview` (counts + `language_breakdown`).
+- [x] 6.2 `tools.rs`: `codekurve_doctor` — maps to `query::doctor`, same checks as CLI `doctor` (schema/version compatibility, index integrity, config validity).
+- [x] 6.3 `tools.rs`: `codekurve_reindex` registered only when `self.allow_reindex`; body triggers existing `commands::reindex`/`incremental::apply_batch` path. Deviation: there is no `commands::reindex` function (the CLI's own `commands::index` owns `println!`s the MCP crate's `#![deny(clippy::print_stdout)]` can't tolerate) — added `query::reindex(root)` instead, the same `commands::setup_index` + `incremental::detect` + `incremental::apply_batch` path minus the prints, returning `incremental::BatchOutcome` as data. The tool body reopens `Session::open` after a successful run so the same locked session (whether it started `Indexed` or `NotIndexed`) reflects the fresh index for later calls.
+- [x] 6.4 `server.rs`: `tools/list` conditionally omits `codekurve_reindex` when `allow_reindex == false`; calling `reindex` while disabled fails as unknown tool. Implemented as explicit `list_tools`/`call_tool` overrides in the `#[tool_handler]` impl block (`#[tool_handler]`'s macro only auto-generates a method when the impl doesn't already define one) — `list_tools` filters `Self::tool_router().list_all()`, `call_tool` short-circuits `codekurve_reindex` to `McpError::method_not_found::<CallToolRequestMethod>()` before delegating everything else to `ToolCallContext`/the router, unchanged.
+- [x] 6.5 Test: `NotIndexed` session → query tools return degraded response/tool error with warning, no index run triggered; `project_status`/`doctor` still answer (degraded), never auto-index. `not_indexed_session_answers_degraded_without_auto_indexing` in `tests/tools.rs`.
+- [x] 6.6 Test: stale index (`pending_files > 0`) is served as-is with the stale warning set — no auto-reindex triggered by a query tool call. `stale_index_is_served_as_is_never_auto_reindexed` in `tests/tools.rs`.
+- [x] 6.7 Spawned-process test (extends PR4's harness): `tools/list` omits `codekurve_reindex` by default; with `[mcp] allow_reindex = true`, `reindex` appears and a call triggers an index run. New `crates/codekurve-mcp/tests/reindex.rs`, three tests (absent by default, appears + runs when enabled, disabled call fails as unknown tool).
+- [x] 6.8 Golden tests for `project_overview` and `doctor` tool responses. `project_overview_and_doctor_return_the_28_3_envelope` in `tests/tools.rs` — both tools pass `total: None` (no pagination), so this test uses a new `assert_envelope_shape_without_total` helper (same five base fields as `assert_envelope_shape`, minus `total`) rather than the eight-tools helper, which requires `total`.
 
 ## Phase 7: PR7 — Docs and Final Regression (req: mcp-server "AGENT_USAGE.md Documents the §28.4 Rules")
 

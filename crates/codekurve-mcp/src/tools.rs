@@ -19,6 +19,22 @@ use crate::server::CodeKurve;
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ProjectStatusInput {}
 
+/// `codekurve_project_overview` takes no arguments — same reasoning as
+/// [`ProjectStatusInput`].
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ProjectOverviewInput {}
+
+/// `codekurve_doctor` takes no arguments — same reasoning as
+/// [`ProjectStatusInput`].
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DoctorInput {}
+
+/// `codekurve_reindex` takes no arguments; only registered/callable when
+/// `[mcp] allow_reindex = true` (`server.rs`'s `list_tools`/`call_tool`
+/// gating, spec "reindex Gated Off by Default").
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ReindexInput {}
+
 /// `search_symbols` (§28.2): `kinds`/`languages`/`path_prefix` are in the
 /// schema so clients can discover the shape, but any non-`None` value is
 /// rejected (spec "search_symbols Tool Rejects Unsupported Filters",
@@ -313,6 +329,97 @@ impl CodeKurve {
 
         let result = serde_json::json!({ "reached": rows });
         let envelope = query::envelope(&project, result, warnings, truncated, Some(total));
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            envelope.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Report project-wide counts (files/symbols/relationships) plus a per-language file breakdown"
+    )]
+    fn codekurve_project_overview(
+        &self,
+        Parameters(ProjectOverviewInput {}): Parameters<ProjectOverviewInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let session = self.session.lock().unwrap();
+        let data =
+            query::overview(&session).map_err(|e| McpError::internal_error(e.message, None))?;
+        let warnings = session.warnings();
+        let project = session.config().project.name.clone();
+        drop(session);
+
+        let languages: Vec<_> = data
+            .languages
+            .iter()
+            .map(|(language, files)| serde_json::json!({ "language": language, "files": files }))
+            .collect();
+        let result = serde_json::json!({
+            "files": data.files,
+            "symbols": data.symbols,
+            "relationships": data.relationships,
+            "languages": languages,
+        });
+        let envelope = query::envelope(&project, result, warnings, false, None);
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            envelope.to_string(),
+        )]))
+    }
+
+    #[tool(
+        description = "Run the same diagnostic checks as the CLI `doctor` command (sqlite/fts5 availability, schema version, config validity, index presence)"
+    )]
+    fn codekurve_doctor(
+        &self,
+        Parameters(DoctorInput {}): Parameters<DoctorInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let session = self.session.lock().unwrap();
+        let report = query::doctor(&session);
+        let warnings = session.warnings();
+        let project = session.config().project.name.clone();
+        drop(session);
+
+        let checks: Vec<_> = report
+            .checks
+            .iter()
+            .map(|c| serde_json::json!({ "name": c.name, "ok": c.ok, "detail": c.detail }))
+            .collect();
+        let result = serde_json::json!({ "ok": report.ok, "checks": checks });
+        let envelope = query::envelope(&project, result, warnings, false, None);
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            envelope.to_string(),
+        )]))
+    }
+
+    /// Registered unconditionally by `#[tool_router]` (a compile-time list);
+    /// `server.rs`'s `list_tools`/`call_tool` overrides do the actual
+    /// `[mcp] allow_reindex` gating (task 6.4) — this body itself never
+    /// checks the flag.
+    #[tool(
+        description = "Trigger an index run for the current project (only available when [mcp] allow_reindex = true)"
+    )]
+    fn codekurve_reindex(
+        &self,
+        Parameters(ReindexInput {}): Parameters<ReindexInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut session = self.session.lock().unwrap();
+        let root = session.root().to_path_buf();
+        let outcome =
+            query::reindex(&root).map_err(|e| McpError::internal_error(e.message, None))?;
+        // Reopen so subsequent tool calls (on this same locked session) see
+        // the refreshed index, whether the session started `Indexed` or
+        // `NotIndexed`.
+        *session =
+            query::Session::open(&root).map_err(|e| McpError::internal_error(e.message, None))?;
+        let warnings = session.warnings();
+        let project = session.config().project.name.clone();
+        drop(session);
+
+        let result = serde_json::json!({
+            "files_changed": outcome.files_changed,
+            "files_deleted": outcome.files_deleted,
+            "fell_back_to_full_reindex": outcome.fell_back_to_full_reindex,
+        });
+        let envelope = query::envelope(&project, result, warnings, false, None);
         Ok(CallToolResult::success(vec![ContentBlock::text(
             envelope.to_string(),
         )]))

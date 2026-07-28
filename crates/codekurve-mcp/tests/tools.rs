@@ -145,6 +145,30 @@ fn envelope_of(call_result: &serde_json::Value) -> serde_json::Value {
     serde_json::from_str(text).unwrap()
 }
 
+/// `project_overview`/`doctor`/`project_status` don't paginate, so their
+/// envelope has no `total` key (`query::envelope(.., None)`, task 2.9's
+/// "no `total` key" shape) — the same five fields [`assert_envelope_shape`]
+/// checks, minus `total`.
+fn assert_envelope_shape_without_total(envelope: &serde_json::Value) {
+    let obj = envelope.as_object().expect("envelope must be an object");
+    for field in [
+        "schema_version",
+        "project",
+        "result",
+        "warnings",
+        "truncated",
+    ] {
+        assert!(
+            obj.contains_key(field),
+            "missing envelope field {field:?}: {envelope}"
+        );
+    }
+    assert!(
+        !obj.contains_key("total"),
+        "unexpected total key: {envelope}"
+    );
+}
+
 fn assert_envelope_shape(envelope: &serde_json::Value) {
     let obj = envelope.as_object().expect("envelope must be an object");
     for field in [
@@ -184,16 +208,21 @@ fn all_eight_tools_return_the_28_3_envelope() {
         tool_names,
         vec![
             "codekurve_analyze_impact",
+            "codekurve_doctor",
             "codekurve_find_callees",
             "codekurve_find_callers",
             "codekurve_find_implementations",
             "codekurve_find_references",
             "codekurve_get_symbol",
+            "codekurve_project_overview",
             "codekurve_project_status",
             "codekurve_search_symbols",
             "codekurve_trace_path",
         ]
     );
+    // `codekurve_reindex` stays absent — `[mcp] allow_reindex` defaults to
+    // off (task 6.4, covered end-to-end in `tests/reindex.rs`).
+    assert!(!tool_names.contains(&"codekurve_reindex"));
 
     // search_symbols
     let result = session.call(
@@ -401,5 +430,128 @@ fn stale_warning_reflects_pending_files() {
     assert_eq!(warnings.len(), 1);
     assert!(warnings[0].as_str().unwrap().contains("stale"));
     assert_eq!(envelope["result"]["stale"], true);
+    session.finish();
+}
+
+/// Task 6.5: `NotIndexed` session (config present, no `codekurve index` run
+/// yet) — query tools answer degraded (never a hard MCP protocol error) with
+/// a warning, and never trigger an index run themselves.
+#[test]
+fn not_indexed_session_answers_degraded_without_auto_indexing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    codekurve_core::project::init(root).unwrap();
+    let mut session = McpSession::start(root);
+
+    // project_status: degraded data, not an error, with the NotIndexed
+    // reason as the one warning.
+    let result = session.call("codekurve_project_status", serde_json::json!({}));
+    let envelope = envelope_of(&result);
+    assert_eq!(envelope["result"]["stale"], true);
+    assert_eq!(envelope["result"]["files"], 0);
+    let warnings = envelope["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1);
+
+    // doctor: still answers, `index` check fails, no auto-index triggered.
+    let result = session.call("codekurve_doctor", serde_json::json!({}));
+    let envelope = envelope_of(&result);
+    assert_eq!(envelope["result"]["ok"], false);
+    let checks = envelope["result"]["checks"].as_array().unwrap();
+    let index_check = checks
+        .iter()
+        .find(|c| c["name"] == "index")
+        .expect("doctor must report an `index` check when NotIndexed");
+    assert_eq!(index_check["ok"], false);
+
+    // A query tool that needs a real index reports an error (not a silent
+    // index run) — same `Session::indexed`/code-4 message every other tool
+    // body already surfaces via `McpError::internal_error` (existing
+    // convention, e.g. `search_symbols_rejects_each_unsupported_filter`'s
+    // `invalid_params` case).
+    let result = session.call(
+        "codekurve_search_symbols",
+        serde_json::json!({"query": "anything"}),
+    );
+    assert!(
+        result["error"]["message"].as_str().is_some(),
+        "search_symbols on a NotIndexed session must report an error, not success: {result}"
+    );
+
+    // Still no index run happened — no db file, no `.codekurve/index.db`.
+    assert!(!root.join(".codekurve").join("index.db").exists());
+
+    session.finish();
+}
+
+/// Task 6.6: stale index (`pending_files > 0`) is served as-is, warning set
+/// — a query tool call must never trigger a reindex on its own.
+#[test]
+fn stale_index_is_served_as_is_never_auto_reindexed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    seed_project(root);
+
+    let db_path = root.join(".codekurve").join("index.db");
+    let conn = codekurve_store::db::open(&db_path).unwrap();
+    conn.execute("UPDATE index_state SET pending_files = 5", [])
+        .unwrap();
+    drop(conn);
+
+    let mut session = McpSession::start(root);
+    let result = session.call(
+        "codekurve_search_symbols",
+        serde_json::json!({"query": "getEligibility"}),
+    );
+    let envelope = envelope_of(&result);
+    let warnings = envelope["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].as_str().unwrap().contains("stale"));
+    // Results are still served from the existing (stale) index, not blocked.
+    assert!(!envelope["result"].as_array().unwrap().is_empty());
+    session.finish();
+
+    // `pending_files` is untouched by the query call — no reindex ran.
+    let conn = codekurve_store::db::open(&db_path).unwrap();
+    let pending: i64 = conn
+        .query_row("SELECT pending_files FROM index_state LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(pending, 5);
+}
+
+/// Task 6.8: golden coverage for `project_overview` and `doctor`.
+#[test]
+fn project_overview_and_doctor_return_the_28_3_envelope() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    seed_project(root);
+    let mut session = McpSession::start(root);
+
+    let result = session.call("codekurve_project_overview", serde_json::json!({}));
+    let envelope = envelope_of(&result);
+    // `project_overview`/`doctor` don't paginate — no `total` key (same
+    // `envelope(.., None)` shape `codekurve_project_status` already uses).
+    assert_envelope_shape_without_total(&envelope);
+    assert_eq!(envelope["result"]["files"], 2);
+    assert!(envelope["result"]["symbols"].as_u64().unwrap() > 0);
+    let languages = envelope["result"]["languages"].as_array().unwrap();
+    assert!(languages
+        .iter()
+        .any(|l| l["language"] == "typescript" && l["files"] == 2));
+
+    let result = session.call("codekurve_doctor", serde_json::json!({}));
+    let envelope = envelope_of(&result);
+    assert_envelope_shape_without_total(&envelope);
+    assert_eq!(envelope["result"]["ok"], true);
+    let checks = envelope["result"]["checks"].as_array().unwrap();
+    for name in ["sqlite", "fts5", "schema", "project root", "config"] {
+        assert!(
+            checks.iter().any(|c| c["name"] == name),
+            "doctor missing {name:?} check: {checks:?}"
+        );
+    }
+    assert!(!checks.iter().any(|c| c["name"] == "index"));
+
     session.finish();
 }
