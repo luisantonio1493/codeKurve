@@ -78,17 +78,24 @@ Chain strategy: feature-branch-chain
 
 ## Phase 5: PR5 — Remaining Read Tools (req: mcp-server "Tool Registry", "search_symbols Tool Rejects Unsupported Filters", "get_symbol Reads Live Source and Flags Drift", "Query Tools Return the §28.3 Response Envelope", "Stale Warning Visible on Every Response")
 
-- [ ] 5.1 `tools.rs`: `codekurve_search_symbols` — accepts `query`/`kinds`/`languages`/`path_prefix`/`limit`; unsupported filter value returns explicit `invalid params: filter not supported yet (supported: query, limit)` error, never silently ignored.
-- [ ] 5.2 `query.rs`: `source_slice(path, span, ctx_lines)` — reads disk every call; `file_missing`/`span_out_of_range`/`non_utf8` → `stale:true` with reason; else `Some(text)` with `stale = index_pending > 0`.
-- [ ] 5.3 `tools.rs`: `codekurve_get_symbol` — uses `query::get_symbol` + `source_slice`; sets stale flag per Confirmed Decision 4.
-- [ ] 5.4 `tools.rs`: `codekurve_find_references`, `codekurve_find_callers`, `codekurve_find_callees`, `codekurve_find_implementations` — each maps to `query::relationships(s, RelKind::_, args)`.
-- [ ] 5.5 `tools.rs`: `codekurve_trace_path`, `codekurve_analyze_impact` — map to `query::trace`/`query::impact`.
-- [ ] 5.6 All 8 tools: response envelope includes path, line range, confidence, provenance per row; total count + truncation flag at result-set level; `warnings` populated from `Session::warnings()` on every response.
-- [ ] 5.7 JSON schema (via `schemars`) for each tool's input, registered in `tools/list`.
-- [ ] 5.8 Golden test per tool: fixture project, snapshot each `call_tool` result (8 fixtures).
-- [ ] 5.9 Test: unsupported `kinds`/`languages`/`path_prefix` value → explicit error, one case per filter.
-- [ ] 5.10 Test: capped result (more callers than cap) → `truncated:true` + total > returned rows; small result (under cap) → `truncated:false`.
-- [ ] 5.11 Test: stale warning present when `pending_files > 0`, absent (empty/false) when `pending_files == 0` — asserted via a direct tool call, not a filesystem walk.
+- [x] 5.1 `tools.rs`: `codekurve_search_symbols` — accepts `query`/`kinds`/`languages`/`path_prefix`/`limit`; unsupported filter value returns explicit `invalid params: filter not supported yet (supported: query, limit)` error, never silently ignored.
+- [x] 5.2 `query.rs`: `source_slice(path, span, ctx_lines)` — reads disk every call; `file_missing`/`span_out_of_range`/`non_utf8` → `stale:true` with reason; else `Some(text)` with `stale = index_pending > 0`. Signature took a 4th `index_pending: bool` param (see deviation below) instead of computing it internally, since `Session` access lives one layer up in `tools.rs`.
+- [x] 5.3 `tools.rs`: `codekurve_get_symbol` — uses `query::get_symbol` + `source_slice`; sets stale flag per Confirmed Decision 4.
+- [x] 5.4 `tools.rs`: `codekurve_find_references`, `codekurve_find_callers`, `codekurve_find_callees`, `codekurve_find_implementations` — each maps to `query::relationships(s, RelKind::_, args)`.
+- [x] 5.5 `tools.rs`: `codekurve_trace_path`, `codekurve_analyze_impact` — map to `query::trace`/`query::impact`.
+- [x] 5.6 All 8 tools: response envelope includes path, line range, confidence, provenance per row; total count + truncation flag at result-set level; `warnings` populated from `Session::warnings()` on every response.
+- [x] 5.7 JSON schema (via `schemars`) for each tool's input, registered in `tools/list`.
+- [x] 5.8 Golden test per tool: fixture project, snapshot each `call_tool` result (8 fixtures).
+- [x] 5.9 Test: unsupported `kinds`/`languages`/`path_prefix` value → explicit error, one case per filter.
+- [x] 5.10 Test: capped result (more callers than cap) → `truncated:true` + total > returned rows; small result (under cap) → `truncated:false`.
+- [x] 5.11 Test: stale warning present when `pending_files > 0`, absent (empty/false) when `pending_files == 0` — asserted via a direct tool call, not a filesystem walk.
+
+**Deviations from the plan (PR5):**
+- `StoredRelationship` (codekurve-store) gained one additive field, `source_relative_path`, and `query_relationships`'s SQL gained one join (`files src_file ON src_file.id = src.file_id`) — needed so `find_references`/`find_callers`/`find_callees`/`find_implementations` rows can carry `path` per §28.3; the existing CLI `relationship_json`/`print_relationships` select fields by name and are byte-identical.
+- `find_references`/`find_callers`/`find_callees`/`find_implementations` apply a limit even when the client doesn't pass one — `min(limit.unwrap_or(config.queries.default_limit), config.queries.max_limit)` — reusing the same config knob `search` already uses, since the CLI's own `--limit`/`--offset` have no default (unbounded) and task 5.10 needs a real cap to test against.
+- `trace_path`/`analyze_impact` rows come from a new `query::bfs_rows`/`reached_row` helper (one `find_symbol_by_id` lookup per reached node, since `traverse::Reached` only carries a symbol id, not its file/span) — acceptable extra cost at fixture/BFS-cap result sizes rather than a second joined traversal query.
+- `search_symbols`/`get_symbol` rows report `"confidence": "high"`/`"provenance": "tree-sitter"` as constants rather than reading stored columns — `reindex` (codekurve-store::repo::insert_file) hardcodes exactly those two values for every symbol today, and `StoredSymbol` doesn't carry them; adding real columns is deferred until per-symbol values actually exist.
+- `get_symbol`'s input schema adds `include_source` (default `true`, spec's own scenario calls it with this flag) alongside `ctx_lines` (default `0`).
 
 ## Phase 6: PR6 — project_overview, doctor, Gated reindex (req: mcp-server "doctor Tool", "Missing or Stale Index Served Degraded, Never Auto-Indexed", "reindex Gated Off by Default")
 

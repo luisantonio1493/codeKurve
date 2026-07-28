@@ -17,3 +17,4 @@ serde_json = { workspace = true }
 assert_cmd = "2"
 tempfile = "3"
 codekurve-core = { path = "../codekurve-core" }
+codekurve-store = { path = "../codekurve-store" }

@@ -86,6 +86,9 @@ fn handshake_and_project_status_call_stay_clean_jsonrpc() {
     let lines = run_handshake(tmp.path(), &[]);
     assert_all_lines_are_jsonrpc(&lines);
 
+    // Full tool-name coverage lives in `tests/tools.rs` (task 5.8+); this
+    // test only needs to know `codekurve_project_status` is still present
+    // among PR5's other eight tools.
     let tools_list: serde_json::Value = serde_json::from_str(lines[1].trim()).unwrap();
     let tool_names: Vec<&str> = tools_list["result"]["tools"]
         .as_array()
@@ -93,7 +96,7 @@ fn handshake_and_project_status_call_stay_clean_jsonrpc() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(tool_names, vec!["codekurve_project_status"]);
+    assert!(tool_names.contains(&"codekurve_project_status"));
 
     let call_result: serde_json::Value = serde_json::from_str(lines[2].trim()).unwrap();
     assert_eq!(

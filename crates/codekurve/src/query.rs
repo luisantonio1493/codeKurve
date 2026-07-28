@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use codekurve_core::Config;
+use codekurve_core::{Config, SourceSpan};
 use codekurve_store::repo::{self, StoredRelationship, StoredSymbol};
 use codekurve_store::{db, migrations, traverse, Connection};
 
@@ -239,6 +239,58 @@ pub fn impact(s: &Session, args: &QueryArgs) -> Result<traverse::BfsOutcome, Com
     ))
 }
 
+/// One §28.3 row (path, line range, confidence, provenance) for a
+/// [`traverse::Reached`] node — `trace_path`/`analyze_impact`'s shared row
+/// shape (MCP-only; the CLI's `trace_json`/`reached_json` stay unchanged).
+/// One extra lookup per node (`find_symbol_by_id`) — `Reached` only carries
+/// the id, not the node's own file/span; fixture-sized result sets make this
+/// an acceptable cost rather than a second joined query.
+pub fn reached_row(s: &Session, r: &traverse::Reached) -> Result<serde_json::Value, CommandError> {
+    let (conn, _project_id) = s.indexed()?;
+    let sym = repo::find_symbol_by_id(conn, &r.symbol_id)
+        .map_err(|e| CommandError::from(e.to_string()))?;
+    Ok(serde_json::json!({
+        "symbol_id": r.symbol_id,
+        "depth": r.depth,
+        "path": sym.as_ref().map(|sym| sym.relative_path.clone()),
+        "start_line": sym.as_ref().map(|sym| sym.span.start_line),
+        "end_line": sym.as_ref().map(|sym| sym.span.end_line),
+        "confidence": r.via.as_ref().map(|e| e.confidence.clone()),
+        "provenance": r.via.as_ref().map(|e| e.provenance.clone()),
+        "via_kind": r.via.as_ref().map(|e| e.kind.clone()),
+        "predecessor": r.predecessor,
+    }))
+}
+
+/// Every reached node as a §28.3 row (see [`reached_row`]), for `trace_path`/
+/// `analyze_impact`'s MCP result.
+pub fn bfs_rows(
+    s: &Session,
+    outcome: &traverse::BfsOutcome,
+) -> Result<Vec<serde_json::Value>, CommandError> {
+    outcome.reached.iter().map(|r| reached_row(s, r)).collect()
+}
+
+/// One §28.3 row (path, line range, confidence, provenance) for a
+/// [`StoredRelationship`] — `find_references`/`find_callers`/`find_callees`/
+/// `find_implementations`'s MCP result shape (the CLI's `relationship_json`
+/// stays unchanged, no `path`).
+pub fn relationship_row(r: &StoredRelationship) -> serde_json::Value {
+    serde_json::json!({
+        "source_symbol_id": r.source_symbol_id,
+        "source_qualified_name": r.source_qualified_name,
+        "target_symbol_id": r.target_symbol_id,
+        "target_qualified_name": r.target_qualified_name,
+        "target_external": r.target_external,
+        "kind": r.kind,
+        "path": r.source_relative_path,
+        "start_line": r.start_line,
+        "start_column": r.start_column,
+        "confidence": r.confidence,
+        "provenance": r.provenance,
+    })
+}
+
 /// `search`'s filter — just the free-text query plus an optional limit
 /// override today; `kinds`/`languages`/`path_prefix` are PR5's job
 /// (design "Unsupported search filters").
@@ -283,6 +335,64 @@ pub fn get_symbol(s: &Session, id: &str, _ctx_lines: u32) -> Result<SymbolDetail
         .map_err(|e| CommandError::from(e.to_string()))?
         .ok_or_else(|| CommandError::from(format!("no symbol with id {id:?}")))?;
     Ok(SymbolDetail { symbol })
+}
+
+/// `get_symbol`'s live-source read (design "`get_symbol` Staleness",
+/// confirmed decision 4): promoted from `commands::snippet`'s bounds check,
+/// made explicit rather than a text marker. Reads disk on every call —
+/// never the indexed/cached span.
+pub struct SourceSlice {
+    pub source: Option<String>,
+    pub stale: bool,
+    pub reason: Option<&'static str>,
+}
+
+/// `path` is the file on disk (project root joined with the symbol's
+/// `relative_path`); `ctx_lines` extra lines of context on each side of the
+/// symbol's line span; `index_pending` is whether the project's stored
+/// freshness metadata shows pending files (`Session::warnings()` non-empty
+/// for an `Indexed` session) — folded into `stale` even when the read itself
+/// succeeds, per confirmed decision 4.
+pub fn source_slice(
+    path: &Path,
+    span: &SourceSpan,
+    ctx_lines: u32,
+    index_pending: bool,
+) -> SourceSlice {
+    let Ok(bytes) = std::fs::read(path) else {
+        return SourceSlice {
+            source: None,
+            stale: true,
+            reason: Some("file_missing"),
+        };
+    };
+    if span.end_byte > bytes.len() {
+        return SourceSlice {
+            source: None,
+            stale: true,
+            reason: Some("span_out_of_range"),
+        };
+    }
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return SourceSlice {
+            source: None,
+            stale: true,
+            reason: Some("non_utf8"),
+        };
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let start = span.start_line.saturating_sub(ctx_lines as usize).max(1);
+    let end = (span.end_line + ctx_lines as usize).min(lines.len());
+    let snippet = if start >= 1 && start <= end && end <= lines.len() {
+        lines[(start - 1)..end].join("\n")
+    } else {
+        String::new()
+    };
+    SourceSlice {
+        source: Some(snippet),
+        stale: index_pending,
+        reason: None,
+    }
 }
 
 /// `codekurve status`'s data, plus the degraded (`NotIndexed`) shape a

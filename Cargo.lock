@@ -219,6 +219,7 @@ dependencies = [
  "assert_cmd",
  "codekurve",
  "codekurve-core",
+ "codekurve-store",
  "rmcp",
  "serde",
  "serde_json",
