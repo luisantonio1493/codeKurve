@@ -1,14 +1,12 @@
 //! CodeKurve CLI binary (composition root).
 
 mod cli;
-mod commands;
-mod incremental;
-mod watch;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use cli::Args;
+use codekurve::{commands, watch};
 use commands::CommandError;
 
 const USAGE: &str = "usage: codekurve <version|init|index|watch|status|search|symbol|doctor|\
