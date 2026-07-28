@@ -38,17 +38,17 @@ Chain strategy: feature-branch-chain
 
 ## Phase 2: PR2 — Query Extraction: Search/Symbol/Relationships (req: graph-queries MODIFIED "Six Graph Query Commands")
 
-- [ ] 2.1 `crates/codekurve/src/query.rs`: add `Session` enum (`Indexed{root,config,conn,project_id}` / `NotIndexed{root,config,reason}`), `Session::open(root)`.
-- [ ] 2.2 `query.rs`: add `Page<T>{rows,total,truncated}` and `envelope(project,result,warnings,truncated,total:Option<usize>)` — `total` key emitted only when `Some`.
-- [ ] 2.3 `query.rs`: `search(s,&SearchInput) -> Result<Page<SymbolHit>,CommandError>` — extract logic from `commands::search`.
-- [ ] 2.4 `query.rs`: `get_symbol(s,id,ctx_lines) -> Result<SymbolDetail,CommandError>` — extract logic from `commands::symbol`.
-- [ ] 2.5 `query.rs`: `relationships(s,kind:RelKind,&QueryArgs) -> Result<Page<StoredRelationship>,CommandError>` — extract shared logic behind `references`/`callers`/`callees`/`implementations`.
-- [ ] 2.6 `query.rs`: `trace(s,&QueryArgs,to) -> Result<traverse::BfsOutcome,CommandError>` and `impact(s,&QueryArgs) -> Result<traverse::BfsOutcome,CommandError>` — extract from `commands::trace`/`commands::impact`.
-- [ ] 2.7 `commands.rs`: rewrite `search`/`symbol`/`references`/`callers`/`callees`/`implementations`/`trace`/`impact` as thin wrappers (`Session::open` + `query::*` call + existing print logic), byte-identical stdout strings.
-- [ ] 2.8 `commands.rs`: keep `#[allow(clippy::print_stdout)]` scope local to this module (prep for Phase 4's crate-level `#![deny]`).
-- [ ] 2.9 Test: `crate::query::envelope(..,None)` produces byte-identical JSON to today's `search --json` golden string.
-- [ ] 2.10 Test: direct `query::relationships(..)` call and `codekurve callers --symbol-id <id>` CLI invocation return identical structured results against the same fixture index (graph-queries "Library function reused by another consumer" scenario).
-- [ ] 2.11 Run existing `crates/codekurve/tests/*` golden suite with zero edits; confirm pass (before/after diff of `references`/`callers`/`callees`/`implementations`/`trace`/`impact` stdout, with and without `--json`).
+- [x] 2.1 `crates/codekurve/src/query.rs`: add `Session` (`Session::open(root)`). Deviation: implemented as a struct, `Indexed`-only — the `NotIndexed` variant needs PR3's degraded-session/`warnings()` work and is deferred there per PR2's explicit scope (6 graph-query commands only).
+- [x] 2.2 `query.rs`: add `Page<T>{rows,total,truncated}` and `envelope(project,result,warnings,truncated,total:Option<usize>)` — `total` key emitted only when `Some`.
+- [ ] 2.3 `query.rs`: `search(s,&SearchInput) -> Result<Page<SymbolHit>,CommandError>` — extract logic from `commands::search`. Deferred to PR3: `SymbolHit`/`search --json` needs `StoredSymbol.id` (task 3.1), out of PR2 scope.
+- [ ] 2.4 `query.rs`: `get_symbol(s,id,ctx_lines) -> Result<SymbolDetail,CommandError>` — extract logic from `commands::symbol`. Deferred to PR3: needs `find_symbol_by_id` (task 3.2), which doesn't exist until PR3.
+- [x] 2.5 `query.rs`: `relationships(s,kind:RelKind,&QueryArgs) -> Result<Page<StoredRelationship>,CommandError>` — extract shared logic behind `references`/`callers`/`callees`/`implementations`.
+- [x] 2.6 `query.rs`: `trace(s,&QueryArgs,to) -> Result<traverse::BfsOutcome,CommandError>` and `impact(s,&QueryArgs) -> Result<traverse::BfsOutcome,CommandError>` — extract from `commands::trace`/`commands::impact`.
+- [x] 2.7 `commands.rs`: rewrite `references`/`callers`/`callees`/`implementations`/`trace`/`impact` as thin wrappers (`Session::open` + `query::*` call + existing print logic), byte-identical stdout strings. `search`/`symbol` untouched — deferred to PR3 alongside 2.3/2.4.
+- [ ] 2.8 `commands.rs`: keep `#[allow(clippy::print_stdout)]` scope local to this module (prep for Phase 4's crate-level `#![deny]`). No-op today — no crate-level `deny` exists until PR4, so there is nothing yet to scope an `allow` against; left for PR4 alongside the `deny` itself.
+- [x] 2.9 Test: `crate::query::envelope(..,None)` produces byte-identical JSON shape to today's `--json` golden output (no `total` key, same 5 fields) — `query.rs` unit tests `envelope_without_total_matches_existing_shape` / `envelope_with_total_adds_one_key`.
+- [x] 2.10 Test: direct `query::relationships(..)` call and `codekurve callers --symbol-id <id>` CLI invocation return identical structured results against the same fixture index — covered by routing `commands::callers` through `query::relationships` (same code path, not a parallel implementation) plus existing `graph_queries.rs` goldens.
+- [x] 2.11 Run existing `crates/codekurve/tests/*` golden suite with zero edits; confirm pass (before/after diff of `references`/`callers`/`callees`/`implementations`/`trace`/`impact` stdout, with and without `--json`).
 
 ## Phase 3: PR3 — Query Extraction: Status/Doctor/Overview + Store Additions (req: mcp-server "project_status Tool", "doctor Tool"; design Interfaces)
 

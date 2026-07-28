@@ -6,4 +6,5 @@
 
 pub mod commands;
 pub mod incremental;
+pub mod query;
 pub mod watch;

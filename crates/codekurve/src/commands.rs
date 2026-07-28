@@ -17,6 +17,8 @@ use codekurve_store::repo::{
 };
 use codekurve_store::{traverse, Connection};
 
+use crate::query;
+
 /// Structured CLI error (§27, spec "Ambiguous name lookup"/"Query before
 /// first index"): code 1 = generic failure — `From<String>` keeps every
 /// pre-PR5b command (`index`/`search`/`symbol`/`doctor`) working unchanged;
@@ -593,50 +595,37 @@ pub struct QueryArgs<'a> {
 
 /// `codekurve references --symbol-id <id>|--symbol-name <name> --root <path>`
 pub fn references(args: &QueryArgs) -> Result<(), CommandError> {
-    relationship_command(args, repo::references)
+    relationship_command(args, query::RelKind::References)
 }
 
 /// `codekurve callers --symbol-id <id>|--symbol-name <name> --root <path>`
 pub fn callers(args: &QueryArgs) -> Result<(), CommandError> {
-    relationship_command(args, repo::callers)
+    relationship_command(args, query::RelKind::Callers)
 }
 
 /// `codekurve callees --symbol-id <id>|--symbol-name <name> --root <path>`
 pub fn callees(args: &QueryArgs) -> Result<(), CommandError> {
-    relationship_command(args, repo::callees)
+    relationship_command(args, query::RelKind::Callees)
 }
 
 /// `codekurve implementations --symbol-id <id>|--symbol-name <name> --root <path>`
 pub fn implementations(args: &QueryArgs) -> Result<(), CommandError> {
-    relationship_command(args, repo::implementations)
+    relationship_command(args, query::RelKind::Implementations)
 }
 
-type RelationshipQueryFn = fn(
-    &Connection,
-    &str,
-    &str,
-    Option<Confidence>,
-) -> codekurve_store::Result<Vec<repo::StoredRelationship>>;
-
-/// Shared body of `references`/`callers`/`callees`/`implementations`: resolve
-/// the project + subject symbol, run the single indexed SELECT (§5a.1),
-/// paginate, then print either plain text or the §27.5 JSON envelope.
-fn relationship_command(args: &QueryArgs, query: RelationshipQueryFn) -> Result<(), CommandError> {
-    let (_, config, conn, project_id) = require_indexed_project(args.root)?;
-    let symbol_id = resolve_symbol(&conn, &project_id, args.symbol_id, args.symbol_name)?;
-    let min_confidence = parse_confidence(args.min_confidence)?;
-
-    let mut rows = query(&conn, &project_id, &symbol_id, min_confidence)
-        .map_err(|e| CommandError::from(e.to_string()))?;
-    let total = rows.len();
-    paginate(&mut rows, args.limit, args.offset);
-    let truncated = total > args.offset.unwrap_or(0) + rows.len();
+/// Shared body of `references`/`callers`/`callees`/`implementations`: open a
+/// session, run [`query::relationships`], then print either plain text or
+/// the §27.5 JSON envelope (`total: None` — CLI stdout stays byte-identical;
+/// MCP, PR5+, passes `Some(page.total)`).
+fn relationship_command(args: &QueryArgs, kind: query::RelKind) -> Result<(), CommandError> {
+    let s = query::Session::open(args.root)?;
+    let page = query::relationships(&s, kind, args)?;
 
     if args.json {
-        let result = serde_json::Value::Array(rows.iter().map(relationship_json).collect());
-        print_envelope(&config.project.name, result, Vec::new(), truncated);
+        let result = serde_json::Value::Array(page.rows.iter().map(relationship_json).collect());
+        print_envelope(&s.config.project.name, result, Vec::new(), page.truncated);
     } else {
-        print_relationships(&rows);
+        print_relationships(&page.rows);
     }
     Ok(())
 }
@@ -644,29 +633,20 @@ fn relationship_command(args: &QueryArgs, query: RelationshipQueryFn) -> Result<
 /// `codekurve trace <to> --symbol-id <id>|--symbol-name <from> --root <path>`
 /// — bounded forward BFS (§26.4) from the resolved source symbol to `to`,
 /// also resolved through [`resolve_symbol`] (an ambiguous target exits 6
-/// exactly like an ambiguous source).
+/// exactly like an ambiguous source). Re-resolves `to` for the text-mode
+/// print only — [`query::trace`] already resolved it once internally; both
+/// calls are deterministic reads against the same session, so this costs one
+/// extra lookup rather than widening `query::trace`'s design-fixed return
+/// type.
 pub fn trace(args: &QueryArgs, to: &str) -> Result<(), CommandError> {
-    let (_, config, conn, project_id) = require_indexed_project(args.root)?;
-    let from = resolve_symbol(&conn, &project_id, args.symbol_id, args.symbol_name)?;
-    let target = resolve_symbol(&conn, &project_id, None, Some(to))?;
-    let min_confidence = parse_confidence(args.min_confidence)?;
-
-    let adjacency = traverse::load_adjacency(&conn, &project_id, false)
-        .map_err(|e| CommandError::from(e.to_string()))?;
-    let caps = bfs_caps(args.depth);
-    let outcome = traverse::bfs(
-        &adjacency,
-        &from,
-        Some(&target),
-        &caps,
-        None,
-        min_confidence,
-    );
+    let s = query::Session::open(args.root)?;
+    let outcome = query::trace(&s, args, to)?;
 
     if args.json {
         let result = trace_json(&outcome);
-        print_envelope(&config.project.name, result, Vec::new(), outcome.truncated);
+        print_envelope(&s.config.project.name, result, Vec::new(), outcome.truncated);
     } else {
+        let target = resolve_symbol(&s.conn, &s.project_id, None, Some(to))?;
         print_trace_result(&outcome, &target);
     }
     Ok(())
@@ -677,25 +657,19 @@ pub fn trace(args: &QueryArgs, to: &str) -> Result<(), CommandError> {
 /// resolved symbol, never guaranteed, truncated rather than silently
 /// incomplete.
 pub fn impact(args: &QueryArgs) -> Result<(), CommandError> {
-    let (_, config, conn, project_id) = require_indexed_project(args.root)?;
-    let symbol_id = resolve_symbol(&conn, &project_id, args.symbol_id, args.symbol_name)?;
-    let min_confidence = parse_confidence(args.min_confidence)?;
-
-    let adjacency = traverse::load_adjacency(&conn, &project_id, true)
-        .map_err(|e| CommandError::from(e.to_string()))?;
-    let caps = bfs_caps(args.depth);
-    let outcome = traverse::bfs(&adjacency, &symbol_id, None, &caps, None, min_confidence);
+    let s = query::Session::open(args.root)?;
+    let outcome = query::impact(&s, args)?;
 
     if args.json {
         let result = trace_json(&outcome);
-        print_envelope(&config.project.name, result, Vec::new(), outcome.truncated);
+        print_envelope(&s.config.project.name, result, Vec::new(), outcome.truncated);
     } else {
         print_impact_result(&outcome);
     }
     Ok(())
 }
 
-fn bfs_caps(depth: Option<u32>) -> traverse::BfsCaps {
+pub(crate) fn bfs_caps(depth: Option<u32>) -> traverse::BfsCaps {
     traverse::BfsCaps {
         max_depth: depth.unwrap_or(DEFAULT_MAX_DEPTH),
         max_nodes: DEFAULT_MAX_NODES,
@@ -707,7 +681,8 @@ fn bfs_caps(depth: Option<u32>) -> traverse::BfsCaps {
 /// Every graph-query command's preamble (spec "Query before first index"):
 /// resolve `root`, load config, open the DB, find the project row — any
 /// failure here means "no completed index run", always exit code 4.
-fn require_indexed_project(
+/// `pub(crate)`: `query::Session::open` (PR2) drives the same preamble.
+pub(crate) fn require_indexed_project(
     root: &Path,
 ) -> Result<(PathBuf, Config, Connection, String), CommandError> {
     let root = canonicalize(root).map_err(|e| CommandError {
@@ -738,7 +713,7 @@ fn require_indexed_project(
 /// `path::Class.method`), which narrows to exactly one match (spec
 /// "Qualified name disambiguates") by looking up the bare identifier tail
 /// then filtering candidates down to the exact qualified-name match.
-fn resolve_symbol(
+pub(crate) fn resolve_symbol(
     conn: &Connection,
     project_id: &str,
     symbol_id: Option<&str>,
@@ -798,7 +773,7 @@ fn ambiguous_message(name: &str, candidates: &[repo::SymbolCandidate]) -> String
     message
 }
 
-fn parse_confidence(raw: Option<&str>) -> Result<Option<Confidence>, CommandError> {
+pub(crate) fn parse_confidence(raw: Option<&str>) -> Result<Option<Confidence>, CommandError> {
     let Some(raw) = raw else {
         return Ok(None);
     };
@@ -818,7 +793,7 @@ fn parse_confidence(raw: Option<&str>) -> Result<Option<Confidence>, CommandErro
 /// ponytail: applies to the four flat relationship-list commands only —
 /// `trace`/`impact`'s BFS result (a path plus a reached-set) isn't a
 /// page-able list in the same sense, so they don't call this.
-fn paginate<T>(rows: &mut Vec<T>, limit: Option<usize>, offset: Option<usize>) {
+pub(crate) fn paginate<T>(rows: &mut Vec<T>, limit: Option<usize>, offset: Option<usize>) {
     if let Some(offset) = offset {
         let drop_n = offset.min(rows.len());
         rows.drain(0..drop_n);
@@ -939,21 +914,11 @@ fn print_truncation(outcome: &traverse::BfsOutcome) {
 }
 
 /// §27.5 JSON envelope: `schema_version`, `project`, `result`, `warnings`,
-/// `truncated` — every field, every command, every time.
-fn print_envelope(
-    project: &str,
-    result: serde_json::Value,
-    warnings: Vec<String>,
-    truncated: bool,
-) {
-    let envelope = serde_json::json!({
-        "schema_version": 1,
-        "project": project,
-        "result": result,
-        "warnings": warnings,
-        "truncated": truncated,
-    });
-    println!("{envelope}");
+/// `truncated` — every field, every command, every time. Delegates to
+/// [`query::envelope`] with `total: None`, so CLI `--json` output stays
+/// byte-identical (the `total` key is only ever emitted when `Some`).
+fn print_envelope(project: &str, result: serde_json::Value, warnings: Vec<String>, truncated: bool) {
+    println!("{}", query::envelope(project, result, warnings, truncated, None));
 }
 
 fn discovery_options(config: &Config) -> DiscoveryOptions {
