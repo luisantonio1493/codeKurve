@@ -15,10 +15,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use codekurve_core::{Confidence, Provenance, RelationshipKind, SymbolKind};
+use codekurve_core::{Confidence, LanguageId, Provenance, RelationshipKind, SymbolKind};
 
-use crate::extract::kind_matches;
 use crate::ir::{EdgeTarget, ExtractedRelationship, FileAnalysis, UnresolvedReference};
+use crate::languages::{analyzer_for, same_resolution_domain, BASE_LIST_REASON};
 
 /// Minimal `tsconfig.json` `compilerOptions.paths` alias map: prefix (with a
 /// single trailing `*`) -> replacement prefix. Deliberately narrow scope
@@ -34,6 +34,7 @@ pub(crate) struct ProjectSymbol {
     pub(crate) file: String,
     pub(crate) qualified_name: String,
     pub(crate) kind: SymbolKind,
+    pub(crate) language: LanguageId,
 }
 
 /// One symbol read back from prior storage — everything `SymbolTable::build`
@@ -50,6 +51,7 @@ pub struct BaselineSymbol {
     pub file: String,
     pub qualified_name: String,
     pub kind: SymbolKind,
+    pub language: LanguageId,
     pub exported: bool,
 }
 
@@ -108,6 +110,7 @@ impl SymbolTable {
                 file: entry.file.clone(),
                 qualified_name: entry.qualified_name.clone(),
                 kind: entry.kind,
+                language: entry.language,
             };
             by_name
                 .entry(entry.name.clone())
@@ -130,6 +133,7 @@ impl SymbolTable {
                         file: file.file.clone(),
                         qualified_name: sym.qualified_name.clone(),
                         kind: sym.kind,
+                        language: file.language,
                     });
             }
         }
@@ -156,6 +160,7 @@ impl SymbolTable {
                         file: file.file.clone(),
                         qualified_name: sym.qualified_name.clone(),
                         kind: sym.kind,
+                        language: file.language,
                     },
                 );
             }
@@ -188,6 +193,7 @@ impl SymbolTable {
                             file: file.file.clone(),
                             qualified_name: sym.qualified_name.clone(),
                             kind: sym.kind,
+                            language: file.language,
                         });
                 }
             }
@@ -328,11 +334,13 @@ pub fn resolve_with(
 
     for file in files.iter_mut() {
         let file_name = file.file.clone();
+        let source_language = file.language;
         let old_rels = std::mem::take(&mut file.relationships);
         let mut new_rels = Vec::with_capacity(old_rels.len());
         for rel in old_rels {
             resolve_one(
                 &file_name,
+                source_language,
                 rel,
                 &table,
                 &known_files,
@@ -350,6 +358,7 @@ pub fn resolve_with(
 #[allow(clippy::too_many_arguments)]
 fn resolve_one(
     file: &str,
+    source_language: LanguageId,
     rel: ExtractedRelationship,
     table: &SymbolTable,
     known_files: &HashSet<String>,
@@ -367,6 +376,9 @@ fn resolve_one(
     };
 
     match rel.kind {
+        RelationshipKind::Imports if source_language == LanguageId::CSharp => {
+            resolve_using(&rel, &text, table, new_rels, report)
+        }
         RelationshipKind::Imports => resolve_import(
             file,
             &rel,
@@ -389,13 +401,30 @@ fn resolve_one(
             unresolved,
             report,
         ),
+        RelationshipKind::UsesType if rel.reason.as_deref() == Some(BASE_LIST_REASON) => {
+            resolve_base_entry(
+                source_language,
+                &rel,
+                &text,
+                table,
+                new_rels,
+                unresolved,
+                report,
+            )
+        }
         RelationshipKind::Calls
         | RelationshipKind::Constructs
         | RelationshipKind::Inherits
         | RelationshipKind::Implements
-        | RelationshipKind::References => {
-            resolve_by_name(&rel, &text, table, new_rels, unresolved, report)
-        }
+        | RelationshipKind::References => resolve_by_name(
+            source_language,
+            &rel,
+            &text,
+            table,
+            new_rels,
+            unresolved,
+            report,
+        ),
         // `Defines`/`Overrides`/`UsesType`/`Reads`/`Writes` aren't produced
         // by `extract::analyze` yet — nothing to resolve, pass through
         // unchanged.
@@ -405,7 +434,12 @@ fn resolve_one(
 
 /// §20.4 tiers for a project-wide by-name lookup (`Calls`/`Constructs`
 /// same-file misses, `Inherits`/`Implements` same-file misses).
+/// `kind_matches` dispatches through the reference's own source-file
+/// analyzer (design "Resolution Changes") rather than a shared free
+/// function, so a second language never silently inherits TypeScript's
+/// rules; language-filtered candidates land in a later PR (PR5).
 fn resolve_by_name(
+    source_language: LanguageId,
     rel: &ExtractedRelationship,
     text: &str,
     table: &SymbolTable,
@@ -413,12 +447,16 @@ fn resolve_by_name(
     unresolved: &mut Vec<UnresolvedReference>,
     report: &mut ResolutionReport,
 ) {
+    let analyzer = analyzer_for(source_language);
     let matches: Vec<&ProjectSymbol> = table
         .by_name
         .get(text)
         .into_iter()
         .flatten()
-        .filter(|ps| kind_matches(rel.kind, ps.kind))
+        .filter(|ps| {
+            same_resolution_domain(source_language, ps.language)
+                && analyzer.kind_matches(rel.kind, ps.kind)
+        })
         .collect();
 
     match matches.as_slice() {
@@ -456,6 +494,148 @@ fn resolve_by_name(
             }
         }
     }
+}
+
+fn resolve_base_entry(
+    source_language: LanguageId,
+    rel: &ExtractedRelationship,
+    text: &str,
+    table: &SymbolTable,
+    new_rels: &mut Vec<ExtractedRelationship>,
+    unresolved: &mut Vec<UnresolvedReference>,
+    report: &mut ResolutionReport,
+) {
+    let matches: Vec<&ProjectSymbol> = table
+        .by_name
+        .get(text)
+        .into_iter()
+        .flatten()
+        .filter(|ps| {
+            same_resolution_domain(source_language, ps.language)
+                && matches!(
+                    ps.kind,
+                    SymbolKind::Class | SymbolKind::Struct | SymbolKind::Interface
+                )
+        })
+        .collect();
+
+    match matches.as_slice() {
+        [] => {
+            unresolved.push(unresolved_ref(
+                rel,
+                text,
+                "base list entry not found in project; class vs interface undeterminable",
+            ));
+            report.unresolved += 1;
+        }
+        [only] => {
+            push_classified_base(new_rels, rel, only, Provenance::Resolved, Confidence::High);
+            report.resolved += 1;
+        }
+        many => {
+            for candidate in many {
+                push_classified_base(
+                    new_rels,
+                    rel,
+                    candidate,
+                    Provenance::Heuristic,
+                    Confidence::Low,
+                );
+                report.resolved += 1;
+            }
+        }
+    }
+}
+
+fn push_classified_base(
+    new_rels: &mut Vec<ExtractedRelationship>,
+    rel: &ExtractedRelationship,
+    candidate: &ProjectSymbol,
+    provenance: Provenance,
+    confidence: Confidence,
+) {
+    new_rels.push(ExtractedRelationship {
+        source_local_key: rel.source_local_key.clone(),
+        target: EdgeTarget::Global {
+            file: candidate.file.clone(),
+            qualified_name: candidate.qualified_name.clone(),
+        },
+        kind: if candidate.kind == SymbolKind::Interface {
+            RelationshipKind::Implements
+        } else {
+            RelationshipKind::Inherits
+        },
+        span: rel.span,
+        provenance,
+        confidence,
+        reason: None,
+    });
+}
+
+fn resolve_using(
+    rel: &ExtractedRelationship,
+    text: &str,
+    table: &SymbolTable,
+    new_rels: &mut Vec<ExtractedRelationship>,
+    report: &mut ResolutionReport,
+) {
+    let matches: Vec<&ProjectSymbol> = table
+        .by_name
+        .get(text)
+        .into_iter()
+        .flatten()
+        .filter(|ps| ps.language == LanguageId::CSharp && ps.kind == SymbolKind::Namespace)
+        .collect();
+
+    match matches.as_slice() {
+        [] => {
+            push_external(new_rels, rel, text.to_string());
+            report.resolved += 1;
+        }
+        [only] => {
+            push_global_preserving_reason(
+                new_rels,
+                rel,
+                only,
+                Provenance::Resolved,
+                Confidence::High,
+            );
+            report.resolved += 1;
+        }
+        many => {
+            for candidate in many {
+                push_global_preserving_reason(
+                    new_rels,
+                    rel,
+                    candidate,
+                    Provenance::Heuristic,
+                    Confidence::Low,
+                );
+                report.resolved += 1;
+            }
+        }
+    }
+}
+
+fn push_global_preserving_reason(
+    new_rels: &mut Vec<ExtractedRelationship>,
+    rel: &ExtractedRelationship,
+    candidate: &ProjectSymbol,
+    provenance: Provenance,
+    confidence: Confidence,
+) {
+    new_rels.push(ExtractedRelationship {
+        source_local_key: rel.source_local_key.clone(),
+        target: EdgeTarget::Global {
+            file: candidate.file.clone(),
+            qualified_name: candidate.qualified_name.clone(),
+        },
+        kind: rel.kind,
+        span: rel.span,
+        provenance,
+        confidence,
+        reason: rel.reason.clone(),
+    });
 }
 
 /// An `Imports` edge, or an `Exports` edge with a `from` module specifier.
@@ -655,6 +835,10 @@ mod tests {
         analyze(source, LanguageId::TypeScript, path).unwrap()
     }
 
+    fn csharp(path: &str, source: &str) -> FileAnalysis {
+        analyze(source, LanguageId::CSharp, path).unwrap()
+    }
+
     /// §20.2 relative-path resolution, exercised through `resolve_module`
     /// directly: implicit extension, then `index.*` directory resolution.
     #[test]
@@ -839,6 +1023,7 @@ mod tests {
                 file: "src/worker.ts".to_string(),
                 qualified_name: "src/worker.ts::doWork".to_string(),
                 kind: SymbolKind::Function,
+                language: LanguageId::TypeScript,
                 exported: true,
             }],
         );
@@ -900,5 +1085,230 @@ mod tests {
         assert_eq!(unresolved.target_text, "neverDefined");
         assert_eq!(unresolved.candidate_count, 0);
         assert_eq!(unresolved.confidence, Confidence::Unresolved);
+    }
+
+    #[test]
+    fn csharp_base_list_resolves_classes_and_interfaces_across_files() {
+        let mut files = vec![
+            csharp(
+                "src/base.cs",
+                "namespace Acme { public class Base {} public interface IBillable {} }",
+            ),
+            csharp(
+                "src/invoice.cs",
+                "namespace Acme { public class Invoice : Base, IBillable {} }",
+            ),
+        ];
+
+        let report = resolve(&mut files, &TsconfigAliases::new());
+        assert_eq!(report.unresolved, 0);
+        let edges = &files[1].relationships;
+        assert!(edges
+            .iter()
+            .any(|edge| edge.kind == RelationshipKind::Inherits
+                && edge.target
+                    == EdgeTarget::Global {
+                        file: "src/base.cs".to_string(),
+                        qualified_name: "src/base.cs::Acme.Base".to_string()
+                    }
+                && edge.confidence == Confidence::High));
+        assert!(edges
+            .iter()
+            .any(|edge| edge.kind == RelationshipKind::Implements
+                && edge.target
+                    == EdgeTarget::Global {
+                        file: "src/base.cs".to_string(),
+                        qualified_name: "src/base.cs::Acme.IBillable".to_string()
+                    }
+                && edge.confidence == Confidence::High));
+    }
+
+    #[test]
+    fn csharp_unresolved_base_list_is_preserved_without_a_guess() {
+        let mut files = vec![csharp(
+            "src/invoice.cs",
+            "namespace Acme { public class Invoice : MissingBase {} }",
+        )];
+
+        let report = resolve(&mut files, &TsconfigAliases::new());
+        assert_eq!(report.unresolved, 1);
+        assert!(files[0]
+            .relationships
+            .iter()
+            .all(|edge| edge.kind != RelationshipKind::UsesType));
+        assert!(files[0].unresolved.iter().any(|reference| {
+            reference.relationship_kind == RelationshipKind::UsesType
+                && reference.target_text == "MissingBase"
+                && reference.reason
+                    == "base list entry not found in project; class vs interface undeterminable"
+        }));
+    }
+
+    #[test]
+    fn language_filter_prevents_cross_language_resolution() {
+        let mut files = vec![
+            analyzed("src/caller.ts", "function run() { return new Invoice(); }"),
+            csharp("src/invoice.cs", "public class Invoice {}"),
+            csharp(
+                "src/caller.cs",
+                "public class Caller { void Run() { new TsOnly(); } }",
+            ),
+            analyzed("src/ts-only.ts", "export class TsOnly {}"),
+        ];
+
+        let report = resolve(&mut files, &TsconfigAliases::new());
+        assert_eq!(report.unresolved, 2);
+        assert!(files[0]
+            .relationships
+            .iter()
+            .all(|edge| edge.kind != RelationshipKind::Constructs));
+        assert!(files[2]
+            .relationships
+            .iter()
+            .all(|edge| edge.kind != RelationshipKind::Constructs));
+    }
+
+    #[test]
+    fn csharp_visibility_does_not_change_unambiguous_call_confidence() {
+        let mut files = vec![
+            csharp("src/targets.cs", "public class Targets { public void PublicTarget() {} internal void InternalTarget() {} protected internal void ProtectedInternalTarget() {} private protected void PrivateProtectedTarget() {} }"),
+            csharp("src/caller.cs", "public class Caller { void Run() { PublicTarget(); InternalTarget(); ProtectedInternalTarget(); PrivateProtectedTarget(); } }"),
+        ];
+
+        resolve(&mut files, &TsconfigAliases::new());
+        let calls: Vec<_> = files[1]
+            .relationships
+            .iter()
+            .filter(|edge| edge.kind == RelationshipKind::Calls)
+            .collect();
+        assert_eq!(calls.len(), 4);
+        assert!(calls.iter().all(|edge| edge.confidence == Confidence::High));
+    }
+
+    #[test]
+    fn csharp_partial_type_reference_keeps_each_fragment_as_a_low_confidence_candidate() {
+        let mut files = vec![
+            csharp("src/first.cs", "public partial class Invoice {}"),
+            csharp("src/second.cs", "public partial class Invoice {}"),
+            csharp(
+                "src/caller.cs",
+                "public class Caller { void Run() { new Invoice(); } }",
+            ),
+        ];
+
+        let report = resolve(&mut files, &TsconfigAliases::new());
+        assert_eq!(report.unresolved, 0);
+        let constructs: Vec<_> = files[2]
+            .relationships
+            .iter()
+            .filter(|edge| edge.kind == RelationshipKind::Constructs)
+            .collect();
+        assert_eq!(constructs.len(), 2);
+        assert!(constructs
+            .iter()
+            .all(|edge| edge.confidence == Confidence::Low));
+    }
+
+    #[test]
+    fn typescript_cross_file_calls_still_resolve_in_any_parse_order() {
+        let mut files = vec![
+            analyzed("src/worker.ts", "export function doWork() { return 1; }"),
+            analyzed("src/caller.ts", "function run() { return doWork(); }"),
+        ];
+
+        resolve(&mut files, &TsconfigAliases::new());
+        assert!(files[1]
+            .relationships
+            .iter()
+            .any(|edge| edge.kind == RelationshipKind::Calls
+                && edge.target
+                    == EdgeTarget::Global {
+                        file: "src/worker.ts".to_string(),
+                        qualified_name: "src/worker.ts::doWork".to_string()
+                    }));
+    }
+
+    #[test]
+    fn csharp_multifile_runtime_resolution_preserves_unresolved_rows() {
+        let mut files = vec![
+            csharp("src/Billing.cs", "namespace Acme.Billing { public class BillingDocument {} public interface IBillable {} }"),
+            csharp("src/Worker.cs", "namespace Acme.App { public class Worker { public void Execute() {} } }"),
+            csharp("src/Invoice.cs", "using Acme.Billing; namespace Acme.App { public class Invoice : BillingDocument, IBillable { void Run() { new Worker(); Execute(); new Missing(); } } }"),
+        ];
+
+        let report = resolve(&mut files, &TsconfigAliases::new());
+        assert_eq!(report.unresolved, 1);
+        let edges = &files[2].relationships;
+        assert!(edges
+            .iter()
+            .any(|edge| edge.kind == RelationshipKind::Imports
+                && matches!(edge.target, EdgeTarget::Global { .. })));
+        assert!(edges
+            .iter()
+            .any(|edge| edge.kind == RelationshipKind::Inherits
+                && matches!(edge.target, EdgeTarget::Global { .. })));
+        assert!(edges
+            .iter()
+            .any(|edge| edge.kind == RelationshipKind::Implements
+                && matches!(edge.target, EdgeTarget::Global { .. })));
+        assert!(edges
+            .iter()
+            .any(|edge| edge.kind == RelationshipKind::Constructs
+                && matches!(edge.target, EdgeTarget::Global { .. })));
+        assert!(edges.iter().any(|edge| edge.kind == RelationshipKind::Calls
+            && matches!(edge.target, EdgeTarget::Global { .. })));
+        assert!(files[2]
+            .unresolved
+            .iter()
+            .any(|reference| reference.target_text == "Missing"));
+    }
+
+    /// `using static` only affects the `Imports` edge (task 4.1/design
+    /// "Resolution Changes") — it does not make an unqualified call to a
+    /// statically-imported member resolvable. `WriteLine` has no project
+    /// symbol, so the `Calls` edge must land in `unresolved` with the
+    /// generic by-name reason, never silently dropped or guessed.
+    #[test]
+    fn using_static_call_site_stays_unresolved() {
+        let mut files = vec![csharp(
+            "src/program.cs",
+            "using static System.Console; public class Program { void Run() { WriteLine(\"hi\"); } }",
+        )];
+
+        let report = resolve(&mut files, &TsconfigAliases::new());
+        assert!(files[0]
+            .relationships
+            .iter()
+            .all(|edge| edge.kind != RelationshipKind::Calls));
+        assert!(files[0].unresolved.iter().any(|reference| {
+            reference.relationship_kind == RelationshipKind::Calls
+                && reference.target_text == "WriteLine"
+                && reference.reason == "no matching symbol in project"
+        }));
+        assert!(report.unresolved >= 1);
+    }
+
+    /// `using Alias = X.Y;` introduces no project symbol named `Alias`
+    /// (design "Resolution Changes" — aliases are never expanded at
+    /// resolve time). Constructing `new Alias()` must therefore land in
+    /// `unresolved` with an explicit reason, never guessed or dropped.
+    #[test]
+    fn alias_qualified_reference_stays_unresolved_with_reason() {
+        let mut files = vec![csharp(
+            "src/program.cs",
+            "using Alias = System.Collections.Generic.List<int>; public class Program { void Run() { new Alias(); } }",
+        )];
+
+        let report = resolve(&mut files, &TsconfigAliases::new());
+        assert!(files[0]
+            .relationships
+            .iter()
+            .all(|edge| edge.kind != RelationshipKind::Constructs));
+        assert!(files[0].unresolved.iter().any(|reference| {
+            reference.relationship_kind == RelationshipKind::Constructs
+                && reference.target_text == "Alias"
+                && reference.reason == "no matching symbol in project"
+        }));
+        assert!(report.unresolved >= 1);
     }
 }

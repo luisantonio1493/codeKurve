@@ -19,18 +19,31 @@ execution or modification. Full non-goal list: §7.
 
 ## Status
 
-**Experimental, pre-0.1, Phase 0 (governance and scaffold).** No indexing,
-querying, or MCP behavior exists yet — see `docs/ROADMAP.md`.
+**Experimental, pre-0.1.** Phases 0–4 (scaffold, vertical slice, TypeScript
+graph, incremental watcher, MCP server) are complete and merged — indexing,
+querying, and MCP behavior work today for TypeScript/JavaScript. Phase 5
+(C# support) has all tasks implemented but failed independent verification
+(missing visibility in CLI output, gaps in `using static`/alias-reference
+test coverage) and is not yet merged — see `docs/ROADMAP.md` and
+`openspec/changes/phase-5-csharp/verify-report.md`.
 
-## Quickstart (target shape, not yet implemented)
+## Quickstart
 
-The intended short-term workflow is `codekurve init`, `index`, `search`,
-`callers`, `mcp` (§4.1). Actual command surface and flags land per
-`docs/ROADMAP.md`; CLI conventions are defined in the plan §27.1.
+```bash
+codekurve init
+codekurve index
+codekurve search <query>
+codekurve callers <symbol>
+codekurve mcp
+```
 
-## Supported languages (v0.1 target)
+Full command surface and flags: `docs/ROADMAP.md`; CLI conventions: the plan
+§27.1.
 
-TypeScript/JavaScript first, C# second (§1, §6).
+## Supported languages
+
+CodeKurve indexes TypeScript, JavaScript, and C#. See the concise coverage
+matrix and C# limitations in [docs/LANGUAGES.md](docs/LANGUAGES.md).
 
 ## MCP server
 

@@ -73,6 +73,7 @@ fn snapshot(db_path: &Path, project_id: &str) -> Snapshot {
                  || '|' || start_byte || '|' || end_byte || '|' || start_line \
                  || '|' || start_column || '|' || end_line || '|' || end_column \
                  || '|' || provenance || '|' || confidence || '|' || is_exported \
+                 || '|' || visibility || '|' || is_partial || '|' || is_record \
                  FROM symbols WHERE project_id = '{project_id}'"
             ),
         ),

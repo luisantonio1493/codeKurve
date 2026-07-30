@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub enum LanguageId {
     TypeScript,
     JavaScript,
+    CSharp,
 }
 
 impl LanguageId {
@@ -17,6 +18,7 @@ impl LanguageId {
         match ext {
             "ts" | "tsx" | "mts" | "cts" => Some(Self::TypeScript),
             "js" | "jsx" | "mjs" | "cjs" => Some(Self::JavaScript),
+            "cs" => Some(Self::CSharp),
             _ => None,
         }
     }
@@ -26,6 +28,7 @@ impl LanguageId {
         match name {
             "typescript" => Some(Self::TypeScript),
             "javascript" => Some(Self::JavaScript),
+            "csharp" => Some(Self::CSharp),
             _ => None,
         }
     }
@@ -35,6 +38,7 @@ impl LanguageId {
         match self {
             Self::TypeScript => "typescript",
             Self::JavaScript => "javascript",
+            Self::CSharp => "csharp",
         }
     }
 }

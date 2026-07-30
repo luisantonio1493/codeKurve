@@ -5,7 +5,10 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use codekurve_core::{Confidence, Provenance, RelationshipKind, SourceSpan, Symbol, SymbolKind};
+use codekurve_core::{
+    Confidence, LanguageId, Provenance, RelationshipKind, SourceSpan, Symbol, SymbolKind,
+    Visibility,
+};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 
 use crate::error::Result;
@@ -75,6 +78,11 @@ pub struct StoredSymbol {
     pub language: String,
     pub relative_path: String,
     pub span: SourceSpan,
+    /// Phase 5 PR1 (design "repo.rs"): `'default'`/`false`/`false` for every
+    /// pre-Phase-5 row and every non-C# symbol.
+    pub visibility: String,
+    pub is_partial: bool,
+    pub is_record: bool,
 }
 
 /// Deterministic file storage id. Exposed so a caller (the `codekurve`
@@ -88,16 +96,27 @@ pub fn file_id(project_id: &str, relative_path: &str) -> String {
 /// §16.3 + Phase 3: BLAKE3 over the 5-tuple, still excluding `start_byte`.
 /// `\x1f` (unit separator) delimits components so a path containing `/`
 /// cannot shift a boundary and forge another symbol's key.
+///
+/// Phase 5 PR1 (design "symbol_key and signature_fingerprint"): `partial_ordinal`
+/// is a 6th, optional component that disambiguates multiple C# `partial`
+/// fragments of the same type in one file. `None` MUST leave the hashed
+/// input byte-for-byte identical to the pre-Phase-5 five-component
+/// `format!` — pinned by `symbol_key_none_matches_pre_migration_golden_hash`.
 pub fn symbol_key(
     language: &str,
     relative_path: &str,
     kind: &str,
     qualified_name: &str,
     signature_fingerprint: &str,
+    partial_ordinal: Option<u32>,
 ) -> String {
-    let input = format!(
+    let mut input = format!(
         "{language}\u{1f}{relative_path}\u{1f}{kind}\u{1f}{qualified_name}\u{1f}{signature_fingerprint}"
     );
+    if let Some(ordinal) = partial_ordinal {
+        input.push('\u{1f}');
+        input.push_str(&ordinal.to_string());
+    }
     blake3::hash(input.as_bytes()).to_hex().to_string()
 }
 
@@ -232,16 +251,17 @@ fn insert_file_and_symbols(
             symbol.kind.as_str(),
             &symbol.qualified_name,
             &symbol.signature_fingerprint,
+            symbol.partial_ordinal,
         );
         let symbol_id = symbol_id(&file_id, &symbol_key);
         let qualified = &symbol.qualified_name;
         tx.execute(
             "INSERT INTO symbols(id, project_id, file_id, symbol_key, name, qualified_name,
                  kind, language, start_byte, end_byte, start_line, start_column,
-                 end_line, end_column, provenance, confidence, generation,
-                 created_at, updated_at)
+                 end_line, end_column, provenance, confidence, visibility, is_partial,
+                 is_record, generation, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                 'tree-sitter', 'high', 1, ?15, ?15)",
+                 'tree-sitter', 'high', ?15, ?16, ?17, 1, ?18, ?18)",
             params![
                 symbol_id,
                 project_id,
@@ -257,6 +277,9 @@ fn insert_file_and_symbols(
                 symbol.span.start_column as i64,
                 symbol.span.end_line as i64,
                 symbol.span.end_column as i64,
+                symbol.visibility.as_str(),
+                symbol.is_partial,
+                symbol.is_record,
                 ts,
             ],
         )?;
@@ -905,7 +928,8 @@ pub fn search(
     let fts_query = format!("\"{}\"", query.replace('"', "\"\""));
     let mut stmt = conn.prepare(
         "SELECT s.id, s.name, s.qualified_name, s.kind, s.language, f.relative_path,
-                s.start_byte, s.end_byte, s.start_line, s.start_column, s.end_line, s.end_column
+                s.start_byte, s.end_byte, s.start_line, s.start_column, s.end_line, s.end_column,
+                s.visibility, s.is_partial, s.is_record
          FROM symbols s
          JOIN files f ON f.id = s.file_id
          WHERE s.project_id = ?2
@@ -933,7 +957,8 @@ pub fn find_project(conn: &Connection, root_path: &str) -> Result<Option<String>
 pub fn find_by_name(conn: &Connection, project_id: &str, name: &str) -> Result<Vec<StoredSymbol>> {
     let mut stmt = conn.prepare(
         "SELECT s.id, s.name, s.qualified_name, s.kind, s.language, f.relative_path,
-                s.start_byte, s.end_byte, s.start_line, s.start_column, s.end_line, s.end_column
+                s.start_byte, s.end_byte, s.start_line, s.start_column, s.end_line, s.end_column,
+                s.visibility, s.is_partial, s.is_record
          FROM symbols s
          JOIN files f ON f.id = s.file_id
          WHERE s.project_id = ?1 AND s.name = ?2
@@ -949,7 +974,8 @@ pub fn find_by_name(conn: &Connection, project_id: &str, name: &str) -> Result<V
 pub fn find_symbol_by_id(conn: &Connection, id: &str) -> Result<Option<StoredSymbol>> {
     let mut stmt = conn.prepare(
         "SELECT s.id, s.name, s.qualified_name, s.kind, s.language, f.relative_path,
-                s.start_byte, s.end_byte, s.start_line, s.start_column, s.end_line, s.end_column
+                s.start_byte, s.end_byte, s.start_line, s.start_column, s.end_line, s.end_column,
+                s.visibility, s.is_partial, s.is_record
          FROM symbols s
          JOIN files f ON f.id = s.file_id
          WHERE s.id = ?1",
@@ -984,6 +1010,7 @@ pub struct BaselineSymbolRow {
     pub relative_path: String,
     pub qualified_name: String,
     pub kind: SymbolKind,
+    pub language: LanguageId,
     /// Mirrors `SymbolTable::build`'s own `exports` fallback (resolve.rs):
     /// true when a persisted `kind = 'exports'` relationship targets this
     /// symbol, i.e. it was resolvable as an import binding at index time.
@@ -1014,7 +1041,7 @@ pub fn resolution_snapshot(conn: &Connection, project_id: &str) -> Result<Resolu
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let mut sym_stmt = conn.prepare(
-        "SELECT s.name, f.relative_path, s.qualified_name, s.kind,
+        "SELECT s.name, f.relative_path, s.qualified_name, s.kind, s.language,
                 EXISTS(SELECT 1 FROM relationships r
                        WHERE r.target_symbol_id = s.id AND r.kind = 'exports') AS exported
          FROM symbols s
@@ -1024,12 +1051,14 @@ pub fn resolution_snapshot(conn: &Connection, project_id: &str) -> Result<Resolu
     let symbols = sym_stmt
         .query_map(params![project_id], |row| {
             let kind: String = row.get(3)?;
+            let language: String = row.get(4)?;
             Ok(BaselineSymbolRow {
                 name: row.get(0)?,
                 relative_path: row.get(1)?,
                 qualified_name: row.get(2)?,
                 kind: parse_symbol_kind(&kind),
-                exported: row.get::<_, i64>(4)? != 0,
+                language: parse_language(&language),
+                exported: row.get::<_, i64>(5)? != 0,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1138,7 +1167,28 @@ fn map_stored(row: &Row) -> rusqlite::Result<StoredSymbol> {
             end_line: row.get::<_, i64>(10)? as usize,
             end_column: row.get::<_, i64>(11)? as usize,
         },
+        visibility: row.get(12)?,
+        is_partial: row.get(13)?,
+        is_record: row.get(14)?,
     })
+}
+
+/// Reverse of `Visibility::as_str` (codekurve-core), for reading
+/// `symbols.visibility` text back into the enum. Every stored value was
+/// written by `as_str` itself, so the fallback is unreachable in practice —
+/// kept total rather than panicking on a read path, mirroring
+/// `parse_symbol_kind`.
+#[allow(dead_code)] // wired into a read path once C# resolution needs it (PR3+)
+fn parse_visibility(s: &str) -> Visibility {
+    match s {
+        "public" => Visibility::Public,
+        "protected" => Visibility::Protected,
+        "internal" => Visibility::Internal,
+        "private" => Visibility::Private,
+        "protectedinternal" => Visibility::ProtectedInternal,
+        "privateprotected" => Visibility::PrivateProtected,
+        _ => Visibility::Default,
+    }
 }
 
 /// Reverse of `SymbolKind::as_str` (codekurve-core), for reading `symbols.kind`
@@ -1163,6 +1213,16 @@ fn parse_symbol_kind(s: &str) -> SymbolKind {
         "import" => SymbolKind::Import,
         "export" => SymbolKind::Export,
         _ => SymbolKind::Module,
+    }
+}
+
+/// Reverse of `LanguageId::as_str`, kept total for persisted rows from older
+/// database versions or malformed external databases.
+fn parse_language(s: &str) -> LanguageId {
+    match s {
+        "javascript" => LanguageId::JavaScript,
+        "csharp" => LanguageId::CSharp,
+        _ => LanguageId::TypeScript,
     }
 }
 
@@ -1227,6 +1287,10 @@ mod tests {
             },
             parent: None,
             signature_fingerprint: String::new(),
+            visibility: Visibility::Default,
+            is_partial: false,
+            is_record: false,
+            partial_ordinal: None,
         }
     }
 
@@ -1397,6 +1461,46 @@ mod tests {
             )
             .unwrap();
         assert_ne!(before, after, "signature edit must re-key");
+    }
+
+    /// Phase 5 PR1 task 1.8 / symbol-index "Stable Symbol Key ... Disambiguates
+    /// Partial Fragments", scenario "Non-partial key is byte-identical to the
+    /// pre-Phase-5 hash": `partial_ordinal: None` must hash exactly the
+    /// pre-Phase-5 five-component tuple. This hash was captured before the
+    /// sixth parameter was added and must never change.
+    #[test]
+    fn symbol_key_none_matches_pre_migration_golden_hash() {
+        let key = symbol_key(
+            "typescript",
+            "src/member.ts",
+            "class",
+            "src/member.ts::MemberService",
+            "",
+            None,
+        );
+        assert_eq!(
+            key,
+            "8be6b5b411dfdc32b2948f30e91dab5251ad60480b1cd3cddf250f5c1d4470af"
+        );
+    }
+
+    /// Phase 5 PR1 task 1.9: `partial_ordinal` must actually participate in
+    /// the hash, and `None` must differ from every `Some(_)` variant.
+    #[test]
+    fn symbol_key_partial_ordinal_disambiguates() {
+        let base = (
+            "csharp",
+            "src/Widget.cs",
+            "class",
+            "src/Widget.cs::Widget",
+            "",
+        );
+        let none = symbol_key(base.0, base.1, base.2, base.3, base.4, None);
+        let some_0 = symbol_key(base.0, base.1, base.2, base.3, base.4, Some(0));
+        let some_1 = symbol_key(base.0, base.1, base.2, base.3, base.4, Some(1));
+        assert_ne!(none, some_0);
+        assert_ne!(none, some_1);
+        assert_ne!(some_0, some_1);
     }
 
     /// PR3 task 3.3: `persist_relationships` (wired in PR2 with empty vecs)

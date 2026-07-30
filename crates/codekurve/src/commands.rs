@@ -214,14 +214,24 @@ fn module_symbol(relative_path: &str, language: LanguageId) -> Symbol {
         parent: None,
         // A module stand-in has no call signature.
         signature_fingerprint: String::new(),
+        visibility: codekurve_core::Visibility::Default,
+        is_partial: false,
+        is_record: false,
+        partial_ordinal: None,
     }
 }
 
-/// Builds `repo::FileInput`s and a `(relative_path, qualified_name) ->
-/// symbol_id` lookup table, using the same deterministic id functions
+/// Builds `repo::FileInput`s and a `(relative_path, lookup_key) ->
+/// symbol_id` table, using the same deterministic id functions
 /// `repo::reindex` uses internally — so ids computed here match exactly
 /// what ends up in the `symbols` table. `pub(crate)`: shared with
 /// `crate::incremental`'s per-batch and full-reindex-fallback paths.
+///
+/// Lookup keys are each symbol's `local_key` (so C# `partial` fragments and
+/// fingerprint-disambiguated overloads attribute `Contains`/`Inherits`
+/// sources correctly) and, when distinct, `qualified_name` (so
+/// `EdgeTarget::Global` resolution still hits). First writer wins on a
+/// shared `qualified_name`.
 pub(crate) fn build_file_inputs(
     project_id: &str,
     analyses: &[FileAnalysis],
@@ -243,20 +253,44 @@ pub(crate) fn build_file_inputs(
                 span: s.span,
                 parent: s.parent.clone(),
                 signature_fingerprint: s.signature_fingerprint.clone(),
+                visibility: s.visibility,
+                is_partial: s.is_partial,
+                is_record: s.is_record,
+                partial_ordinal: s.partial_ordinal,
             })
             .collect();
         symbols.push(module_symbol(&analysis.file, meta.language));
 
-        for symbol in &symbols {
+        for extracted in &analysis.symbols {
             let key = repo::symbol_key(
                 meta.language.as_str(),
                 &analysis.file,
-                symbol.kind.as_str(),
-                &symbol.qualified_name,
-                &symbol.signature_fingerprint,
+                extracted.kind.as_str(),
+                &extracted.qualified_name,
+                &extracted.signature_fingerprint,
+                extracted.partial_ordinal,
+            );
+            let id = repo::symbol_id(&file_id, &key);
+            symbol_ids.insert((analysis.file.clone(), extracted.local_key.clone()), id.clone());
+            symbol_ids
+                .entry((analysis.file.clone(), extracted.qualified_name.clone()))
+                .or_insert(id);
+        }
+        // Module stand-in: edges key the file by its relative path.
+        {
+            let module = symbols
+                .last()
+                .expect("module stand-in pushed immediately above");
+            let key = repo::symbol_key(
+                meta.language.as_str(),
+                &analysis.file,
+                module.kind.as_str(),
+                &module.qualified_name,
+                &module.signature_fingerprint,
+                module.partial_ordinal,
             );
             symbol_ids.insert(
-                (analysis.file.clone(), symbol.qualified_name.clone()),
+                (analysis.file.clone(), analysis.file.clone()),
                 repo::symbol_id(&file_id, &key),
             );
         }
@@ -385,6 +419,7 @@ pub(crate) fn project_baseline(snapshot: repo::ResolutionSnapshot) -> resolve::P
             file: row.relative_path,
             qualified_name: row.qualified_name,
             kind: row.kind,
+            language: row.language,
             exported: row.exported,
         })
         .collect();
@@ -480,11 +515,25 @@ pub fn search(root: &Path, query: &str) -> Result<(), String> {
     }
     for hit in hits {
         println!(
-            "{}  {}  {}:{}",
-            hit.name, hit.kind, hit.relative_path, hit.span.start_line
+            "{}  {}  {}  {}:{}{}",
+            hit.name,
+            hit.kind,
+            hit.visibility,
+            hit.relative_path,
+            hit.span.start_line,
+            modifiers_suffix(hit.is_partial, hit.is_record)
         );
     }
     Ok(())
+}
+
+fn modifiers_suffix(is_partial: bool, is_record: bool) -> &'static str {
+    match (is_partial, is_record) {
+        (true, true) => "  [partial, record]",
+        (true, false) => "  [partial]",
+        (false, true) => "  [record]",
+        (false, false) => "",
+    }
 }
 
 /// `codekurve symbol <name> --root <path>`
@@ -500,7 +549,14 @@ pub fn symbol(root: &Path, name: &str) -> Result<(), String> {
         return Err(format!("no symbol named {name:?}"));
     }
     for hit in &hits {
-        println!("{} ({}) [{}]", hit.name, hit.kind, hit.language);
+        println!(
+            "{} ({}) [{}] visibility={}{}",
+            hit.name,
+            hit.kind,
+            hit.language,
+            hit.visibility,
+            modifiers_suffix(hit.is_partial, hit.is_record)
+        );
         println!(
             "  {}:{}:{}-{}:{}",
             hit.relative_path,
@@ -1031,4 +1087,102 @@ fn project_id(conn: &Connection, root: &Path) -> Result<String, String> {
     repo::find_project(conn, &root.to_string_lossy())
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "project not indexed yet. run `codekurve index` first.".to_string())
+}
+
+#[cfg(test)]
+mod symbol_ids_tests {
+    use super::*;
+    use codekurve_analysis::extract;
+    use codekurve_core::RelationshipKind;
+
+    fn meta() -> FileMeta {
+        FileMeta {
+            language: LanguageId::CSharp,
+            size_bytes: 1,
+            content_hash: "hash".to_string(),
+            modified_ns: 0,
+        }
+    }
+
+    #[test]
+    fn partial_csharp_edges_survive_symbol_ids_lookup() {
+        let source = "namespace Acme;\npublic partial class Widget : Base {\n  public void Alpha() {}\n}\npublic class Base {}\n";
+        let mut analysis =
+            extract::analyze(source, LanguageId::CSharp, "src/widget.cs").expect("analyze");
+        resolve::resolve(std::slice::from_mut(&mut analysis), &TsconfigAliases::new());
+
+        let (_files, symbol_ids) =
+            build_file_inputs("proj", &[analysis.clone()], &[meta()]);
+        let rels = build_relationships("proj", &[analysis], &symbol_ids);
+
+        let contains_alpha = rels.iter().any(|r| {
+            r.kind == RelationshipKind::Contains
+                && r.target_symbol_id.as_ref().is_some_and(|tid| {
+                    symbol_ids
+                        .iter()
+                        .any(|(k, id)| k.1.contains("Alpha") && id == tid)
+                })
+        });
+        assert!(
+            contains_alpha,
+            "partial Widget must keep Contains→Alpha through composition-root ids"
+        );
+
+        let inherits = rels
+            .iter()
+            .any(|r| r.kind == RelationshipKind::Inherits && r.target_symbol_id.is_some());
+        assert!(
+            inherits,
+            "partial Widget must keep Inherits→Base through composition-root ids"
+        );
+        assert!(
+            !rels.iter().any(|r| r.target_symbol_id.is_none()
+                && r.target_external.is_none()
+                && matches!(
+                    r.kind,
+                    RelationshipKind::Contains | RelationshipKind::Inherits
+                )),
+            "no dangling Contains/Inherits rows"
+        );
+    }
+
+    #[test]
+    fn overload_contains_targets_distinct_symbol_ids() {
+        let source =
+            "namespace Acme;\npublic class Widget {\n  public Widget() {}\n  public Widget(int x) {}\n}\n";
+        let mut analysis =
+            extract::analyze(source, LanguageId::CSharp, "src/widget.cs").expect("analyze");
+        resolve::resolve(std::slice::from_mut(&mut analysis), &TsconfigAliases::new());
+
+        let (_files, symbol_ids) =
+            build_file_inputs("proj", &[analysis.clone()], &[meta()]);
+        let rels = build_relationships("proj", &[analysis.clone()], &symbol_ids);
+
+        let ctor_targets: Vec<_> = analysis
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Constructor)
+            .map(|s| symbol_ids.get(&(analysis.file.clone(), s.local_key.clone())))
+            .collect();
+        assert_eq!(ctor_targets.len(), 2);
+        assert!(ctor_targets.iter().all(|t| t.is_some()));
+        assert_ne!(ctor_targets[0], ctor_targets[1]);
+
+        let contains_to_ctors: Vec<_> = rels
+            .iter()
+            .filter(|r| {
+                r.kind == RelationshipKind::Contains
+                    && ctor_targets.iter().any(|t| *t == r.target_symbol_id.as_ref())
+            })
+            .collect();
+        assert_eq!(
+            contains_to_ctors.len(),
+            2,
+            "each overload must keep its own Contains edge"
+        );
+        assert_ne!(
+            contains_to_ctors[0].target_symbol_id,
+            contains_to_ctors[1].target_symbol_id
+        );
+    }
 }

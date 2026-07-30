@@ -77,6 +77,6 @@ fn doctor_reports_fts5() {
         .success()
         .stdout(
             predicate::str::contains("[ok] fts5")
-                .and(predicate::str::contains("[ok] schema: version 3")),
+                .and(predicate::str::contains("[ok] schema: version 4")),
         );
 }

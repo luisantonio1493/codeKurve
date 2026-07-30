@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::error::{Error, Result};
 
 /// Schema version applied by this build.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 const MIGRATION_0001: &str = r#"
 CREATE TABLE projects (
@@ -147,6 +147,18 @@ DELETE FROM files;
 DELETE FROM projects;
 "#;
 
+/// Migration 0004 (Phase 5 PR1, design "Migration 0004"): additive
+/// `visibility`/`is_partial`/`is_record` columns for the language-neutral
+/// `Visibility` enum and the C# `partial`/`record` modifiers. Unlike 0003,
+/// this is **not** a wipe: none of the three columns participates in
+/// `symbol_key`, so no existing symbol id changes and a reindex is not
+/// forced.
+const MIGRATION_0004: &str = r#"
+ALTER TABLE symbols ADD COLUMN visibility TEXT NOT NULL DEFAULT 'default';
+ALTER TABLE symbols ADD COLUMN is_partial INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE symbols ADD COLUMN is_record INTEGER NOT NULL DEFAULT 0;
+"#;
+
 /// Apply all pending migrations. Idempotent: already-applied versions are
 /// skipped.
 pub fn apply(conn: &Connection) -> Result<()> {
@@ -196,6 +208,17 @@ pub fn apply(conn: &Connection) -> Result<()> {
         tx.commit()?;
     }
 
+    if current < 4 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_0004)
+            .map_err(|e| Error::Migration(format!("0004: {e}")))?;
+        tx.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (4, datetime('now'))",
+            [],
+        )?;
+        tx.commit()?;
+    }
+
     Ok(())
 }
 
@@ -216,13 +239,13 @@ mod tests {
     use crate::db;
 
     /// Spec scenario "Fresh database migration": a fresh DB ends at
-    /// `SCHEMA_VERSION` (3), the pre-existing relationship-graph tables
+    /// `SCHEMA_VERSION` (4), the pre-existing relationship-graph tables
     /// still exist, and Phase 3's `index_state` table (plus the
     /// `files.content_hash`/`modified_ns` columns) is present.
     #[test]
-    fn fresh_database_reaches_schema_version_3() {
+    fn fresh_database_reaches_schema_version_4() {
         let conn = db::open_in_memory().unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 3);
+        assert_eq!(current_version(&conn).unwrap(), 4);
 
         let table_exists = |name: &str| -> bool {
             conn.query_row(
@@ -259,6 +282,9 @@ mod tests {
         };
         assert!(column_exists("files", "content_hash"));
         assert!(column_exists("files", "modified_ns"));
+        assert!(column_exists("symbols", "visibility"));
+        assert!(column_exists("symbols", "is_partial"));
+        assert!(column_exists("symbols", "is_record"));
     }
 
     /// Migrations must apply cleanly and idempotently on top of an
@@ -269,6 +295,77 @@ mod tests {
         // Re-running apply() on an already-migrated connection must be a
         // no-op, not an error (idempotency).
         apply(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 4);
+    }
+
+    /// Phase 5 PR1 task 1.10 / symbol-index "Schema Migration 0004 ... Without
+    /// Wiping Data", scenario "Migration applies to a populated index without
+    /// wiping it": simulate a project indexed under `SCHEMA_VERSION = 3` (no
+    /// `visibility`/`is_partial`/`is_record` columns), then apply migration
+    /// 0004 and assert every row and every `symbol_key`/`id` survives, with
+    /// the three new columns present at their documented defaults.
+    #[test]
+    fn migration_0004_applies_without_wiping_populated_v3_data() {
+        let conn = db::open_in_memory().unwrap();
+        // Roll the schema_migrations ledger back to "as if only 0001-0003
+        // had run" by dropping the three PR1 columns and downgrading the
+        // recorded version — apply() then re-applies 0004 on real data.
+        conn.execute_batch(
+            "ALTER TABLE symbols DROP COLUMN visibility;
+             ALTER TABLE symbols DROP COLUMN is_partial;
+             ALTER TABLE symbols DROP COLUMN is_record;
+             DELETE FROM schema_migrations WHERE version = 4;",
+        )
+        .unwrap();
         assert_eq!(current_version(&conn).unwrap(), 3);
+
+        conn.execute(
+            "INSERT INTO projects(id, name, root_path, config_hash, created_at, updated_at)
+             VALUES ('prj-1', 'demo', '/tmp/demo', 'hash', '0', '0')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files(id, project_id, relative_path, language, size_bytes,
+                 parse_status, generation, created_at, updated_at)
+             VALUES ('fil-1', 'prj-1', 'src/a.ts', 'typescript', 10, 'ok', 1, '0', '0')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols(id, project_id, file_id, symbol_key, name, qualified_name,
+                 kind, language, start_byte, end_byte, start_line, start_column, end_line,
+                 end_column, provenance, confidence, generation, created_at, updated_at)
+             VALUES ('sym-1', 'prj-1', 'fil-1', 'preexisting-key', 'Foo', 'src/a.ts::Foo',
+                 'class', 'typescript', 0, 10, 1, 0, 1, 10, 'tree-sitter', 'high', 1, '0', '0')",
+            [],
+        )
+        .unwrap();
+
+        let symbol_count_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+            .unwrap();
+
+        apply(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 4);
+
+        let symbol_count_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(symbol_count_before, symbol_count_after);
+
+        let (id, key, visibility, is_partial, is_record): (String, String, String, i64, i64) = conn
+            .query_row(
+                "SELECT id, symbol_key, visibility, is_partial, is_record
+                 FROM symbols WHERE id = 'sym-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(id, "sym-1");
+        assert_eq!(key, "preexisting-key", "pre-migration symbol_key unchanged");
+        assert_eq!(visibility, "default");
+        assert_eq!(is_partial, 0);
+        assert_eq!(is_record, 0);
     }
 }

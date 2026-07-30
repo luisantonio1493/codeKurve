@@ -386,6 +386,10 @@ mod tests {
             },
             parent: None,
             signature_fingerprint: String::new(),
+            visibility: codekurve_core::Visibility::Default,
+            is_partial: false,
+            is_record: false,
+            partial_ordinal: None,
         }
     }
 

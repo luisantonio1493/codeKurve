@@ -71,6 +71,10 @@ pub enum RelationshipKind {
     UsesType,
     Reads,
     Writes,
+    /// An attribute (C#) or, later, a TS decorator applied to a declaration
+    /// (design "Attributes"). Target text = the attribute's original name;
+    /// span = the attribute's own span, not its enclosing list.
+    Decorates,
 }
 
 impl RelationshipKind {
@@ -89,6 +93,37 @@ impl RelationshipKind {
             Self::UsesType => "usestype",
             Self::Reads => "reads",
             Self::Writes => "writes",
+            Self::Decorates => "decorates",
+        }
+    }
+}
+
+/// Language-neutral symbol visibility (design "Visibility"), independent of
+/// `is_exported` — `is_exported` means only "declared with the TypeScript
+/// `export` keyword" and is unrelated to any language's access modifiers.
+/// `Default` means "no modifier written", never a guessed implicit default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Visibility {
+    Public,
+    Protected,
+    Internal,
+    Private,
+    ProtectedInternal,
+    PrivateProtected,
+    Default,
+}
+
+impl Visibility {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Protected => "protected",
+            Self::Internal => "internal",
+            Self::Private => "private",
+            Self::ProtectedInternal => "protectedinternal",
+            Self::PrivateProtected => "privateprotected",
+            Self::Default => "default",
         }
     }
 }
@@ -164,4 +199,19 @@ pub struct Symbol {
     /// ir.rs) — carried through unchanged to feed `symbol_key`'s 5th
     /// tuple element.
     pub signature_fingerprint: String,
+    /// Language-neutral access modifier (design "Visibility"). `Default` for
+    /// every TypeScript/JavaScript symbol (no such modifier concept there).
+    pub visibility: Visibility,
+    /// C# `partial` declaration (design "Partial identity"). Always `false`
+    /// for non-C# symbols.
+    pub is_partial: bool,
+    /// C# `record`/`record struct` (design "Records": no new `SymbolKind`,
+    /// `record` folds into `Class`/`Struct` + this flag). Always `false` for
+    /// non-C# symbols.
+    pub is_record: bool,
+    /// Disambiguates multiple `partial` fragments of the same type in one
+    /// file for `symbol_key` (design "symbol_key"). `None` for every
+    /// non-partial declaration, keeping the hashed input byte-identical to
+    /// the pre-Phase-5 five-component tuple.
+    pub partial_ordinal: Option<u32>,
 }

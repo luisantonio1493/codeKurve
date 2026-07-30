@@ -125,7 +125,11 @@ impl Default for Project {
 impl Default for Index {
     fn default() -> Self {
         Self {
-            languages: vec!["typescript".to_string(), "javascript".to_string()],
+            languages: vec![
+                "typescript".to_string(),
+                "javascript".to_string(),
+                "csharp".to_string(),
+            ],
             max_file_size_bytes: 2_097_152,
             follow_symlinks: false,
             include_hidden: false,

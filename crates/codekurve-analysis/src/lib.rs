@@ -3,4 +3,5 @@
 pub mod discovery;
 pub mod extract;
 pub mod ir;
+pub mod languages;
 pub mod resolve;

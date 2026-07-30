@@ -3,13 +3,16 @@
 //! §Interfaces, plan §18, §22).
 
 use codekurve_core::{
-    Confidence, LanguageId, Provenance, RelationshipKind, SourceSpan, SymbolKind,
+    Confidence, LanguageId, Provenance, RelationshipKind, SourceSpan, SymbolKind, Visibility,
 };
 
 /// One file's extracted symbols/relationships, pre-resolution.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileAnalysis {
     pub file: String,
+    /// The language this file was parsed as (design "Resolution Changes" —
+    /// feeds `resolve.rs`'s per-language `kind_matches` dispatch).
+    pub language: LanguageId,
     pub symbols: Vec<ExtractedSymbol>,
     pub relationships: Vec<ExtractedRelationship>,
     pub unresolved: Vec<UnresolvedReference>,
@@ -33,6 +36,16 @@ pub struct ExtractedSymbol {
     /// signature (class/interface). Feeds `symbol_key`'s 5th tuple element
     /// (design "symbol_key and signature_fingerprint").
     pub signature_fingerprint: String,
+    /// Language-neutral access modifier (design "Visibility"). Every
+    /// existing TypeScript construction site sets `Visibility::Default`.
+    pub visibility: Visibility,
+    /// C# `partial` declaration. `false` for every TypeScript symbol.
+    pub is_partial: bool,
+    /// C# `record`/`record struct`. `false` for every TypeScript symbol.
+    pub is_record: bool,
+    /// Disambiguates multiple `partial` fragments of the same type in one
+    /// file for `symbol_key`. `None` for every TypeScript symbol.
+    pub partial_ordinal: Option<u32>,
 }
 
 /// A relationship edge extracted from one file, before its target is

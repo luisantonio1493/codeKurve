@@ -53,8 +53,9 @@ pub fn discover(root: &Path, options: &DiscoveryOptions) -> Vec<DiscoveredFile> 
 
     let mut files = Vec::new();
     for entry in builder.build().flatten() {
-        // ponytail: extension filter is enough for TS/JS in Phase 1; explicit
-        // binary sniffing (§15.2) lands when non-text extensions matter.
+        // ponytail: extension filter is enough for TS/JS/C# (`LanguageId::
+        // from_extension` covers `.cs` since Phase 5); explicit binary
+        // sniffing (§15.2) lands when non-text extensions matter.
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }

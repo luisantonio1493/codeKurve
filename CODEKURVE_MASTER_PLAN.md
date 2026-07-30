@@ -3162,6 +3162,22 @@ Preparar piloto interno.
 - reproducible benchmark report;
 - installation package interno.
 
+### Installation flow (target shape, ref. colbymchenry/codegraph)
+
+Tres pasos separados, mismo patrón que otros MCP CLIs consolidados:
+
+1. **Install binary** — script `curl | sh` (macOS/Linux) e `irm | iex`
+   (Windows PowerShell) que descarga el binario release correcto para el OS
+   sin requerir toolchain Rust local. Sin publicar hasta resolver
+   `docs/LICENSING.md` (hoy: "Do not redistribute").
+2. **Wire agent(s)** — nuevo subcomando `codekurve install`: detecta y
+   auto-configura clientes MCP soportados (Claude Code, Cursor, Codex CLI,
+   etc.), escribiendo la entrada en su config (ej. `.mcp.json`) en vez de
+   requerir edición manual como hoy. Solo conecta el MCP server — no indexa
+   nada.
+3. **Init per project** — `codekurve init` (ya existe) construye el índice
+   local en `.codegraph/`/`.codekurve/` del proyecto actual.
+
 ## Exit criteria
 
 - revisión interna;
