@@ -64,6 +64,40 @@ fn search_without_index_fails_clearly() {
         .stderr(predicate::str::contains("run `codekurve index`"));
 }
 
+/// Task 1.x (Phase 6, design "max_total_files enforcement point"):
+/// exceeding `index.max_total_files` hard-fails `codekurve index` before any
+/// index state is written — no partial/silently-truncated index.
+#[test]
+fn index_over_max_total_files_hard_fails_before_writing_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    ck().arg("init").arg(root).assert().success();
+
+    let config_path = root.join(".codekurve").join("config.toml");
+    let config_text = std::fs::read_to_string(&config_path).unwrap();
+    let config_text = config_text.replace("max_total_files = 50000", "max_total_files = 2");
+    std::fs::write(&config_path, config_text).unwrap();
+
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    for name in ["a", "b", "c"] {
+        std::fs::write(root.join("src").join(format!("{name}.ts")), SOURCE).unwrap();
+    }
+
+    ck().arg("index")
+        .arg("--root")
+        .arg(root)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("max_total_files"));
+
+    ck().arg("status")
+        .arg("--root")
+        .arg(root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("files: 0"));
+}
+
 #[test]
 fn doctor_reports_fts5() {
     let tmp = tempfile::tempdir().unwrap();

@@ -1,0 +1,46 @@
+# cargo-deny configuration.
+#
+# CI runs `cargo deny check advisories licenses bans sources` as a required
+# job (see .github/workflows/ci.yml). Every exception below carries a
+# `# reason:` comment naming the advisory/license, why it is not exploitable
+# here, and the condition under which it should be revisited. Blanket
+# ignores are forbidden.
+
+[advisories]
+yanked = "deny"
+ignore = []
+
+# The workspace crates carry no `license` field: no open-source license has
+# been chosen yet (see docs/LICENSING.md — deliberately unresolved, "do not
+# redistribute"). They are marked `publish = false` and excluded from the
+# license check via `private.ignore` rather than given a placeholder
+# license; this section audits third-party dependencies only.
+[licenses]
+private = { ignore = true }
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "CC0-1.0",
+]
+
+[bans]
+# Design decision (D6 in docs/design): the workspace already carries
+# duplicate transitive versions of several crates (e.g. multiple `syn`,
+# `bitflags`, `windows-sys` generations pulled in by different direct
+# deps). Setting this to "deny" would fail on day one; keep it a warning
+# until the dependency tree is deliberately deduplicated as a follow-up.
+multiple-versions = "warn"
+wildcards = "deny"
+# Intra-workspace `{ path = "../..." }` deps have no version requirement by
+# design (cargo enforces they resolve to the local crate); this is not the
+# "unpinned registry dependency" risk `wildcards` exists to catch.
+allow-wildcard-paths = true
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

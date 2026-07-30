@@ -25,6 +25,9 @@ pub struct DiscoveryOptions {
     pub include_hidden: bool,
     pub follow_symlinks: bool,
     pub max_file_size_bytes: u64,
+    /// Hard cap on discovered file count; `0` disables the check (Phase 6,
+    /// design "max_total_files enforcement point").
+    pub max_total_files: usize,
     /// Languages to include. Empty means "all supported".
     pub languages: Vec<LanguageId>,
 }
@@ -37,8 +40,15 @@ impl DiscoveryOptions {
 
 /// Walk `root` and return the eligible source files, sorted by relative path
 /// for deterministic output. Unreadable entries are skipped rather than
-/// aborting the walk.
-pub fn discover(root: &Path, options: &DiscoveryOptions) -> Vec<DiscoveredFile> {
+/// aborting the walk. Hard-fails with `Error::TooManyFiles` the moment the
+/// discovered count exceeds `options.max_total_files` (`0` = unlimited) —
+/// mid-walk short-circuit, not a post-walk count check, so an oversized
+/// project never finishes an expensive full walk just to be rejected
+/// (design "max_total_files enforcement point").
+pub fn discover(
+    root: &Path,
+    options: &DiscoveryOptions,
+) -> Result<Vec<DiscoveredFile>, codekurve_core::Error> {
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(!options.include_hidden)
@@ -78,10 +88,15 @@ pub fn discover(root: &Path, options: &DiscoveryOptions) -> Vec<DiscoveredFile> 
             relative_path,
             language,
         });
+        if options.max_total_files > 0 && files.len() > options.max_total_files {
+            return Err(codekurve_core::Error::TooManyFiles {
+                limit: options.max_total_files,
+            });
+        }
     }
 
     files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
-    files
+    Ok(files)
 }
 
 /// Build a `/`-separated path relative to `root`, or `None` if `path` is not
@@ -107,6 +122,7 @@ mod tests {
             include_hidden: false,
             follow_symlinks: false,
             max_file_size_bytes: 2_097_152,
+            max_total_files: 0,
             languages: vec![LanguageId::TypeScript, LanguageId::JavaScript],
         }
     }
@@ -123,7 +139,7 @@ mod tests {
         fs::write(root.join("node_modules").join("dep.ts"), "").unwrap();
         fs::write(root.join(".gitignore"), "ignored.ts\nnode_modules/\n").unwrap();
 
-        let discovered = discover(root, &options());
+        let discovered = discover(root, &options()).unwrap();
         let found: Vec<&str> = discovered
             .iter()
             .map(|f| f.relative_path.as_str())
@@ -145,10 +161,65 @@ mod tests {
 
         let mut opts = options();
         opts.languages = vec![LanguageId::TypeScript];
-        let found = discover(root, &opts);
+        let found = discover(root, &opts).unwrap();
 
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].relative_path, "a.ts");
         assert_eq!(found[0].language, LanguageId::TypeScript);
+    }
+
+    /// Phase 6: exactly `max_total_files` discovered files is accepted, not
+    /// rejected — the limit is inclusive.
+    #[test]
+    fn at_limit_is_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for name in ["a", "b", "c"] {
+            fs::write(root.join(format!("{name}.ts")), "").unwrap();
+        }
+
+        let mut opts = options();
+        opts.max_total_files = 3;
+        let found = discover(root, &opts).unwrap();
+
+        assert_eq!(found.len(), 3);
+    }
+
+    /// Phase 6 (design "max_total_files enforcement point"): the moment
+    /// discovery finds one file more than the configured cap, it hard-fails
+    /// with `Error::TooManyFiles` instead of returning a truncated list.
+    #[test]
+    fn over_limit_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for name in ["a", "b", "c"] {
+            fs::write(root.join(format!("{name}.ts")), "").unwrap();
+        }
+
+        let mut opts = options();
+        opts.max_total_files = 2;
+        let err = discover(root, &opts).unwrap_err();
+
+        assert!(matches!(
+            err,
+            codekurve_core::Error::TooManyFiles { limit: 2 }
+        ));
+    }
+
+    /// `max_total_files: 0` means unlimited — never short-circuits, however
+    /// many files are discovered.
+    #[test]
+    fn zero_disables_the_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for name in ["a", "b", "c"] {
+            fs::write(root.join(format!("{name}.ts")), "").unwrap();
+        }
+
+        let mut opts = options();
+        opts.max_total_files = 0;
+        let found = discover(root, &opts).unwrap();
+
+        assert_eq!(found.len(), 3);
     }
 }

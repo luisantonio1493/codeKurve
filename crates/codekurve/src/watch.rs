@@ -48,9 +48,7 @@ pub fn run(root: &Path, debounce_ms_override: Option<u64>) -> Result<(), String>
         Duration::from_millis(debounce_ms),
         Duration::from_millis(max_batch_wait_ms),
         |paths| apply_flush(&mut setup, paths),
-    );
-
-    Ok(())
+    )
 }
 
 fn reconcile(setup: &mut IndexSetup) -> Result<(), String> {
@@ -86,12 +84,18 @@ fn reconcile(setup: &mut IndexSetup) -> Result<(), String> {
 }
 
 /// One debounced batch: `detect` restricted to the flushed paths, then
-/// `apply_batch`. Errors are logged, not fatal — the watcher keeps running
-/// so the next batch (or `pending_files` staying nonzero) can recover.
-fn apply_flush(setup: &mut IndexSetup, paths: &HashSet<PathBuf>) {
+/// `apply_batch`. Most errors are logged, not fatal — the watcher keeps
+/// running so the next batch (or `pending_files` staying nonzero) can
+/// recover. `max_total_files` is the one exception (Phase 6, design risk
+/// #4): a project that has genuinely grown past the configured cap will
+/// hit the exact same error on every future batch too, so silently
+/// logging-and-continuing forever would leave the index falling further
+/// behind with no clear signal — this stops the watcher instead, matching
+/// startup [`reconcile`]'s fatal behavior for the same condition.
+fn apply_flush(setup: &mut IndexSetup, paths: &HashSet<PathBuf>) -> Result<(), String> {
     let filter = relative_paths(&setup.root, paths);
     if filter.is_empty() {
-        return;
+        return Ok(());
     }
     let changes = match incremental::detect(
         &setup.conn,
@@ -101,13 +105,14 @@ fn apply_flush(setup: &mut IndexSetup, paths: &HashSet<PathBuf>) {
         Some(&filter),
     ) {
         Ok(changes) => changes,
+        Err(e) if e.contains("max_total_files") => return Err(e),
         Err(e) => {
             eprintln!("error: {e}");
-            return;
+            return Ok(());
         }
     };
     if changes.is_empty() {
-        return;
+        return Ok(());
     }
     let ctx = IndexContext {
         root: &setup.root,
@@ -129,6 +134,7 @@ fn apply_flush(setup: &mut IndexSetup, paths: &HashSet<PathBuf>) {
         ),
         Err(e) => eprintln!("error: {e}"),
     }
+    Ok(())
 }
 
 /// Absolute event paths -> `discovery`-style relative slash paths, dropping
@@ -156,14 +162,14 @@ fn relative_paths(root: &Path, paths: &HashSet<PathBuf>) -> HashSet<String> {
 
 /// Task 6.2 (design "Debounce"): sliding quiet-window `debounce`, hard cap
 /// `max_batch_wait` since the batch's first pending event. Blocks until `rx`
-/// disconnects. `flush` runs on the same thread — batches are never applied
-/// concurrently.
-fn debounce_loop<F: FnMut(&HashSet<PathBuf>)>(
+/// disconnects or `flush` returns a fatal error. `flush` runs on the same
+/// thread — batches are never applied concurrently.
+fn debounce_loop<F: FnMut(&HashSet<PathBuf>) -> Result<(), String>>(
     rx: &Receiver<Vec<PathBuf>>,
     debounce: Duration,
     max_batch_wait: Duration,
     mut flush: F,
-) {
+) -> Result<(), String> {
     let mut pending: HashSet<PathBuf> = HashSet::new();
     let mut first: Option<Instant> = None;
     let mut last: Option<Instant> = None;
@@ -185,7 +191,7 @@ fn debounce_loop<F: FnMut(&HashSet<PathBuf>)>(
             }
             Err(RecvTimeoutError::Timeout) => {
                 if !pending.is_empty() {
-                    flush(&pending);
+                    flush(&pending)?;
                     pending.clear();
                 }
                 first = None;
@@ -194,6 +200,7 @@ fn debounce_loop<F: FnMut(&HashSet<PathBuf>)>(
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -217,8 +224,12 @@ mod tests {
                 &rx,
                 Duration::from_millis(30),
                 Duration::from_millis(1000),
-                |paths| flushes_clone.lock().unwrap().push(paths.clone()),
-            );
+                |paths| {
+                    flushes_clone.lock().unwrap().push(paths.clone());
+                    Ok(())
+                },
+            )
+            .unwrap();
         });
 
         for i in 0..5 {
@@ -253,8 +264,12 @@ mod tests {
                 &rx,
                 Duration::from_millis(50),
                 Duration::from_millis(120),
-                |paths| flushes_clone.lock().unwrap().push(paths.clone()),
-            );
+                |paths| {
+                    flushes_clone.lock().unwrap().push(paths.clone());
+                    Ok(())
+                },
+            )
+            .unwrap();
         });
 
         // Send an event every 20ms (< 50ms debounce, so the sliding window
@@ -276,6 +291,44 @@ mod tests {
             flushes.len() >= 2,
             "max_batch_wait must force at least one flush before the sender stops, got {}",
             flushes.len()
+        );
+    }
+
+    /// Phase 6, design risk #4 (WARNING follow-up): a fatal `flush` error
+    /// (e.g. `max_total_files` exceeded) stops the loop immediately instead
+    /// of being logged-and-continued, and is propagated to the caller —
+    /// `apply_flush` inherits this by returning `Err` only for that one
+    /// condition (see its doc comment).
+    #[test]
+    fn fatal_flush_error_stops_the_loop_and_is_propagated() {
+        let (tx, rx) = mpsc::channel::<Vec<PathBuf>>();
+        let flush_count = Arc::new(Mutex::new(0u32));
+        let flush_count_clone = flush_count.clone();
+
+        let handle = thread::spawn(move || {
+            debounce_loop(
+                &rx,
+                Duration::from_millis(10),
+                Duration::from_millis(1000),
+                |_paths| {
+                    *flush_count_clone.lock().unwrap() += 1;
+                    Err("project exceeds index.max_total_files (2)".to_string())
+                },
+            )
+        });
+
+        tx.send(vec![PathBuf::from("a.ts")]).unwrap();
+        // Second batch, sent after the fatal error should already have
+        // stopped the loop — must never reach `flush`.
+        thread::sleep(Duration::from_millis(50));
+        let _ = tx.send(vec![PathBuf::from("b.ts")]);
+
+        let result = handle.join().unwrap();
+        assert!(result.is_err(), "fatal flush error must propagate");
+        assert_eq!(
+            *flush_count.lock().unwrap(),
+            1,
+            "loop must stop after the first fatal flush, not keep retrying"
         );
     }
 }

@@ -7,9 +7,19 @@ target/
 # CodeKurve local index / data directory
 .codekurve/
 
+# Synthetic benchmark fixtures (generated at runtime by scripts/bench.py,
+# not committed — design PR3 D13)
+fixtures/bench/
+
 # Gentle-AI generated skill registry (managed automatically)
 .atl/.skill-registry.cache.json
 .atl/skill-registry.md
+
+# cargo-about NOTICE report (generated in CI, uploaded as a workflow artifact)
+NOTICE-3rdparty.md
+
+# Python bytecode cache (scripts/)
+__pycache__/
 
 # Editor temporary files
 *.swp

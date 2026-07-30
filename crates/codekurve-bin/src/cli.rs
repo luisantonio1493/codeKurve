@@ -19,6 +19,7 @@ pub struct Args {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub debounce_ms: Option<u64>,
+    pub client: Option<String>,
 }
 
 impl Args {
@@ -33,6 +34,7 @@ impl Args {
         let mut limit = None;
         let mut offset = None;
         let mut debounce_ms = None;
+        let mut client = None;
         let mut iter = args;
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -45,6 +47,7 @@ impl Args {
                 "--limit" => limit = iter.next().and_then(|v| v.parse().ok()),
                 "--offset" => offset = iter.next().and_then(|v| v.parse().ok()),
                 "--debounce-ms" => debounce_ms = iter.next().and_then(|v| v.parse().ok()),
+                "--client" => client = iter.next(),
                 _ => positionals.push(arg),
             }
         }
@@ -59,6 +62,7 @@ impl Args {
             limit,
             offset,
             debounce_ms,
+            client,
         }
     }
 

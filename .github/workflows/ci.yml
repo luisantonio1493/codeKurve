@@ -30,8 +30,31 @@ jobs:
       - name: licensing check
         run: python scripts/check_licensing.py
 
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: cargo-deny (advisories, licenses, bans, sources)
+        uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2.1.1
+        with:
+          command: check advisories licenses bans sources
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: install cargo-about
+        run: cargo install cargo-about --locked --features cli
+
+      - name: generate third-party NOTICE report
+        run: cargo about generate about.hbs > NOTICE-3rdparty.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: license-report
+          path: NOTICE-3rdparty.md
+
 # Deferred (see docs/ROADMAP.md and design decisions):
 # - aarch64 Linux runner (macos-latest already covers aarch64 macOS).
-# - doc-tests, cargo-deny, and a dedicated MSRV job.
+# - doc-tests and a dedicated MSRV job.
 # - dependency caching (no Swatinem/rust-cache in Phase 0 — auditability
 #   over speed; reconsider only when build slowness is measured).

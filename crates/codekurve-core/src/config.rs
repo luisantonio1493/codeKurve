@@ -46,6 +46,11 @@ pub struct Project {
 pub struct Index {
     pub languages: Vec<String>,
     pub max_file_size_bytes: u64,
+    /// Additive field (Phase 6): older configs that name `[index]` but
+    /// predate this key still parse, via this field-level default rather
+    /// than requiring the whole section to be absent.
+    #[serde(default = "default_max_total_files")]
+    pub max_total_files: usize,
     pub follow_symlinks: bool,
     pub include_hidden: bool,
     pub store_source: bool,
@@ -99,6 +104,10 @@ fn default_version() -> u32 {
     CONFIG_VERSION
 }
 
+fn default_max_total_files() -> usize {
+    50_000
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -131,6 +140,7 @@ impl Default for Index {
                 "csharp".to_string(),
             ],
             max_file_size_bytes: 2_097_152,
+            max_total_files: default_max_total_files(),
             follow_symlinks: false,
             include_hidden: false,
             store_source: false,
@@ -226,5 +236,35 @@ mod tests {
         // Unspecified sections fall back to defaults.
         assert_eq!(parsed.queries.default_limit, 50);
         assert!(parsed.ignore.respect_gitignore);
+        assert_eq!(parsed.index.max_total_files, 50_000);
+    }
+
+    /// Spec scenario "Existing config files parse unchanged": a config file
+    /// that omits `[index]` entirely still parses with the built-in
+    /// `max_total_files` default, via `Config.index`'s section-level
+    /// `#[serde(default)]`.
+    #[test]
+    fn config_omitting_index_section_uses_default_max_total_files() {
+        let parsed = Config::from_toml("version = 1\n[project]\nname = \"x\"\nroot = \".\"\n")
+            .expect("parse");
+        assert_eq!(parsed.index.max_total_files, 50_000);
+    }
+
+    /// `max_total_files` is additive (Phase 6): a config file that *names*
+    /// `[index]` — because it predates this field, or only overrides other
+    /// `Index` fields — but omits `max_total_files` still parses, via the
+    /// field's own `#[serde(default = "default_max_total_files")]`, not
+    /// just the whole-section default above.
+    #[test]
+    fn index_section_omitting_max_total_files_uses_its_own_default() {
+        let parsed = Config::from_toml(
+            "version = 1\n[project]\nname = \"x\"\nroot = \".\"\n\
+             [index]\nlanguages = [\"typescript\"]\nmax_file_size_bytes = 1024\n\
+             follow_symlinks = true\ninclude_hidden = true\nstore_source = true\n",
+        )
+        .expect("parse");
+        assert_eq!(parsed.index.max_total_files, 50_000);
+        assert_eq!(parsed.index.languages, vec!["typescript".to_string()]);
+        assert!(parsed.index.follow_symlinks);
     }
 }

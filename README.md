@@ -51,7 +51,8 @@ matrix and C# limitations in [docs/LANGUAGES.md](docs/LANGUAGES.md).
 (Claude Code, Codex) instead of ad-hoc grepping. Full rules and client setup:
 `docs/AGENT_USAGE.md`.
 
-Quick start (Claude Code, `.mcp.json`):
+Quick start: `codekurve install claude-code` (or `cursor` / `codex-cli`) wires
+the config automatically, or add this to `.mcp.json` by hand:
 
 ```json
 {
@@ -59,7 +60,7 @@ Quick start (Claude Code, `.mcp.json`):
     "codekurve": {
       "command": "/absolute/path/to/target/release/codekurve",
       "args": ["mcp", "--root", "/absolute/path/to/project"],
-      "transport": "stdio"
+      "type": "stdio"
     }
   }
 }

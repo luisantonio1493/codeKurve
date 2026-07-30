@@ -34,7 +34,23 @@ the policy is configurable, not hardcoded (plan §29.3).
 SQLite is local, no source-code duplication beyond what's required (plan
 §0.8, §24).
 
+## Data paths
+
+- `.codekurve/index.db` — SQLite index, local to the project root, never
+  transmitted over the network.
+- Client MCP config files written by `codekurve install`: Claude Code
+  (`<root>/.mcp.json`, project scope), Cursor (`<root>/.cursor/mcp.json`,
+  project scope), Codex CLI (`$CODEX_HOME/config.toml` or
+  `$HOME/.codex/config.toml`, user scope — Codex has no project-scoped
+  config).
+- Backups: `install` writes `<file>.bak` before any rewrite of an existing
+  client config, letting a user roll back without git.
+
 ## Update process
 
-No auto-update in Phase 0; release checksums and future binary signing are
-tracked in plan §29.2, not yet implemented.
+No auto-update. Dependency and license audit runs in CI via `cargo-deny`
+and `cargo-about` (`.github/workflows/ci.yml`, `deny.toml`, `about.toml`).
+Tagged releases build a CycloneDX SBOM, a NOTICE report, and a `SHA256SUMS`
+checksum file covering every platform binary
+(`.github/workflows/release.yml`); artifacts stay inside CI workflow storage
+— no public publish step, no binary signing or notarization, in this phase.

@@ -69,7 +69,7 @@ pub fn detect(
     opts: &DiscoveryOptions,
     filter: Option<&HashSet<String>>,
 ) -> Result<Vec<FileChange>, String> {
-    let discovered = discovery::discover(root, opts);
+    let discovered = discovery::discover(root, opts).map_err(|e| e.to_string())?;
     let stored = repo::file_snapshot(conn, project_id).map_err(|e| e.to_string())?;
 
     let mut changes = Vec::new();
@@ -194,7 +194,7 @@ fn apply_via_full_reindex(
     conn: &mut Connection,
     ctx: &IndexContext,
 ) -> Result<BatchOutcome, String> {
-    let discovered = discovery::discover(ctx.root, ctx.options);
+    let discovered = discovery::discover(ctx.root, ctx.options).map_err(|e| e.to_string())?;
 
     let mut analyses: Vec<FileAnalysis> = Vec::new();
     let mut file_meta: Vec<FileMeta> = Vec::new();
@@ -431,6 +431,7 @@ mod tests {
             include_hidden: false,
             follow_symlinks: false,
             max_file_size_bytes: 2_097_152,
+            max_total_files: 0,
             languages: vec![LanguageId::TypeScript],
         }
     }
@@ -559,6 +560,7 @@ mod tests {
             changes,
             vec![FileChange::Modified(
                 discovery::discover(root, &discovery_opts())
+                    .unwrap()
                     .into_iter()
                     .find(|f| f.relative_path == "src/a.ts")
                     .unwrap()

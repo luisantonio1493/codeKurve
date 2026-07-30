@@ -58,6 +58,10 @@ cargo build --release -p codekurve-bin
 # binary lands at target/release/codekurve
 ```
 
+Or run `codekurve install claude-code` / `codekurve install cursor` /
+`codekurve install codex-cli` to write the config below automatically (backs
+up any existing file first).
+
 ### Claude Code
 
 Add to your MCP server config (e.g. `.mcp.json` in the project root, or via
@@ -69,16 +73,34 @@ Add to your MCP server config (e.g. `.mcp.json` in the project root, or via
     "codekurve": {
       "command": "/absolute/path/to/target/release/codekurve",
       "args": ["mcp", "--root", "/absolute/path/to/project"],
-      "transport": "stdio"
+      "type": "stdio"
     }
   }
 }
 ```
 
-### Codex
+### Cursor
 
-Codex's config format is equivalent — register a stdio server with the same
-`command`/`args` pair:
+Add to `.cursor/mcp.json` in the project root — Cursor's own config omits a
+`type`/`transport` key entirely:
+
+```json
+{
+  "mcpServers": {
+    "codekurve": {
+      "command": "/absolute/path/to/target/release/codekurve",
+      "args": ["mcp", "--root", "/absolute/path/to/project"]
+    }
+  }
+}
+```
+
+### Codex CLI
+
+Codex has no project-scoped config — `codekurve install codex-cli` writes to
+`$CODEX_HOME/config.toml`, falling back to `$HOME/.codex/config.toml`
+(`%USERPROFILE%\.codex\config.toml` on Windows). Register a stdio server with
+`command`/`args` only, no `type`/`transport` key:
 
 ```toml
 [mcp_servers.codekurve]
@@ -86,7 +108,7 @@ command = "/absolute/path/to/target/release/codekurve"
 args = ["mcp", "--root", "/absolute/path/to/project"]
 ```
 
-Either client will send `initialize`, then `tools/list`, then `tools/call`
+Every client will send `initialize`, then `tools/list`, then `tools/call`
 for whichever tool it needs. `reindex` only shows up in `tools/list` when
 `[mcp] allow_reindex = true` is set in the project's config (off by default).
 

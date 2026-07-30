@@ -175,6 +175,7 @@ dependencies = [
  "notify",
  "serde_json",
  "tempfile",
+ "toml_edit",
 ]
 
 [[package]]

@@ -6,11 +6,12 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use cli::Args;
-use codekurve::{commands, watch};
+use codekurve::{commands, install, watch};
 use commands::CommandError;
 
 const USAGE: &str = "usage: codekurve <version|init|index|watch|mcp|status|search|symbol|doctor|\
-references|callers|callees|implementations|trace|impact> [args] [--root <path>] [--debounce-ms <n>]";
+references|callers|callees|implementations|trace|impact|install> [args] [--root <path>] \
+[--debounce-ms <n>] [--client <name>]";
 
 fn main() -> ExitCode {
     let mut raw = std::env::args().skip(1);
@@ -43,6 +44,10 @@ fn main() -> ExitCode {
             )),
         },
         "doctor" => commands::doctor(&args.root).map_err(CommandError::from),
+        "install" => {
+            let client = args.positional(0).or(args.client.as_deref());
+            install::run(&args.root, client).map_err(CommandError::from)
+        }
         "references" => commands::references(&query_args(&args)),
         "callers" => commands::callers(&query_args(&args)),
         "callees" => commands::callees(&query_args(&args)),

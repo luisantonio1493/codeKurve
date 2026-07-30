@@ -10,8 +10,8 @@ each phase's CI must pass on Windows, macOS, and Linux before moving on.
 | 2 | TypeScript graph | **Complete** (merged to `main`) |
 | 3 | Incremental and watcher | **Complete** (merged to `main`) |
 | 4 | MCP | **Complete** (merged to `main`) |
-| 5 | C# | **Implementation complete, verify FAILED** — 84/84 tasks done, but independent verification found 3 critical gaps (visibility missing from CLI output, `using static`/alias-reference test coverage gaps). Not merged. See `openspec/changes/phase-5-csharp/verify-report.md`. |
-| 6 | Enterprise hardening | Not started |
+| 5 | C# | **Complete** (merged to `main`) — verify FAILED once on 3 critical gaps (CLI visibility output, `using static`/alias-reference test coverage), fixed and re-verified PASS before merge. See `openspec/changes/archive/2026-07-30-phase-5-csharp/verify-report.md`. |
+| 6 | Enterprise hardening | **Complete** (working tree, not yet committed) — internal-pilot readiness: `max_total_files` hard-fail, `cargo-deny`/`cargo-about` CI audit, measured 100/1k/10k benchmarks, internal release artifacts (binaries/SBOM/checksums, CI-only), `codekurve install` for Claude Code/Cursor/Codex CLI. Public redistribution deferred pending `docs/LICENSING.md`. See `openspec/changes/archive/2026-07-30-phase-6-enterprise-hardening/verify-report.md`. |
 | 7 | Angular and .NET aware | Not started |
 | 8 | Pilot and evaluation | Not started |
 
