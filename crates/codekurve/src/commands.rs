@@ -710,6 +710,39 @@ fn relationship_command(args: &QueryArgs, kind: query::RelKind) -> Result<(), Co
     Ok(())
 }
 
+/// `codekurve unresolved [<target-text>] [--symbol-id <id>|--symbol-name
+/// <name>] [--limit N] [--offset N] [--json] [--root <path>]` — the
+/// references the analyzer recorded but deliberately refused to resolve into
+/// edges, with the `reason` it recorded. Unlike the four relationship
+/// commands this takes no required subject: with no filter it lists the whole
+/// project (paginated — real projects run to hundreds of rows).
+pub fn unresolved(args: &QueryArgs, target_text: Option<&str>) -> Result<(), CommandError> {
+    let s = query::Session::open(args.root)?;
+    if let query::Session::Indexed {
+        conn, project_id, ..
+    } = &s
+    {
+        warn_if_stale(conn, project_id);
+    }
+    let filter = query::UnresolvedFilter {
+        target_text,
+        symbol_id: args.symbol_id,
+        symbol_name: args.symbol_name,
+        limit: args.limit,
+        offset: args.offset,
+    };
+    let page = query::unresolved(&s, &filter)?;
+
+    if args.json {
+        let result =
+            serde_json::Value::Array(page.rows.iter().map(query::unresolved_row).collect());
+        print_envelope(&s.config().project.name, result, Vec::new(), page.truncated);
+    } else {
+        print_unresolved(&page.rows);
+    }
+    Ok(())
+}
+
 /// `codekurve trace <to> --symbol-id <id>|--symbol-name <from> --root <path>`
 /// — bounded forward BFS (§26.4) from the resolved source symbol to `to`,
 /// also resolved through [`resolve_symbol`] (an ambiguous target exits 6
@@ -953,6 +986,29 @@ fn print_relationships(rows: &[repo::StoredRelationship]) {
             r.start_line.unwrap_or(0),
             r.start_column.unwrap_or(0)
         );
+    }
+}
+
+/// [`print_relationships`]'s shape, adapted: `unresolved_references` stores
+/// no line/column, so the source file's path takes that slot, and the
+/// `reason` — the whole reason this command exists, and usually a full
+/// sentence — gets its own indented line rather than being run off the right
+/// edge of the terminal.
+fn print_unresolved(rows: &[repo::StoredUnresolved]) {
+    if rows.is_empty() {
+        println!("no results");
+        return;
+    }
+    for u in rows {
+        let source = u
+            .source_qualified_name
+            .as_deref()
+            .unwrap_or(&u.source_relative_path);
+        println!(
+            "{} -> {}  [{}, {}]  {}",
+            source, u.target_text, u.relationship_kind, u.confidence, u.source_relative_path
+        );
+        println!("    reason: {}", u.reason);
     }
 }
 

@@ -72,6 +72,19 @@ pub struct RelationshipInput {
     pub offset: Option<u32>,
 }
 
+/// `find_unresolved`: every field optional — with none set the tool lists the
+/// whole project's unresolved references. `target_text` is matched exactly
+/// (the store's index is `(project_id, target_text)`), so pass the type/symbol
+/// name as it appears in the source.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct FindUnresolvedInput {
+    pub target_text: Option<String>,
+    pub symbol_id: Option<String>,
+    pub symbol_name: Option<String>,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+}
+
 /// `trace_path` (§28.2): same subject resolution as [`RelationshipInput`]
 /// plus the CLI's positional `to` target and `--depth`.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -263,6 +276,49 @@ impl CodeKurve {
         Parameters(input): Parameters<RelationshipInput>,
     ) -> Result<CallToolResult, McpError> {
         self.relationship_result(input, RelKind::Implementations)
+    }
+
+    #[tool(
+        description = "Explain why a relationship is missing. Reach for this when find_implementations/find_callers/find_references come back empty for a symbol that clearly ought to have relationships: the analyzer records every reference it could not resolve, with the reason it stopped, instead of guessing an edge. Typical causes are a target defined outside the indexed project (an external base class or interface, e.g. a C# `class X : IFoo` where `IFoo` comes from a NuGet package and base-class vs interface is undeterminable) or a name with zero/ambiguous candidates. Filter by target_text (exact match on the name as written in the source), by symbol_id/symbol_name, or pass nothing to list the whole project."
+    )]
+    fn codekurve_find_unresolved(
+        &self,
+        Parameters(input): Parameters<FindUnresolvedInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let session = self.session.lock().unwrap();
+        // Same bound the relationship tools apply — a real project holds
+        // hundreds of unresolved rows, so this is never unbounded (§28.3).
+        let default_limit = session.config().queries.default_limit as usize;
+        let max_limit = session.config().queries.max_limit as usize;
+        let limit = input
+            .limit
+            .map(|l| l as usize)
+            .unwrap_or(default_limit)
+            .min(max_limit);
+        let filter = query::UnresolvedFilter {
+            target_text: input.target_text.as_deref(),
+            symbol_id: input.symbol_id.as_deref(),
+            symbol_name: input.symbol_name.as_deref(),
+            limit: Some(limit),
+            offset: input.offset.map(|o| o as usize),
+        };
+        let page = query::unresolved(&session, &filter)
+            .map_err(|e| McpError::internal_error(e.message, None))?;
+        let warnings = session.warnings();
+        let project = session.config().project.name.clone();
+        let rows: Vec<_> = page.rows.iter().map(query::unresolved_row).collect();
+        drop(session);
+
+        let envelope = query::envelope(
+            &project,
+            serde_json::Value::Array(rows),
+            warnings,
+            page.truncated,
+            Some(page.total),
+        );
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            envelope.to_string(),
+        )]))
     }
 
     #[tool(description = "Bounded forward path from one symbol to another")]

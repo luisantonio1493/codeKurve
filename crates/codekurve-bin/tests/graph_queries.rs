@@ -140,6 +140,117 @@ fn json_output_has_all_envelope_fields() {
     }
 }
 
+/// Two calls to symbols that exist nowhere in the project — the analyzer
+/// records each as an `unresolved_references` row with its reason instead of
+/// inventing an edge (ADR 0007). Two rows so `--limit` can truncate.
+const GHOST_TS: &str =
+    "export function callGhosts(): void {\n  missingAlpha();\n  missingBeta();\n}\n";
+
+fn seed_unresolved_project(root: &std::path::Path) {
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src").join("ghost.ts"), GHOST_TS).unwrap();
+    ck().arg("init").arg(root).assert().success();
+    ck().arg("index").arg("--root").arg(root).assert().success();
+}
+
+/// The gap this command closes: the row's `reason` — recorded at index time,
+/// previously only ever visible as `status`'s aggregate count — reaches the
+/// terminal, both unfiltered and filtered to one exact target text.
+#[test]
+fn unresolved_lists_rows_with_their_reason() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    seed_unresolved_project(root);
+
+    ck().arg("unresolved")
+        .arg("--root")
+        .arg(root)
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("missingAlpha")
+                .and(predicate::str::contains("missingBeta"))
+                .and(predicate::str::contains("src/ghost.ts::callGhosts"))
+                .and(predicate::str::contains("reason:")),
+        );
+
+    // Exact target-text filter (the `idx_unresolved_project_target` path).
+    ck().arg("unresolved")
+        .arg("missingAlpha")
+        .arg("--root")
+        .arg(root)
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("missingAlpha")
+                .and(predicate::str::contains("missingBeta").not()),
+        );
+}
+
+/// Same pagination/truncation semantics as the relationship commands:
+/// `--limit` bounds the rows, `truncated` flips, and `total` stays the
+/// pre-truncation count (`--json`'s envelope omits `total` on the CLI, so
+/// `truncated` is the observable half here).
+#[test]
+fn unresolved_paginates_like_the_relationship_queries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    seed_unresolved_project(root);
+
+    let output = ck()
+        .arg("unresolved")
+        .arg("--limit")
+        .arg("1")
+        .arg("--json")
+        .arg("--root")
+        .arg(root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let envelope: serde_json::Value =
+        serde_json::from_str(String::from_utf8(output.stdout).unwrap().trim()).unwrap();
+    assert_eq!(envelope["result"].as_array().unwrap().len(), 1);
+    assert_eq!(envelope["truncated"], true);
+    let row = &envelope["result"][0];
+    for field in ["path", "kind", "target_text", "reason", "confidence"] {
+        assert!(row.get(field).is_some(), "row missing {field:?}: {row}");
+    }
+
+    // The second page: offset past the first row, nothing left to truncate.
+    let output = ck()
+        .arg("unresolved")
+        .arg("--offset")
+        .arg("1")
+        .arg("--json")
+        .arg("--root")
+        .arg(root)
+        .output()
+        .unwrap();
+    let envelope: serde_json::Value =
+        serde_json::from_str(String::from_utf8(output.stdout).unwrap().trim()).unwrap();
+    assert_eq!(envelope["result"].as_array().unwrap().len(), 1);
+    assert_eq!(envelope["truncated"], false);
+}
+
+/// A project where the analyzer resolved everything: an empty page and exit
+/// 0, never an error.
+#[test]
+fn unresolved_on_a_fully_resolved_project_is_empty_not_an_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src").join("a.ts"), A_TS).unwrap();
+    ck().arg("init").arg(root).assert().success();
+    ck().arg("index").arg("--root").arg(root).assert().success();
+
+    ck().arg("unresolved")
+        .arg("--root")
+        .arg(root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no results"));
+}
+
 /// `trace`/`impact` share the same BFS-backed envelope and command
 /// preamble; a smoke test that both run end to end without requiring a
 /// specific reachable path (fixture has no multi-hop chain).

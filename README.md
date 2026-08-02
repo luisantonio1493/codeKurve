@@ -51,12 +51,21 @@ codekurve init
 codekurve index
 codekurve search <query>
 codekurve callers <symbol>
+codekurve unresolved [<target-text>]
 codekurve tui
 codekurve mcp
 ```
 
 Full command surface and flags: `docs/ROADMAP.md`; CLI conventions: the plan
 §27.1.
+
+`codekurve unresolved` answers the question the other queries can't:
+CodeKurve never invents an edge it cannot determine (an external base type, a
+name with zero candidates), and this command — plus the
+`codekurve_find_unresolved` MCP tool — shows those references and the reason
+each one stopped. Reach for it when `callers`/`implementations` come back
+empty for a symbol that obviously has relationships; see
+`docs/AGENT_USAGE.md`.
 
 ## Interactive explorer
 

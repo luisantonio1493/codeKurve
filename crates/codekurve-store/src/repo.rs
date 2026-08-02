@@ -919,6 +919,86 @@ fn query_relationships(
     Ok(result)
 }
 
+/// One `unresolved_references` row read back for display — the query side of
+/// what [`persist_unresolved`] writes, joined to the source symbol's
+/// qualified name and the source file's relative path exactly like
+/// [`query_relationships`] does (mirrors [`StoredRelationship`]).
+///
+/// `source_symbol_id`/`source_qualified_name` are both optional: the column
+/// is nullable (file-level edges have no owning symbol), so the symbol join
+/// is a LEFT JOIN. No `start_line`/`start_column`/`provenance` — the table
+/// stores none of the three (§24.2), and adding them would need a migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredUnresolved {
+    pub source_symbol_id: Option<String>,
+    pub source_qualified_name: Option<String>,
+    pub source_relative_path: String,
+    pub relationship_kind: String,
+    pub target_text: String,
+    pub reason: String,
+    pub confidence: String,
+    pub candidate_count: u32,
+}
+
+/// Every reference the analyzer recorded but deliberately refused to turn
+/// into an edge (§27.4 "never silently pick first", ADR 0007) — until now
+/// only visible as `index_status`'s count. `reason` is the whole point: it
+/// says *why* resolution stopped ("base list entry not found in project;
+/// class vs interface undeterminable", "zero candidates", …).
+///
+/// `target_text` filtering is exact, not `LIKE`: `idx_unresolved_project_target`
+/// is `(project_id, target_text)`, so equality stays a bounded index seek
+/// while a substring predicate would force a full scan of a table that runs
+/// to hundreds of rows on a real project. `source_symbol_id` has no index of
+/// its own; it's an additional narrowing filter, applied in the same SELECT
+/// rather than in memory.
+pub fn unresolved(
+    conn: &Connection,
+    project_id: &str,
+    target_text: Option<&str>,
+    source_symbol_id: Option<&str>,
+) -> Result<Vec<StoredUnresolved>> {
+    let mut filters = String::new();
+    let mut binds: Vec<&str> = vec![project_id];
+    if let Some(target_text) = target_text {
+        filters.push_str(" AND u.target_text = ?");
+        binds.push(target_text);
+    }
+    if let Some(source_symbol_id) = source_symbol_id {
+        filters.push_str(" AND u.source_symbol_id = ?");
+        binds.push(source_symbol_id);
+    }
+    let sql = format!(
+        "SELECT u.source_symbol_id, src.qualified_name, f.relative_path, u.relationship_kind,
+                u.target_text, u.reason, u.confidence, u.candidate_count
+         FROM unresolved_references u
+         JOIN files f ON f.id = u.source_file_id
+         LEFT JOIN symbols src ON src.id = u.source_symbol_id
+         WHERE u.project_id = ?{filters}
+         ORDER BY f.relative_path, u.target_text"
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(binds.iter().copied()),
+        map_unresolved,
+    )?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn map_unresolved(row: &Row) -> rusqlite::Result<StoredUnresolved> {
+    Ok(StoredUnresolved {
+        source_symbol_id: row.get(0)?,
+        source_qualified_name: row.get(1)?,
+        source_relative_path: row.get(2)?,
+        relationship_kind: row.get(3)?,
+        target_text: row.get(4)?,
+        reason: row.get(5)?,
+        confidence: row.get(6)?,
+        candidate_count: row.get::<_, i64>(7)? as u32,
+    })
+}
+
 fn map_relationship(row: &Row) -> rusqlite::Result<StoredRelationship> {
     Ok(StoredRelationship {
         source_symbol_id: row.get(0)?,
@@ -2146,6 +2226,140 @@ mod tests {
             dependents_by_target_symbol(&conn, &project, &[do_work], &["src/a.ts".to_string()])
                 .unwrap();
         assert_eq!(dependents, vec!["src/b.ts".to_string()]);
+    }
+
+    /// Seeds `seed()`'s project with three unresolved rows: two different
+    /// targets owned by `MemberService`, and one file-level row (no source
+    /// symbol) for a third target — enough to exercise every filter
+    /// combination `unresolved` supports.
+    fn seed_unresolved() -> (Connection, String) {
+        let mut conn = seed();
+        let pid = project_id(&conn);
+        let file = conn
+            .query_row("SELECT id FROM files LIMIT 1", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap();
+        let owner: String = conn
+            .query_row(
+                "SELECT id FROM symbols WHERE name = 'MemberService'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let files = vec![FileInput {
+            relative_path: "src/member.ts".to_string(),
+            language: "typescript".to_string(),
+            content_hash: "test-hash".to_string(),
+            modified_ns: 0,
+            size_bytes: 42,
+            symbols: vec![
+                symbol("MemberService", SymbolKind::Class, 0),
+                symbol("findMember", SymbolKind::Function, 100),
+            ],
+        }];
+        let row = |source: Option<&str>, target: &str, reason: &str| UnresolvedReferenceInput {
+            source_symbol_id: source.map(str::to_string),
+            source_file_id: file.clone(),
+            relationship_kind: RelationshipKind::UsesType,
+            target_text: target.to_string(),
+            context_json: None,
+            candidate_count: 0,
+            reason: reason.to_string(),
+            confidence: Confidence::Unresolved,
+        };
+        let unresolved_rows = vec![
+            row(
+                Some(&owner),
+                "IOpenApiDocumentTransformer",
+                "base list entry not found in project; class vs interface undeterminable",
+            ),
+            row(Some(&owner), "ILogger", "zero candidates"),
+            row(None, "ExternalThing", "zero candidates"),
+        ];
+        reindex(&mut conn, &pid, &files, &[], &unresolved_rows).unwrap();
+        (conn, pid)
+    }
+
+    /// The whole point of the query: an exact `target_text` filter returns
+    /// the row *with the reason the analyzer recorded*, which is otherwise
+    /// only ever surfaced as `index_status`'s bare count.
+    #[test]
+    fn unresolved_filters_by_target_text() {
+        let (conn, pid) = seed_unresolved();
+
+        let rows = unresolved(&conn, &pid, Some("IOpenApiDocumentTransformer"), None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].target_text, "IOpenApiDocumentTransformer");
+        assert_eq!(
+            rows[0].reason,
+            "base list entry not found in project; class vs interface undeterminable"
+        );
+        assert_eq!(rows[0].relationship_kind, "usestype");
+        assert_eq!(rows[0].confidence, "unresolved");
+        assert_eq!(rows[0].source_relative_path, "src/member.ts");
+        assert_eq!(
+            rows[0].source_qualified_name.as_deref(),
+            Some("src/member.ts::MemberService"),
+            "the source symbol's qualified name is joined in, not just its id"
+        );
+
+        // Exact match, never substring — a prefix must not match.
+        assert!(unresolved(&conn, &pid, Some("IOpenApi"), None)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// `source_symbol_id` narrows to the rows one symbol owns; the
+    /// file-level row (null `source_symbol_id`) is excluded by it, but still
+    /// listed — with a `None` qualified name — when no filter is given.
+    #[test]
+    fn unresolved_filters_by_source_symbol() {
+        let (conn, pid) = seed_unresolved();
+        let owner: String = conn
+            .query_row(
+                "SELECT id FROM symbols WHERE name = 'MemberService'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        let mut targets: Vec<String> = unresolved(&conn, &pid, None, Some(&owner))
+            .unwrap()
+            .into_iter()
+            .map(|u| u.target_text)
+            .collect();
+        targets.sort();
+        assert_eq!(targets, vec!["ILogger", "IOpenApiDocumentTransformer"]);
+
+        let all = unresolved(&conn, &pid, None, None).unwrap();
+        assert_eq!(all.len(), 3);
+        let file_level = all
+            .iter()
+            .find(|u| u.target_text == "ExternalThing")
+            .unwrap();
+        assert!(file_level.source_symbol_id.is_none());
+        assert!(file_level.source_qualified_name.is_none());
+        assert_eq!(file_level.source_relative_path, "src/member.ts");
+
+        // Both filters compose in the same SELECT.
+        let both = unresolved(&conn, &pid, Some("ILogger"), Some(&owner)).unwrap();
+        assert_eq!(both.len(), 1);
+        assert!(unresolved(&conn, &pid, Some("ExternalThing"), Some(&owner))
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A project with nothing unresolved is an empty result, never an error —
+    /// same contract the relationship queries give.
+    #[test]
+    fn unresolved_empty_project_returns_no_rows() {
+        let conn = seed();
+        let pid = project_id(&conn);
+        assert!(unresolved(&conn, &pid, None, None).unwrap().is_empty());
+        assert!(unresolved(&conn, &pid, Some("Anything"), None)
+            .unwrap()
+            .is_empty());
     }
 
     /// Task 4.6, `unresolved_references` side: `c.ts` has an unresolved

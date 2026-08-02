@@ -62,6 +62,41 @@ symbol that looks like an entry point is a signal to run `find_references`
 instead (it returns every relationship kind, including framework edges), not
 a signal that the symbol is dead code.
 
+### `find_implementations` empty ≠ "nothing implements this"
+
+CodeKurve only records an edge when it can determine one. C#'s base list is
+the clearest case: in `class BearerSecuritySchemeTransformer :
+IOpenApiDocumentTransformer`, the syntax is genuinely ambiguous between a base
+class and an interface, and when `IOpenApiDocumentTransformer` lives outside
+the indexed project (a NuGet package, a referenced assembly) nothing in the
+tree can disambiguate it. CodeKurve refuses to guess an `Implements` edge —
+that refusal is deliberate
+([ADR 0007](adr/0007-confidence-and-provenance.md)) — and
+records an `unresolved_references` row instead:
+
+```text
+relationship_kind = usestype
+target_text       = IOpenApiDocumentTransformer
+reason            = "base list entry not found in project; class vs interface undeterminable"
+```
+
+So `find_implementations` returning nothing for `IOpenApiDocumentTransformer`
+is not "no implementations exist" — it is "the analyzer declined to invent an
+edge, and wrote down why". Use **`find_unresolved`** (CLI: `codekurve
+unresolved [<target-text>]`) to read that reason:
+
+```bash
+codekurve unresolved IOpenApiDocumentTransformer
+# MinimalApi.BearerSecuritySchemeTransformer -> IOpenApiDocumentTransformer  [usestype, unresolved]  Source/Extensions/OpenApiExtensions.cs
+#     reason: base list entry not found in project; class vs interface undeterminable
+```
+
+The same applies whenever `find_callers`/`find_callees`/`find_references`
+come back empty for a symbol that obviously has relationships: check
+`find_unresolved` before falling back to reading the source. `target_text` is
+matched exactly (pass the name as written in the source); with no filter the
+tool lists every unresolved reference in the project, paginated.
+
 ## Connecting a client over stdio
 
 `codekurve mcp` speaks MCP over stdio only (no network port, no auth
@@ -207,9 +242,12 @@ area of the codebase interactively.
 ## Tool registry
 
 `project_status`, `search_symbols`, `get_symbol`, `find_references`,
-`find_callers`, `find_callees`, `find_implementations`, `trace_path`,
-`analyze_impact`, `project_overview`, `doctor`, and (gated) `reindex`. See
-`openspec/changes/phase-4-mcp/specs/mcp-server/spec.md` for the full
-per-tool contract and response envelope (§28.3: source paths, line ranges,
-confidence, provenance, stale warning, total count — never unbounded
-results).
+`find_callers`, `find_callees`, `find_implementations`, `find_unresolved`,
+`trace_path`, `analyze_impact`, `project_overview`, `doctor`, and (gated)
+`reindex`. See
+`openspec/changes/archive/phase-4-mcp/specs/mcp-server/spec.md` for the
+per-tool contract and response envelope of the original twelve (§28.3:
+source paths, line ranges, confidence, provenance, stale warning, total
+count — never unbounded results). `find_unresolved` post-dates that archived
+spec; it returns the same envelope, minus `start_line`/`provenance`, which
+the `unresolved_references` table does not store.

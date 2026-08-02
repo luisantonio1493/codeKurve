@@ -12,8 +12,9 @@ use commands::CommandError;
 
 const USAGE: &str =
     "usage: codekurve <version|init|index|watch|mcp|tui|status|search|symbol|doctor|\
-references|callers|callees|implementations|trace|impact|install|uninstall> [args] \
+references|callers|callees|implementations|unresolved|trace|impact|install|uninstall> [args] \
 [--root <path>] [--debounce-ms <n>] [--client <name>] [--yes]\n\
+\x20      codekurve unresolved [<target-text>]  references the analyzer could not resolve, and why\n\
 \x20      codekurve tui                   interactive code-graph explorer\n\
 \x20      codekurve install [<client>]    configure every detected agent, or one by name\n\
 \x20      codekurve uninstall [<client>]  remove codekurve from agent configs\n\
@@ -72,6 +73,9 @@ fn main() -> ExitCode {
         "callers" => commands::callers(&query_args(&args)),
         "callees" => commands::callees(&query_args(&args)),
         "implementations" => commands::implementations(&query_args(&args)),
+        // Optional positional: `codekurve unresolved` alone lists the whole
+        // project, `codekurve unresolved <target-text>` filters to one target.
+        "unresolved" => commands::unresolved(&query_args(&args), args.positional(0)),
         "impact" => commands::impact(&query_args(&args)),
         "trace" => match args.positional(0) {
             Some(to) => commands::trace(&query_args(&args), to),

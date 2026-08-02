@@ -44,13 +44,29 @@ Each `codekurve mcp` process MUST resolve exactly one project root at startup, t
 
 ### Requirement: Tool Registry
 
-The server MUST register the following tools, each with a JSON Schema for its input: `project_status`, `search_symbols`, `get_symbol`, `find_references`, `find_callers`, `find_callees`, `find_implementations`, `trace_path`, `analyze_impact`, `project_overview`, `doctor`. `reindex` MUST be registered only when gated in (see the reindex gating requirement) (§28.2).
+The server MUST register the following tools, each with a JSON Schema for its input: `project_status`, `search_symbols`, `get_symbol`, `find_references`, `find_callers`, `find_callees`, `find_implementations`, `find_unresolved`, `trace_path`, `analyze_impact`, `project_overview`, `doctor`. `reindex` MUST be registered only when gated in (see the reindex gating requirement) (§28.2).
 
 #### Scenario: Client lists tools
 
 - GIVEN a real MCP client (e.g. Claude Code or Codex) connects to `codekurve mcp` with `reindex` disabled
 - WHEN the client requests the tool list
-- THEN it receives the eleven always-on tools with valid input schemas, and `reindex` is absent
+- THEN it receives the twelve always-on tools with valid input schemas, and `reindex` is absent
+
+### Requirement: find_unresolved Tool
+
+`find_unresolved` MUST return the project's `unresolved_references` rows — references the analyzer recorded but deliberately declined to resolve into edges — each carrying at minimum the source symbol id and qualified name (both nullable for file-level references), the source file's path, the relationship kind, the target text, the recorded `reason`, the confidence, and the candidate count. It MUST accept optional `target_text` (matched exactly), `symbol_id`/`symbol_name`, `limit`, and `offset`; with no filter it MUST list the whole project's unresolved references, bounded by the same caps the other query tools use. A project with no unresolved references MUST return an empty, non-error result. The tool MUST NOT create, infer, or imply a relationship edge for any row it returns.
+
+#### Scenario: Unresolvable external base type is explained
+
+- GIVEN a C# class whose base list names a type defined outside the indexed project, recorded as an unresolved reference because base class vs interface is undeterminable
+- WHEN `find_implementations` is called for that type and returns no rows, and `find_unresolved` is then called with the type's name as `target_text`
+- THEN `find_unresolved` returns the recorded row with its `reason`, and no `Implements` edge exists for it
+
+#### Scenario: Fully resolved project
+
+- GIVEN an indexed project with zero `unresolved_references` rows
+- WHEN `find_unresolved` is called with no filter
+- THEN the response is an empty result set with `total: 0`, not an error
 
 ### Requirement: project_status Tool
 

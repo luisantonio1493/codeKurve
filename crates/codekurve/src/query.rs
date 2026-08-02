@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use codekurve_core::{Config, SourceSpan};
-use codekurve_store::repo::{self, StoredRelationship, StoredSymbol};
+use codekurve_store::repo::{self, StoredRelationship, StoredSymbol, StoredUnresolved};
 use codekurve_store::{db, migrations, traverse, Connection};
 
 use crate::commands::{self, CommandError, QueryArgs};
@@ -288,6 +288,66 @@ pub fn relationship_row(r: &StoredRelationship) -> serde_json::Value {
         "start_column": r.start_column,
         "confidence": r.confidence,
         "provenance": r.provenance,
+    })
+}
+
+/// [`unresolved`]'s filter. Every field is optional — no filter at all lists
+/// the whole project's unresolved references, which is the common entry point
+/// ("what did the analyzer give up on?"). Not `QueryArgs`: that shape
+/// *requires* a subject symbol, and this query's whole point is that it works
+/// without one.
+pub struct UnresolvedFilter<'a> {
+    pub target_text: Option<&'a str>,
+    pub symbol_id: Option<&'a str>,
+    pub symbol_name: Option<&'a str>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+/// The references the analyzer recorded but refused to turn into edges, with
+/// the `reason` it recorded — same pagination/truncation semantics as
+/// [`relationships`]. Answers "`find_implementations` came back empty, but
+/// this class clearly implements something — what happened?".
+pub fn unresolved(
+    s: &Session,
+    filter: &UnresolvedFilter,
+) -> Result<Page<StoredUnresolved>, CommandError> {
+    let (conn, project_id) = s.indexed()?;
+    // Only resolve a subject symbol when one was actually named —
+    // `resolve_symbol` errors on (None, None), which is a legitimate call
+    // here (list everything), not a usage mistake.
+    let symbol_id = match (filter.symbol_id, filter.symbol_name) {
+        (None, None) => None,
+        (id, name) => Some(commands::resolve_symbol(conn, project_id, id, name)?),
+    };
+
+    let mut rows = repo::unresolved(conn, project_id, filter.target_text, symbol_id.as_deref())
+        .map_err(|e| CommandError::from(e.to_string()))?;
+    let total = rows.len();
+    commands::paginate(&mut rows, filter.limit, filter.offset);
+    let truncated = total > filter.offset.unwrap_or(0) + rows.len();
+    Ok(Page {
+        rows,
+        total,
+        truncated,
+    })
+}
+
+/// One §28.3 row for a [`StoredUnresolved`] — shared by the CLI's `--json`
+/// and the `codekurve_find_unresolved` MCP tool (unlike `relationship_json`,
+/// there is no pre-existing golden CLI shape to preserve, so one shape
+/// serves both). No `start_line`/`provenance`: `unresolved_references` stores
+/// neither (see [`StoredUnresolved`]); `path` locates the row instead.
+pub fn unresolved_row(u: &StoredUnresolved) -> serde_json::Value {
+    serde_json::json!({
+        "source_symbol_id": u.source_symbol_id,
+        "source_qualified_name": u.source_qualified_name,
+        "path": u.source_relative_path,
+        "kind": u.relationship_kind,
+        "target_text": u.target_text,
+        "reason": u.reason,
+        "confidence": u.confidence,
+        "candidate_count": u.candidate_count,
     })
 }
 

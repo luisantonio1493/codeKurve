@@ -34,6 +34,22 @@ The CLI MUST expose `references`, `callers`, `callees`, `implementations`, `trac
 - WHEN both the CLI command and the direct library call run against the same index
 - THEN they return the same structured result (same rows, confidence, provenance, truncation, total count)
 
+### Requirement: Unresolved References Command
+
+The CLI MUST expose `unresolved [<target-text>]`, supporting `--symbol-id`/`--symbol-name`, `--limit`, `--offset`, `--json`, and `--root`, listing the references the analyzer recorded but declined to resolve into edges, each with the `reason` it recorded. Unlike the six graph query commands it MUST NOT require a subject symbol: with no filter it lists the whole project, paginated. `<target-text>` MUST be matched exactly. Its query logic MUST live in the same reusable library layer, shared with the MCP `find_unresolved` tool. The command MUST NOT alter analyzer behaviour or synthesize an edge for any row it reports.
+
+#### Scenario: Unresolved reference reports its reason
+
+- GIVEN an indexed project containing a reference the analyzer could not resolve
+- WHEN `codekurve unresolved <target-text>` runs
+- THEN the matching row is printed with its source, target text, relationship kind, confidence, source path, and the recorded reason
+
+#### Scenario: Nothing unresolved
+
+- GIVEN an indexed project where every reference resolved
+- WHEN `codekurve unresolved` runs
+- THEN the command exits 0 with an empty result, not an error
+
 ### Requirement: Ambiguous Symbol Resolution Exits 6
 
 If a query targets a symbol by name and multiple symbols match, the command MUST exit code 6, list every candidate with its qualified name, and MUST NOT silently pick the first match (§27.4).

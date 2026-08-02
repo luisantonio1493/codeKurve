@@ -12,7 +12,11 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use assert_cmd::Command as AssertCommand;
 
 const A_TS: &str = "export function getEligibility(): boolean {\n  return true;\n}\n\nexport function callLocal(): boolean {\n  return getEligibility();\n}\n\nexport function unused(): void {}\n";
-const B_TS: &str = "export function callAmbiguous(): boolean {\n  return getEligibility();\n}\n";
+/// `callGhost` calls a symbol that exists nowhere in the project, so the
+/// analyzer records an `unresolved_references` row instead of an edge — the
+/// fixture's populated case for `find_unresolved`. It adds no `Calls` edge,
+/// so every other tool's expected counts are unchanged.
+const B_TS: &str = "export function callAmbiguous(): boolean {\n  return getEligibility();\n}\n\nexport function callGhost(): void {\n  missingThing();\n}\n";
 
 /// `init` + `index` via the real `codekurve` binary — same setup CLI golden
 /// tests use (`crates/codekurve-bin/tests/graph_queries.rs`), so the MCP
@@ -213,6 +217,7 @@ fn all_eight_tools_return_the_28_3_envelope() {
             "codekurve_find_callers",
             "codekurve_find_implementations",
             "codekurve_find_references",
+            "codekurve_find_unresolved",
             "codekurve_get_symbol",
             "codekurve_project_overview",
             "codekurve_project_status",
@@ -314,6 +319,41 @@ fn all_eight_tools_return_the_28_3_envelope() {
     let envelope = envelope_of(&result);
     assert_envelope_shape(&envelope);
     assert_eq!(envelope["result"].as_array().unwrap().len(), 0);
+
+    // find_unresolved: the row `find_callers`/`find_references` can never
+    // return, because the analyzer refused to guess an edge for it — the
+    // §28.3 envelope plus the recorded `reason`.
+    let result = session.call("codekurve_find_unresolved", serde_json::json!({}));
+    let envelope = envelope_of(&result);
+    assert_envelope_shape(&envelope);
+    let rows = envelope["result"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(envelope["total"], 1);
+    assert_eq!(rows[0]["target_text"], "missingThing");
+    assert_eq!(rows[0]["source_qualified_name"], "src/b.ts::callGhost");
+    for field in ["path", "kind", "reason", "confidence", "candidate_count"] {
+        assert!(
+            rows[0].get(field).is_some(),
+            "unresolved row missing {field:?}: {}",
+            rows[0]
+        );
+    }
+    assert!(rows[0]["reason"].as_str().unwrap().contains("no matching"));
+
+    // …and the exact-target filter, plus a miss returning an empty page
+    // rather than an error.
+    let result = session.call(
+        "codekurve_find_unresolved",
+        serde_json::json!({"target_text": "missingThing"}),
+    );
+    assert_eq!(envelope_of(&result)["result"].as_array().unwrap().len(), 1);
+    let result = session.call(
+        "codekurve_find_unresolved",
+        serde_json::json!({"target_text": "missing"}),
+    );
+    let envelope = envelope_of(&result);
+    assert_envelope_shape(&envelope);
+    assert_eq!(envelope["total"], 0);
 
     // trace_path
     let result = session.call(
