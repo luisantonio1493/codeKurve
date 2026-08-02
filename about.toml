@@ -5,6 +5,9 @@ accepted = [
     "BSD-2-Clause",
     "ISC",
     "Unicode-3.0",
+    # Zlib: permissive, OSI-approved, no copyleft or reciprocity. Entered
+    # the tree with ratatui (ADR 0011) via kasuari -> hashbrown -> foldhash.
+    "Zlib",
     "CC0-1.0",
     "MIT-0",
     "Unlicense",

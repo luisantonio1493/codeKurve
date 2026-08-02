@@ -1,0 +1,15 @@
+[package]
+name = "codekurve-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+codekurve = { path = "../codekurve" }
+codekurve-core = { path = "../codekurve-core" }
+ratatui = { workspace = true }
+crossterm = { workspace = true }

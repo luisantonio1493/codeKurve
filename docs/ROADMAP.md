@@ -15,6 +15,20 @@ each phase's CI must pass on Windows, macOS, and Linux before moving on.
 | 7 | Angular and .NET aware | **Complete** (merged to `main`) — heuristic recognition pass for Angular (DI, routing, decorators) and .NET (attribute + call-driven controllers, minimal APIs, DI, EF Core), all framework edges `Heuristic`-provenance and confidence-floored. See `openspec/changes/archive/2026-08-02-phase-7-angular-dotnet/verify-report.md` and `docs/FRAMEWORKS.md`. |
 | 8 | Pilot and evaluation | **In progress** — real-repo validation (one .NET, one Angular project) found and fixed 2 real bugs (an incremental-index foreign-key violation, unresolved symbol ids in `trace`/`impact` CLI output) that no fixture had caught. Index/query timing, memory footprint, and precision measured; still open: a large-repo memory measurement and the final continue/adjust/stop/scale-out decision. |
 
+## Beyond the plan
+
+Work that is **not** part of the master plan's phases 0–8. Listed here rather
+than folded into a phase row, so the plan's scope stays an honest record of
+what was designed up front versus what was added afterwards.
+
+- **Terminal UI (`codekurve tui` + the interactive `codekurve install`
+  picker)** — added on 2026-08-02, unplanned. A new leaf crate,
+  `crates/codekurve-tui`, rendering the existing `query`/`install` layers;
+  it introduces the workspace's first UI dependencies (`ratatui`,
+  `crossterm`, +401 KiB on the release binary) and serves humans, whereas
+  the plan's primary consumer is an agent over MCP. Justification, measured
+  cost, and the exit condition for removing it: `docs/adr/0011-ratatui-tui.md`.
+
 > **Public distribution note**: the repo is public and `v0.1.0` binaries are
 > published on GitHub Releases (see [Installation](../README.md#installation)).
 > Licensing (previously unresolved) is now MIT — see `docs/LICENSING.md`.

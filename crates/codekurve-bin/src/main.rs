@@ -2,6 +2,7 @@
 
 mod cli;
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -9,9 +10,11 @@ use cli::Args;
 use codekurve::{commands, install, watch};
 use commands::CommandError;
 
-const USAGE: &str = "usage: codekurve <version|init|index|watch|mcp|status|search|symbol|doctor|\
+const USAGE: &str =
+    "usage: codekurve <version|init|index|watch|mcp|tui|status|search|symbol|doctor|\
 references|callers|callees|implementations|trace|impact|install|uninstall> [args] \
 [--root <path>] [--debounce-ms <n>] [--client <name>] [--yes]\n\
+\x20      codekurve tui                   interactive code-graph explorer\n\
 \x20      codekurve install [<client>]    configure every detected agent, or one by name\n\
 \x20      codekurve uninstall [<client>]  remove codekurve from agent configs\n\
 \x20      codekurve version | -v | --version";
@@ -33,6 +36,7 @@ fn main() -> ExitCode {
         "index" => commands::index(&args.root).map_err(CommandError::from),
         "watch" => watch::run(&args.root, args.debounce_ms).map_err(CommandError::from),
         "mcp" => codekurve_mcp::run(&args.root).map_err(CommandError::from),
+        "tui" => codekurve_tui::run_explorer(&args.root),
         "status" => commands::status(&args.root, args.json).map_err(CommandError::from),
         "search" => match args.positional(0) {
             Some(query) => commands::search(&args.root, query).map_err(CommandError::from),
@@ -49,7 +53,16 @@ fn main() -> ExitCode {
         "doctor" => commands::doctor(&args.root).map_err(CommandError::from),
         "install" => {
             let client = args.positional(0).or(args.client.as_deref());
-            install::run(&args.root, client, args.yes).map_err(CommandError::from)
+            // The checkbox picker is strictly an upgrade of the `[y/N]`
+            // prompt, so it appears under exactly the conditions that prompt
+            // appeared under: no client named, `--yes` absent, and a real
+            // terminal on stdin. Scripted, piped and agent-driven installs
+            // keep taking the identical non-interactive path.
+            if client.is_none() && !args.yes && std::io::stdin().is_terminal() {
+                codekurve_tui::run_picker(&args.root).map_err(CommandError::from)
+            } else {
+                install::run(&args.root, client, args.yes).map_err(CommandError::from)
+            }
         }
         "uninstall" => {
             let client = args.positional(0).or(args.client.as_deref());

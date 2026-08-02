@@ -16,6 +16,7 @@ path = "src/main.rs"
 codekurve = { path = "../codekurve" }
 codekurve-core = { path = "../codekurve-core" }
 codekurve-mcp = { path = "../codekurve-mcp" }
+codekurve-tui = { path = "../codekurve-tui" }
 
 [dev-dependencies]
 assert_cmd = "2"

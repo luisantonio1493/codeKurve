@@ -25,6 +25,10 @@ allow = [
     "ISC",
     "Unicode-3.0",
     "CC0-1.0",
+    # reason: Zlib — permissive, OSI-approved, no copyleft/reciprocity.
+    # Pulled in by `foldhash` (ratatui -> kasuari -> hashbrown, ADR 0011).
+    # Revisit only if the TUI dependency itself is dropped.
+    "Zlib",
 ]
 
 [bans]

@@ -16,3 +16,9 @@ rmcp = "=2.2.0"
 tokio = "1"
 schemars = "1"
 serde_json = "1"
+# TUI (ADR 0011). `default-features = false` drops the calendar widget, the
+# `macros` helpers and the layout cache we never use; `crossterm_0_29` pins
+# ratatui's backend to the same crossterm generation this workspace depends
+# on directly, so only one crossterm ends up in the tree.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
+crossterm = "0.29"

@@ -74,14 +74,22 @@ cargo build --release -p codekurve-bin
 
 Or run `codekurve install` with no arguments: it detects every MCP client
 installed on the machine (`claude-code` / `cursor` / `codex-cli` / `copilot` /
-`opencode`), prints the plan (which agents, which config paths), and writes
-the configs below after a `[y/N]` confirmation — backing up any existing file
-first. Detection is filesystem probing only (`~/.claude`, `~/.cursor`,
-`$CODEX_HOME` or `~/.codex`, VS Code's user dir, `~/.config/opencode` or
-`~/.opencode`); CodeKurve never shells out to check.
+`opencode`) and writes the configs below, backing up any existing file first.
+Detection is filesystem probing only (`~/.claude`, `~/.cursor`, `$CODEX_HOME`
+or `~/.codex`, VS Code's user dir, `~/.config/opencode` or `~/.opencode`);
+CodeKurve never shells out to check.
 
-Pass `--yes` to skip the prompt; it is also skipped automatically when stdin
-is not a terminal, so scripted and agent-driven installs never hang.
+In an interactive terminal this opens a checkbox picker: detected agents
+start checked, undetected ones are shown greyed out and cannot be selected,
+`space` toggles, `↵` installs the checked set, and `q`/`Esc` cancels without
+writing anything.
+
+**Agents: this picker will never block you.** It appears only when there is
+no client argument, `--yes` was not passed, *and* stdin is a terminal — the
+same conditions the old `[y/N]` prompt appeared under. Pass `--yes`, run with
+a non-terminal stdin, or name a client (`codekurve install claude-code`) and
+the non-interactive path runs unchanged: it prints the plan and writes the
+configs with no prompt and no screen.
 
 `codekurve install <client>` still targets a single client directly, with no
 prompt.
@@ -177,6 +185,24 @@ holding the binary *and* its arguments (no separate `args` key), and
 Every client will send `initialize`, then `tools/list`, then `tools/call`
 for whichever tool it needs. `reindex` only shows up in `tools/list` when
 `[mcp] allow_reindex = true` is set in the project's config (off by default).
+
+## `codekurve tui` — for the human, not for you
+
+`codekurve tui [--root <path>]` opens an interactive explorer over the same
+index: a live search box, the hits on the left, and the selected symbol's
+`references` plus (on `i`) its impact set on the right, with `↵` walking to a
+related symbol and `Esc` walking back.
+
+It reads through the identical `query::search` / `get_symbol` /
+`relationships` / `impact` calls the MCP tools use, so it never shows
+anything the tools would not — including the same stale-index warning and the
+same "run `codekurve index` first" refusal (exit code 4).
+
+**Agents should not run it.** It takes over the terminal (raw mode,
+alternate screen) and only exits on a keypress; there is no `--json` and no
+non-interactive mode. Use the MCP tools, or the plain CLI commands, for
+anything scripted. Recommend it to a human who is exploring an unfamiliar
+area of the codebase interactively.
 
 ## Tool registry
 

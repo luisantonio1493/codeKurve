@@ -51,11 +51,54 @@ codekurve init
 codekurve index
 codekurve search <query>
 codekurve callers <symbol>
+codekurve tui
 codekurve mcp
 ```
 
 Full command surface and flags: `docs/ROADMAP.md`; CLI conventions: the plan
 §27.1.
+
+## Interactive explorer
+
+`codekurve tui [--root <path>]` opens a terminal UI over the same index the
+CLI and the MCP server read — type to search, arrow through the hits, and
+walk the graph without re-running a command per hop.
+
+```text
+┌ codekurve ────────────────────────────────────────────────────┐
+│search: TodoItem█                                              │
+└───────────────────────────────────────────────────────────────┘
+┌ symbols (9) ────────┐┌ TodoItem (class) ───────────────────────┐
+│  Title  property    ││Source/Models/TodoItem.cs:5              │
+│> TodoItem  class    ││                                         │
+│  User  property     ││references (4)                           │
+│  UserId  property   ││ ← MinimalApi.Data.TodoDbContext  persist│
+│                     ││ ← MinimalApi.TodoApi.CreateTodoItem  con│
+└─────────────────────┘└─────────────────────────────────────────┘
+ ↑↓ move  ↵ open  i impact  esc back  / search  q quit
+```
+
+| key | action |
+|---|---|
+| type / `Backspace` | edit the search box (results update live) |
+| `↑` `↓` | move the selection in the focused list |
+| `↵` | search box → relationship list; on a relationship row, open that symbol |
+| `Tab` / `→` / `←` | move focus between the results and relationship lists |
+| `Esc` / `Backspace` | go back one symbol; with an empty history, return to the search box |
+| `i` | toggle the impact view (reached nodes and depth) for the selected symbol |
+| `/` | jump back to the search box |
+| `q` | quit (outside the search box, where `q` is just a character) |
+| `Ctrl-C` | quit from anywhere |
+
+The right panel lists **references**, not callers, so framework edges
+(`Injects`, `HandlesRoute`, `RegisteredAs`, …) appear — see
+`docs/AGENT_USAGE.md`. A stale index is shown as a warning line rather than
+being silently ignored, and a project with no index refuses to open with the
+same message the CLI gives.
+
+Requires a real terminal; it is not part of the MCP surface, and no
+non-interactive command's behaviour changed. Rationale and dependency
+justification: [`docs/adr/0011-ratatui-tui.md`](docs/adr/0011-ratatui-tui.md).
 
 ## Supported languages
 
@@ -79,9 +122,29 @@ limitations: [docs/FRAMEWORKS.md](docs/FRAMEWORKS.md).
 
 Quick start: `codekurve install` detects every MCP client installed on the
 machine (`claude-code`, `cursor`, `codex-cli`, `copilot` (VS Code),
-`opencode`), prints what it will write, and configures them after a `[y/N]`
-confirmation — pass `--yes` (or run it non-interactively) to skip the prompt.
-Detection is filesystem probing only; CodeKurve never shells out.
+`opencode`) and configures the ones you pick. Detection is filesystem
+probing only; CodeKurve never shells out.
+
+In a terminal it opens a checkbox picker — detected agents start checked,
+undetected ones are listed greyed out and cannot be selected (use
+`codekurve install <client>` to force one):
+
+```text
+┌ codekurve install ──────────────────────────────────────┐
+│ Detected agents:                                        │
+│                                                         │
+│ > [x] claude-code   .mcp.json                           │
+│   [x] cursor        .cursor/mcp.json                    │
+│   [ ] codex-cli     ~/.codex/config.toml (not detected) │
+│   [ ] copilot       .vscode/mcp.json     (not detected) │
+│   [x] opencode      opencode.json                       │
+└─────────────────────────────────────────────────────────┘
+ space toggle  ↵ install  q cancel
+```
+
+`space` toggles, `↵` installs the checked set, `q`/`Esc` cancels without
+writing anything. Pass `--yes`, pipe stdin, or name a client and the picker
+never appears — those paths print the plan and behave exactly as before.
 
 To target one client instead, name it: `codekurve install <client>`.
 `codekurve uninstall [<client>]` reverses it, removing only the `codekurve`

@@ -251,16 +251,78 @@ fn resolve_config_path(client: Client, root: &Path) -> Result<PathBuf, String> {
     }
 }
 
+fn current_exe() -> Result<PathBuf, String> {
+    std::env::current_exe()
+        .and_then(|p| p.canonicalize())
+        .map_err(|e| format!("failed to resolve codekurve binary path: {e}"))
+}
+
+fn canonical_root(root: &Path) -> Result<PathBuf, String> {
+    root.canonicalize()
+        .map_err(|e| format!("failed to resolve --root: {e}"))
+}
+
+/// One supported client's row in the no-arg install plan: its name, where
+/// its config would be written, and whether the machine actually has it.
+///
+/// Public so `codekurve-tui`'s interactive picker can render the same plan
+/// `install_detected` prints without re-deriving detection signals or
+/// config-path layout — that knowledge stays in this module (ADR 0011).
+#[derive(Debug, Clone)]
+pub struct ClientPlan {
+    pub name: &'static str,
+    pub config_path: PathBuf,
+    pub scope: &'static str,
+    pub detected: bool,
+}
+
+/// Every supported client (detected or not) with its resolved config path —
+/// the picker's row source. Detection is the same filesystem probe
+/// [`install_detected`] uses.
+pub fn plan(root: &Path) -> Result<Vec<ClientPlan>, String> {
+    let root = canonical_root(root)?;
+    let home = home_dir()?;
+    Client::ALL
+        .into_iter()
+        .map(|client| {
+            Ok(ClientPlan {
+                name: client.name(),
+                config_path: resolve_config_path(client, &root)?,
+                scope: client.scope(),
+                detected: client.is_installed(&home),
+            })
+        })
+        .collect()
+}
+
+/// Configure exactly the named clients — the set the interactive picker
+/// checked. Goes through the same writers as `install [<client>]`, so there
+/// is one implementation of every config shape. An unknown name is an error,
+/// never a silent skip.
+pub fn install_named(root: &Path, names: &[&str]) -> Result<(), String> {
+    if names.is_empty() {
+        println!("no agents selected; no changes made.");
+        return Ok(());
+    }
+    let exe = current_exe()?;
+    let root = canonical_root(root)?;
+
+    let mut targets = Vec::new();
+    for name in names {
+        let client = Client::parse(name).ok_or_else(|| {
+            format!("unsupported client \"{name}\"\nsupported clients: {SUPPORTED_CLIENTS}")
+        })?;
+        targets.push((client, resolve_config_path(client, &root)?));
+    }
+    apply(&exe, &root, &targets)
+}
+
 /// `codekurve install [<client>] [--root <path>] [--yes]`. Without a client
 /// name, every detected agent (see the module doc's signals table) is
 /// configured after a `[y/N]` confirmation.
 pub fn run(root: &Path, client: Option<&str>, yes: bool) -> Result<(), String> {
-    let exe = std::env::current_exe()
-        .and_then(|p| p.canonicalize())
-        .map_err(|e| format!("failed to resolve codekurve binary path: {e}"))?;
-    let root = root
-        .canonicalize()
-        .map_err(|e| format!("failed to resolve --root: {e}"))?;
+    let exe = current_exe()?;
+    let root = canonical_root(root)?;
 
     let Some(client_name) = client else {
         return install_detected(&exe, &root, yes);
@@ -332,8 +394,15 @@ fn install_detected(exe: &Path, root: &Path, yes: bool) -> Result<(), String> {
         return Ok(());
     }
 
+    apply(exe, root, &targets)
+}
+
+/// The write loop shared by no-arg `install` and [`install_named`] (the
+/// picker's checked set): one client per line, a partial failure reported
+/// rather than aborting the rest.
+fn apply(exe: &Path, root: &Path, targets: &[(Client, PathBuf)]) -> Result<(), String> {
     let mut failures = Vec::new();
-    for (client, path) in &targets {
+    for (client, path) in targets {
         match install_one(*client, path, exe, root) {
             Ok(()) => println!("configured {} -> {}", client.name(), path.display()),
             Err(e) => {
