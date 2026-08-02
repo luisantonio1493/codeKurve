@@ -72,7 +72,13 @@ const ADD_LIFETIMES: &[(&str, &str)] = &[
 // ponytail: a representative closed list of the standard typed registration
 // APIs, not an exhaustive one — same published bound as
 // `MIDDLEWARE_USE_NAMES`; extend it if a real fixture needs one more entry.
-const TYPED_FEATURE_ADD_NAMES: &[&str] = &[
+//
+// Not `*_ADD_NAMES`: `UseStartup<T>` is the same *shape* (the type argument
+// names a project class) despite the `Use` prefix, so the list is keyed on
+// shape, not on the verb. It stays separate from `UseMiddleware`, which is
+// also typed but is semantically middleware and carries the middleware
+// `reason` — folding the two would relabel existing edges.
+const TYPED_FEATURE_NAMES: &[&str] = &[
     "AddDbContext",
     "AddDbContextFactory",
     "AddDbContextPool",
@@ -83,6 +89,11 @@ const TYPED_FEATURE_ADD_NAMES: &[&str] = &[
     "AddDocumentTransformer",
     "AddOperationTransformer",
     "AddSchemaTransformer",
+    // Classic (pre-minimal-API) host builder: `.UseStartup<Startup>()` names
+    // the project's own startup class. Found on a production ASP.NET Core
+    // app that predates the minimal-API style the rest of this list was
+    // surveyed from.
+    "UseStartup",
 ];
 
 /// Closed exact-name list of ASP.NET Core feature registrations that take no
@@ -110,6 +121,7 @@ const BARE_FEATURE_ADD_NAMES: &[&str] = &[
     "AddHttpContextAccessor",
     "AddMemoryCache",
     "AddMvc",
+    "AddMvcCore",
     "AddOpenApi",
     "AddOutputCache",
     "AddProblemDetails",
@@ -152,6 +164,11 @@ const MIDDLEWARE_USE_NAMES: &[&str] = &[
     "UseWebSockets",
     "UseAntiforgery",
     "UseHsts",
+    // Classic (pre-minimal-API) pipeline, still in production use — both
+    // observed on a real ASP.NET Core app whose style predates the rest of
+    // this list.
+    "UseMvc",
+    "UseIdentityServer",
 ];
 
 /// One resolved `invocation_expression`'s callee name, its type-argument
@@ -270,7 +287,7 @@ fn recognize_call(node: Node, source: &[u8], analysis: &mut FileAnalysis, source
         recognize_add_call(node, source, analysis, source_key, lifetime, &info);
         return;
     }
-    if TYPED_FEATURE_ADD_NAMES.contains(&info.name.as_str()) {
+    if TYPED_FEATURE_NAMES.contains(&info.name.as_str()) {
         // Same shape as the `UseMiddleware<T>` branch below: the type
         // argument *is* the registered type. No type argument = a bare
         // framework-service overload, which names no project type — emit
@@ -1443,6 +1460,47 @@ builder.Services.AddHostedService<CleanupWorker>();
             Some("key:feature:AddHostedService")
         );
         assert_eq!(worker.confidence, Confidence::High);
+    }
+
+    /// The classic (pre-minimal-API) host builder, still in production. Taken
+    /// from a real 350-file ASP.NET Core app: `UseStartup<Startup>` names a
+    /// project class exactly like the `Add*` typed registrations do, and
+    /// `UseMvc`/`AddMvcCore` are that app's pipeline, invisible to a catalogue
+    /// surveyed only from minimal-API code.
+    #[test]
+    fn classic_host_builder_registrations_are_recognized() {
+        let source = r#"
+public class Program {
+    public static void Main(string[] args) {
+        WebHost.CreateDefaultBuilder(args).UseStartup<Startup>().Build().Run();
+    }
+}
+"#;
+        let analysis = analyze_program(source);
+        let regs = call_driven_rel(&analysis, RelationshipKind::RegisteredAs);
+        let startup = regs
+            .iter()
+            .find(|r| r.target == EdgeTarget::Unresolved("Startup".to_string()))
+            .expect("expected the UseStartup edge");
+        assert_eq!(startup.reason.as_deref(), Some("key:feature:UseStartup"));
+        assert_eq!(startup.confidence, Confidence::High);
+        assert_eq!(startup.provenance, Provenance::Heuristic);
+
+        // `UseMvc`/`AddMvcCore` are middleware/bare-feature shapes: recognized,
+        // but their target is a framework feature, not a project type.
+        let classic = analyze_program(
+            r#"
+var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddMvcCore();
+app.UseMvc();
+"#,
+        );
+        let names: Vec<_> = call_driven_rel(&classic, RelationshipKind::RegisteredAs)
+            .iter()
+            .map(|r| r.target.clone())
+            .collect();
+        assert!(names.contains(&EdgeTarget::Unresolved("MvcCore".to_string())));
+        assert!(names.contains(&EdgeTarget::Unresolved("Mvc".to_string())));
     }
 
     #[test]
