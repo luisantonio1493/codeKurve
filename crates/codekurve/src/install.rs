@@ -42,6 +42,28 @@
 //! PR5a therefore does NOT share one entry shape across both clients (the
 //! design's sketch did) — each client gets the exact shape its own live
 //! config already uses.
+//!
+//! ## Verified GitHub Copilot (VS Code): `.vscode/mcp.json`, `"servers"` key
+//!
+//! Checked against this machine's real `~/Library/Application Support/Code/
+//! User/mcp.json` (VS Code's *user*-scope MCP config, populated by VS Code
+//! itself for other servers): top-level key is `"servers"` (not
+//! `"mcpServers"`), entries carry `command`/`args`/`type: "stdio"` for local
+//! servers. Project scope uses the same shape at `.vscode/mcp.json` in the
+//! workspace root (VS Code's own documented per-project MCP config file) —
+//! chosen here to match Claude Code/Cursor's project-scope convention.
+//!
+//! ## Verified OpenCode: `opencode.json`, `"mcp"` key, `command` is ONE array
+//!
+//! Checked against this machine's real `~/.config/opencode/opencode.json`
+//! (OpenCode's user-scope config) and cross-checked against OpenCode's
+//! published schema (`https://opencode.ai/config.json`,
+//! `$defs.McpLocalConfig`): top-level key is `"mcp"`, and unlike every other
+//! client here, a local server's `command` is a **single array** combining
+//! the binary and its arguments (e.g. `["/path/to/codekurve", "mcp",
+//! "--root", "/path"]`) — there is no separate `args` key. `type: "local"`
+//! is required. Project scope uses the same `Config` schema at
+//! `opencode.json` in the project root.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -53,6 +75,8 @@ pub enum Client {
     ClaudeCode,
     Cursor,
     Codex,
+    Copilot,
+    OpenCode,
 }
 
 impl Client {
@@ -61,35 +85,41 @@ impl Client {
             "claude-code" => Some(Self::ClaudeCode),
             "cursor" => Some(Self::Cursor),
             "codex-cli" => Some(Self::Codex),
+            "copilot" => Some(Self::Copilot),
+            "opencode" => Some(Self::OpenCode),
             _ => None,
         }
     }
 
-    /// Client-relative config path (project scope for Claude Code/Cursor;
-    /// Codex has no project-scoped config — see `codex_config_path`).
+    /// Client-relative config path (project scope for every client here
+    /// except Codex, which has no project-scoped config — see
+    /// `codex_config_path`).
     fn config_path(&self, root: &Path) -> PathBuf {
         match self {
             Self::ClaudeCode => root.join(".mcp.json"),
             Self::Cursor => root.join(".cursor").join("mcp.json"),
+            Self::Copilot => root.join(".vscode").join("mcp.json"),
+            Self::OpenCode => root.join("opencode.json"),
             Self::Codex => unreachable!("Codex path is resolved via codex_config_path"),
         }
     }
 
     /// `true` for clients whose live config carries a `"type": "stdio"` key
-    /// (Claude Code, verified above); Cursor's live config carries none.
+    /// (Claude Code and Copilot, both verified above); Cursor's live config
+    /// carries none.
     fn includes_stdio_type(&self) -> bool {
-        matches!(self, Self::ClaudeCode)
+        matches!(self, Self::ClaudeCode | Self::Copilot)
     }
 
     fn scope(&self) -> &'static str {
         match self {
-            Self::ClaudeCode | Self::Cursor => "project scope",
+            Self::ClaudeCode | Self::Cursor | Self::Copilot | Self::OpenCode => "project scope",
             Self::Codex => "user scope",
         }
     }
 }
 
-const SUPPORTED_CLIENTS: &str = "claude-code, cursor, codex-cli";
+const SUPPORTED_CLIENTS: &str = "claude-code, cursor, codex-cli, copilot, opencode";
 
 fn manual_instructions(exe: &str, root: &str) -> String {
     format!(
@@ -100,7 +130,13 @@ fn manual_instructions(exe: &str, root: &str) -> String {
          to configure Codex CLI manually, add this table to config.toml:\n\
          [mcp_servers.codekurve]\n\
          command = \"{exe}\"\n\
-         args = [\"mcp\", \"--root\", \"{root}\"]"
+         args = [\"mcp\", \"--root\", \"{root}\"]\n\
+         to configure GitHub Copilot (VS Code) manually, add this entry to \
+         .vscode/mcp.json under \"servers\":\n\
+         \"codekurve\": {{\"command\": \"{exe}\", \"args\": [\"mcp\", \"--root\", \"{root}\"], \"type\": \"stdio\"}}\n\
+         to configure OpenCode manually, add this entry to opencode.json \
+         under \"mcp\":\n\
+         \"codekurve\": {{\"type\": \"local\", \"command\": [\"{exe}\", \"mcp\", \"--root\", \"{root}\"]}}"
     )
 }
 
@@ -146,7 +182,15 @@ pub fn run(root: &Path, client: Option<&str>) -> Result<(), String> {
     };
     match client {
         Client::Codex => write_codex_toml(&config_path, &exe, &root)?,
-        _ => write_json_client(&config_path, &exe, &root, client.includes_stdio_type())?,
+        Client::OpenCode => write_opencode_json(&config_path, &exe, &root)?,
+        Client::Copilot => write_json_client(&config_path, &exe, &root, "servers", true)?,
+        _ => write_json_client(
+            &config_path,
+            &exe,
+            &root,
+            "mcpServers",
+            client.includes_stdio_type(),
+        )?,
     }
     println!(
         "installed codekurve MCP server into {} ({})",
@@ -176,14 +220,17 @@ fn server_entry(exe: &Path, root: &Path, include_type: bool) -> Value {
     Value::Object(entry)
 }
 
-/// Reads (or starts fresh), merges the `codekurve` entry into `mcpServers`
-/// without disturbing sibling entries, backs up any pre-existing file, then
-/// writes. Rule 4 (design): an unparseable file, or an `mcpServers` key
-/// present but not an object, aborts with no write at all.
+/// Reads (or starts fresh), merges the `codekurve` entry into the top-level
+/// `servers_key` object (`"mcpServers"` for Claude Code/Cursor, `"servers"`
+/// for Copilot/VS Code) without disturbing sibling entries, backs up any
+/// pre-existing file, then writes. Rule 4 (design): an unparseable file, or
+/// a `servers_key` key present but not an object, aborts with no write at
+/// all.
 fn write_json_client(
     path: &Path,
     exe: &Path,
     root: &Path,
+    servers_key: &str,
     include_type: bool,
 ) -> Result<(), String> {
     let existing_bytes = fs::read(path).ok();
@@ -196,7 +243,7 @@ fn write_json_client(
                 format!(
                     "{} is not valid JSON ({e}); no changes made.\n{}",
                     path.display(),
-                    manual_snippet(exe, root, include_type)
+                    manual_snippet(exe, root, servers_key, include_type)
                 )
             })?;
             match parsed {
@@ -205,24 +252,24 @@ fn write_json_client(
                     return Err(format!(
                         "{} does not contain a JSON object at the top level; no changes made.\n{}",
                         path.display(),
-                        manual_snippet(exe, root, include_type)
+                        manual_snippet(exe, root, servers_key, include_type)
                     ));
                 }
             }
         }
     };
 
-    let servers = match doc.get_mut("mcpServers") {
+    let servers = match doc.get_mut(servers_key) {
         None => {
-            doc.insert("mcpServers".to_string(), Value::Object(Map::new()));
-            doc.get_mut("mcpServers").unwrap().as_object_mut().unwrap()
+            doc.insert(servers_key.to_string(), Value::Object(Map::new()));
+            doc.get_mut(servers_key).unwrap().as_object_mut().unwrap()
         }
-        Some(Value::Object(_)) => doc.get_mut("mcpServers").unwrap().as_object_mut().unwrap(),
+        Some(Value::Object(_)) => doc.get_mut(servers_key).unwrap().as_object_mut().unwrap(),
         Some(_) => {
             return Err(format!(
-                "{} has a \"mcpServers\" key that is not an object; no changes made.\n{}",
+                "{} has a \"{servers_key}\" key that is not an object; no changes made.\n{}",
                 path.display(),
-                manual_snippet(exe, root, include_type)
+                manual_snippet(exe, root, servers_key, include_type)
             ));
         }
     };
@@ -242,10 +289,93 @@ fn write_json_client(
     fs::write(path, out).map_err(|e| e.to_string())
 }
 
-fn manual_snippet(exe: &Path, root: &Path, include_type: bool) -> String {
+fn manual_snippet(exe: &Path, root: &Path, servers_key: &str, include_type: bool) -> String {
     let entry = server_entry(exe, root, include_type);
     format!(
-        "add this entry to the file's \"mcpServers\" object manually:\n\"codekurve\": {}",
+        "add this entry to the file's \"{servers_key}\" object manually:\n\"codekurve\": {}",
+        serde_json::to_string_pretty(&entry).unwrap_or_default()
+    )
+}
+
+/// Reads (or starts fresh), merges the `codekurve` entry into OpenCode's
+/// top-level `"mcp"` object, backs up any pre-existing file, then writes.
+/// OpenCode's `McpLocalConfig` shape (verified against
+/// `https://opencode.ai/config.json`) differs from every other client here:
+/// `command` is one array holding the binary *and* its arguments, there is
+/// no separate `args` key, and `type: "local"` is required.
+fn write_opencode_json(path: &Path, exe: &Path, root: &Path) -> Result<(), String> {
+    let existing_bytes = fs::read(path).ok();
+
+    let mut doc: Map<String, Value> = match &existing_bytes {
+        None => Map::new(),
+        Some(bytes) => {
+            let text = String::from_utf8_lossy(bytes);
+            let parsed: Value = serde_json::from_str(&text).map_err(|e| {
+                format!(
+                    "{} is not valid JSON ({e}); no changes made.\n{}",
+                    path.display(),
+                    manual_snippet_opencode(exe, root)
+                )
+            })?;
+            match parsed {
+                Value::Object(map) => map,
+                _ => {
+                    return Err(format!(
+                        "{} does not contain a JSON object at the top level; no changes made.\n{}",
+                        path.display(),
+                        manual_snippet_opencode(exe, root)
+                    ));
+                }
+            }
+        }
+    };
+
+    let servers = match doc.get_mut("mcp") {
+        None => {
+            doc.insert("mcp".to_string(), Value::Object(Map::new()));
+            doc.get_mut("mcp").unwrap().as_object_mut().unwrap()
+        }
+        Some(Value::Object(_)) => doc.get_mut("mcp").unwrap().as_object_mut().unwrap(),
+        Some(_) => {
+            return Err(format!(
+                "{} has a \"mcp\" key that is not an object; no changes made.\n{}",
+                path.display(),
+                manual_snippet_opencode(exe, root)
+            ));
+        }
+    };
+    servers.insert("codekurve".to_string(), opencode_entry(exe, root));
+
+    if let Some(bytes) = &existing_bytes {
+        backup(path, bytes)?;
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let out = serde_json::to_string_pretty(&Value::Object(doc)).map_err(|e| e.to_string())?;
+    fs::write(path, out).map_err(|e| e.to_string())
+}
+
+fn opencode_entry(exe: &Path, root: &Path) -> Value {
+    let mut entry = Map::new();
+    entry.insert("type".to_string(), Value::String("local".to_string()));
+    entry.insert(
+        "command".to_string(),
+        Value::Array(vec![
+            Value::String(exe.to_string_lossy().into_owned()),
+            Value::String("mcp".to_string()),
+            Value::String("--root".to_string()),
+            Value::String(root.to_string_lossy().into_owned()),
+        ]),
+    );
+    Value::Object(entry)
+}
+
+fn manual_snippet_opencode(exe: &Path, root: &Path) -> String {
+    let entry = opencode_entry(exe, root);
+    format!(
+        "add this entry to the file's \"mcp\" object manually:\n\"codekurve\": {}",
         serde_json::to_string_pretty(&entry).unwrap_or_default()
     )
 }
@@ -341,7 +471,7 @@ mod tests {
     fn missing_file_is_created_no_backup() {
         let dir = tempdir().unwrap();
         let path = dir.path().join(".mcp.json");
-        write_json_client(&path, &exe(), &root(), true).unwrap();
+        write_json_client(&path, &exe(), &root(), "mcpServers", true).unwrap();
 
         let text = fs::read_to_string(&path).unwrap();
         let value: Value = serde_json::from_str(&text).unwrap();
@@ -360,7 +490,7 @@ mod tests {
         let original = r#"{"mcpServers":{"other":{"command":"foo"}}}"#;
         fs::write(&path, original).unwrap();
 
-        write_json_client(&path, &exe(), &root(), true).unwrap();
+        write_json_client(&path, &exe(), &root(), "mcpServers", true).unwrap();
 
         let text = fs::read_to_string(&path).unwrap();
         let value: Value = serde_json::from_str(&text).unwrap();
@@ -375,8 +505,8 @@ mod tests {
     fn install_twice_is_idempotent() {
         let dir = tempdir().unwrap();
         let path = dir.path().join(".mcp.json");
-        write_json_client(&path, &exe(), &root(), true).unwrap();
-        write_json_client(&path, &exe(), &root(), true).unwrap();
+        write_json_client(&path, &exe(), &root(), "mcpServers", true).unwrap();
+        write_json_client(&path, &exe(), &root(), "mcpServers", true).unwrap();
 
         let text = fs::read_to_string(&path).unwrap();
         let value: Value = serde_json::from_str(&text).unwrap();
@@ -387,7 +517,7 @@ mod tests {
     fn cursor_entry_has_no_type_key() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("mcp.json");
-        write_json_client(&path, &exe(), &root(), false).unwrap();
+        write_json_client(&path, &exe(), &root(), "mcpServers", false).unwrap();
 
         let text = fs::read_to_string(&path).unwrap();
         let value: Value = serde_json::from_str(&text).unwrap();
@@ -401,7 +531,7 @@ mod tests {
         let original = "{ not valid json";
         fs::write(&path, original).unwrap();
 
-        let err = write_json_client(&path, &exe(), &root(), true).unwrap_err();
+        let err = write_json_client(&path, &exe(), &root(), "mcpServers", true).unwrap_err();
         assert!(err.contains("not valid JSON"));
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
         assert!(!path.with_extension("json.bak").exists());
@@ -414,7 +544,7 @@ mod tests {
         let original = r#"{"mcpServers": "not-an-object"}"#;
         fs::write(&path, original).unwrap();
 
-        let err = write_json_client(&path, &exe(), &root(), true).unwrap_err();
+        let err = write_json_client(&path, &exe(), &root(), "mcpServers", true).unwrap_err();
         assert!(err.contains("not an object"));
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
@@ -440,6 +570,47 @@ mod tests {
         let dir = tempdir().unwrap();
         run(dir.path(), Some("claude-code")).unwrap();
         assert!(dir.path().join(".mcp.json").exists());
+    }
+
+    #[test]
+    fn copilot_config_lands_under_dot_vscode_dir_under_servers_key() {
+        let dir = tempdir().unwrap();
+        run(dir.path(), Some("copilot")).unwrap();
+        let path = dir.path().join(".vscode").join("mcp.json");
+        assert!(path.exists());
+        let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["servers"]["codekurve"]["type"], "stdio");
+        assert!(value.get("mcpServers").is_none());
+    }
+
+    #[test]
+    fn opencode_config_lands_at_root_with_single_command_array() {
+        let dir = tempdir().unwrap();
+        run(dir.path(), Some("opencode")).unwrap();
+        let path = dir.path().join("opencode.json");
+        assert!(path.exists());
+        let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["mcp"]["codekurve"]["type"], "local");
+        let command = value["mcp"]["codekurve"]["command"].as_array().unwrap();
+        assert_eq!(command[1], "mcp");
+        assert_eq!(command[2], "--root");
+        assert!(value["mcp"]["codekurve"].get("args").is_none());
+    }
+
+    #[test]
+    fn opencode_preserves_foreign_mcp_entries_and_backs_up() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("opencode.json");
+        let original = r#"{"mcp":{"other":{"type":"remote","url":"https://example.com"}}}"#;
+        fs::write(&path, original).unwrap();
+
+        write_opencode_json(&path, &exe(), &root()).unwrap();
+
+        let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["mcp"]["other"]["type"], "remote");
+        assert_eq!(value["mcp"]["codekurve"]["type"], "local");
+        let bak_path = path.with_extension("json.bak");
+        assert_eq!(fs::read_to_string(&bak_path).unwrap(), original);
     }
 
     #[test]

@@ -58,9 +58,9 @@ cargo build --release -p codekurve-bin
 # binary lands at target/release/codekurve
 ```
 
-Or run `codekurve install claude-code` / `codekurve install cursor` /
-`codekurve install codex-cli` to write the config below automatically (backs
-up any existing file first).
+Or run `codekurve install <client>` (`claude-code` / `cursor` / `codex-cli` /
+`copilot` / `opencode`) to write the config below automatically (backs up any
+existing file first).
 
 ### Claude Code
 
@@ -106,6 +106,42 @@ Codex has no project-scoped config — `codekurve install codex-cli` writes to
 [mcp_servers.codekurve]
 command = "/absolute/path/to/target/release/codekurve"
 args = ["mcp", "--root", "/absolute/path/to/project"]
+```
+
+### GitHub Copilot (VS Code)
+
+Add to `.vscode/mcp.json` in the project root — VS Code's own config uses
+`"servers"` (not `"mcpServers"`) and a `"type": "stdio"` key for local
+servers:
+
+```json
+{
+  "servers": {
+    "codekurve": {
+      "command": "/absolute/path/to/target/release/codekurve",
+      "args": ["mcp", "--root", "/absolute/path/to/project"],
+      "type": "stdio"
+    }
+  }
+}
+```
+
+### OpenCode
+
+Add to `opencode.json` in the project root. OpenCode's `McpLocalConfig`
+schema differs from every other client here: `command` is a single array
+holding the binary *and* its arguments (no separate `args` key), and
+`type: "local"` is required:
+
+```json
+{
+  "mcp": {
+    "codekurve": {
+      "type": "local",
+      "command": ["/absolute/path/to/target/release/codekurve", "mcp", "--root", "/absolute/path/to/project"]
+    }
+  }
+}
 ```
 
 Every client will send `initialize`, then `tools/list`, then `tools/call`

@@ -77,9 +77,10 @@ limitations: [docs/FRAMEWORKS.md](docs/FRAMEWORKS.md).
 (Claude Code, Codex) instead of ad-hoc grepping. Full rules and client setup:
 `docs/AGENT_USAGE.md`.
 
-Quick start: `codekurve install claude-code` (or `cursor` / `codex-cli`) wires
-the config automatically, or add this to `.mcp.json` by hand (`codekurve` on
-PATH after [installing](#installation), or an absolute path to the binary):
+Quick start: `codekurve install <client>` wires the config automatically for
+`claude-code`, `cursor`, `codex-cli`, `copilot` (VS Code), or `opencode` — or
+add this to `.mcp.json` by hand (`codekurve` on PATH after
+[installing](#installation), or an absolute path to the binary):
 
 ```json
 {
