@@ -19,13 +19,15 @@ execution or modification. Full non-goal list: §7.
 
 ## Status
 
-**Experimental.** Phases 0–7 of `CODEKURVE_MASTER_PLAN.md` are complete,
-verified, and archived under `openspec/changes/archive/`: scaffold, TypeScript
-graph, incremental watcher, MCP server, C# support, enterprise hardening, and
-Angular/.NET framework awareness. Latest release: `v0.2.0` (first was `v0.1.0`).
+**Experimental.** All phases of `CODEKURVE_MASTER_PLAN.md` (0–8) are complete:
+scaffold, TypeScript graph, incremental watcher, MCP server, C# support,
+enterprise hardening, Angular/.NET framework awareness, and a real-repository
+pilot. Phases 0–7 are archived under `openspec/changes/archive/`.
 
-Fase 8 (real-repo pilot evaluation) is in progress — see `docs/ROADMAP.md` for
-what's measured and what's still open.
+Phase 8 piloted CodeKurve on three real repositories — including a 350-file
+production ASP.NET solution — measured every metric the plan asks for, found
+and fixed three defects no fixture had caught, and concluded **continue**.
+Evidence and honest limitations: [`docs/PILOT_REPORT.md`](docs/PILOT_REPORT.md).
 
 ## Installation
 
