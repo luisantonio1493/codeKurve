@@ -776,11 +776,7 @@ fn cs_simple_type_name(node: Node, source: &[u8]) -> Option<String> {
     }
 }
 
-fn local_key_for(
-    qualified_name: &str,
-    partial_ordinal: Option<u32>,
-    fingerprint: &str,
-) -> String {
+fn local_key_for(qualified_name: &str, partial_ordinal: Option<u32>, fingerprint: &str) -> String {
     match partial_ordinal {
         // Two partial fragments in one file share a `qualified_name`; the
         // in-memory `local_key` needs its own disambiguator too (persisted

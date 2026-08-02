@@ -273,7 +273,10 @@ pub(crate) fn build_file_inputs(
                 extracted.partial_ordinal,
             );
             let id = repo::symbol_id(&file_id, &key);
-            symbol_ids.insert((analysis.file.clone(), extracted.local_key.clone()), id.clone());
+            symbol_ids.insert(
+                (analysis.file.clone(), extracted.local_key.clone()),
+                id.clone(),
+            );
             symbol_ids
                 .entry((analysis.file.clone(), extracted.qualified_name.clone()))
                 .or_insert(id);
@@ -1132,8 +1135,7 @@ mod symbol_ids_tests {
             extract::analyze(source, LanguageId::CSharp, "src/widget.cs").expect("analyze");
         resolve::resolve(std::slice::from_mut(&mut analysis), &TsconfigAliases::new());
 
-        let (_files, symbol_ids) =
-            build_file_inputs("proj", &[analysis.clone()], &[meta()]);
+        let (_files, symbol_ids) = build_file_inputs("proj", &[analysis.clone()], &[meta()]);
         let rels = build_relationships("proj", &[analysis], &symbol_ids);
 
         let contains_alpha = rels.iter().any(|r| {
@@ -1175,8 +1177,7 @@ mod symbol_ids_tests {
             extract::analyze(source, LanguageId::CSharp, "src/widget.cs").expect("analyze");
         resolve::resolve(std::slice::from_mut(&mut analysis), &TsconfigAliases::new());
 
-        let (_files, symbol_ids) =
-            build_file_inputs("proj", &[analysis.clone()], &[meta()]);
+        let (_files, symbol_ids) = build_file_inputs("proj", &[analysis.clone()], &[meta()]);
         let rels = build_relationships("proj", &[analysis.clone()], &symbol_ids);
 
         let ctor_targets: Vec<_> = analysis
@@ -1193,7 +1194,9 @@ mod symbol_ids_tests {
             .iter()
             .filter(|r| {
                 r.kind == RelationshipKind::Contains
-                    && ctor_targets.iter().any(|t| *t == r.target_symbol_id.as_ref())
+                    && ctor_targets
+                        .iter()
+                        .any(|t| *t == r.target_symbol_id.as_ref())
             })
             .collect();
         assert_eq!(
