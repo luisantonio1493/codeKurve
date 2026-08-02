@@ -32,4 +32,6 @@ with Context / Decision / Alternatives / Consequences / Status.
 
 ## Licensing
 
-Licensing has not been finalized. Do not redistribute.
+Licensing has not been finalized — see `docs/LICENSING.md` for the current
+state (the repo and release binaries are public, but that's a separate
+question from what license, if any, governs reuse/modification).

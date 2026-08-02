@@ -11,9 +11,18 @@ each phase's CI must pass on Windows, macOS, and Linux before moving on.
 | 3 | Incremental and watcher | **Complete** (merged to `main`) |
 | 4 | MCP | **Complete** (merged to `main`) |
 | 5 | C# | **Complete** (merged to `main`) — verify FAILED once on 3 critical gaps (CLI visibility output, `using static`/alias-reference test coverage), fixed and re-verified PASS before merge. See `openspec/changes/archive/2026-07-30-phase-5-csharp/verify-report.md`. |
-| 6 | Enterprise hardening | **Complete** (working tree, not yet committed) — internal-pilot readiness: `max_total_files` hard-fail, `cargo-deny`/`cargo-about` CI audit, measured 100/1k/10k benchmarks, internal release artifacts (binaries/SBOM/checksums, CI-only), `codekurve install` for Claude Code/Cursor/Codex CLI. Public redistribution deferred pending `docs/LICENSING.md`. See `openspec/changes/archive/2026-07-30-phase-6-enterprise-hardening/verify-report.md`. |
-| 7 | Angular and .NET aware | Not started |
-| 8 | Pilot and evaluation | Not started |
+| 6 | Enterprise hardening | **Complete** (merged to `main`) — internal-pilot readiness: `max_total_files` hard-fail, `cargo-deny`/`cargo-about` CI audit, measured 100/1k/10k benchmarks, release artifacts (binaries/SBOM/checksums), `codekurve install` for Claude Code/Cursor/Codex CLI. See `openspec/changes/archive/2026-07-30-phase-6-enterprise-hardening/verify-report.md`. |
+| 7 | Angular and .NET aware | **Complete** (merged to `main`) — heuristic recognition pass for Angular (DI, routing, decorators) and .NET (attribute + call-driven controllers, minimal APIs, DI, EF Core), all framework edges `Heuristic`-provenance and confidence-floored. See `openspec/changes/archive/2026-08-02-phase-7-angular-dotnet/verify-report.md` and `docs/FRAMEWORKS.md`. |
+| 8 | Pilot and evaluation | **In progress** — real-repo validation (one .NET, one Angular project) found and fixed 2 real bugs (an incremental-index foreign-key violation, unresolved symbol ids in `trace`/`impact` CLI output) that no fixture had caught. Index/query timing, memory footprint, and precision measured; still open: a large-repo memory measurement and the final continue/adjust/stop/scale-out decision. |
+
+> **Public distribution note**: the repo is now public and `v0.1.0` binaries
+> are published on GitHub Releases (see [Installation](../README.md#installation))
+> even though `docs/LICENSING.md` still marks licensing as unresolved
+> ("pending", no `LICENSE` file, "do not redistribute" text not yet removed).
+> This is a real, currently-open inconsistency — publishing was a deliberate
+> choice to unblock installation, not a resolution of the licensing question.
+> Pick and add a license (or explicitly decide "proprietary, source-available")
+> before treating this as settled.
 
 ## Phase 0 exit criteria
 
