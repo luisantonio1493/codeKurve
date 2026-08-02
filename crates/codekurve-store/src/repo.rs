@@ -317,6 +317,24 @@ fn insert_file_and_symbols(
 /// itself — `insert_file_and_symbols`'s `ON CONFLICT` upserts it, and
 /// `delete_file` removes it outright for a genuine delete.
 fn delete_file_owned_rows(tx: &Transaction, project_id: &str, file_id: &str) -> Result<()> {
+    delete_file_owned_relationships(tx, project_id, file_id)?;
+    delete_file_owned_symbols(tx, file_id)?;
+    Ok(())
+}
+
+/// First half of [`delete_file_owned_rows`]: this file's own outbound
+/// `relationships`/`unresolved_references` rows. Split out so a multi-file
+/// batch (`apply_incremental`) can clear every file's own edges *before*
+/// deleting any file's symbols — otherwise, since `foreign_keys = ON` checks
+/// are immediate (not deferred), deleting file A's symbols while file B
+/// (later in the same batch) still owns an edge targeting one of them trips
+/// `FOREIGN KEY constraint failed`, even though B's own edge is about to be
+/// cleared and rebuilt a few statements later in the same transaction.
+fn delete_file_owned_relationships(
+    tx: &Transaction,
+    project_id: &str,
+    file_id: &str,
+) -> Result<()> {
     tx.execute(
         "DELETE FROM relationships WHERE project_id = ?1 AND source_file_id = ?2",
         params![project_id, file_id],
@@ -325,6 +343,14 @@ fn delete_file_owned_rows(tx: &Transaction, project_id: &str, file_id: &str) -> 
         "DELETE FROM unresolved_references WHERE project_id = ?1 AND source_file_id = ?2",
         params![project_id, file_id],
     )?;
+    Ok(())
+}
+
+/// Second half of [`delete_file_owned_rows`]: this file's own symbols (+ FTS
+/// shadow). Must only run, across a whole batch, after every batch file's
+/// [`delete_file_owned_relationships`] has already run — see that function's
+/// doc comment.
+fn delete_file_owned_symbols(tx: &Transaction, file_id: &str) -> Result<()> {
     tx.execute(
         "DELETE FROM symbols_fts WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)",
         params![file_id],
@@ -412,8 +438,16 @@ pub fn apply_incremental(
     for path in deleted {
         delete_file(tx, project_id, ts, path)?;
     }
+    // Two full passes over `files`, not one interleaved pass: every batch
+    // file's own edges must be gone before any batch file's symbols are
+    // deleted, or an as-yet-unprocessed file's still-present edge to an
+    // already-deleted symbol trips the immediate foreign-key check (see
+    // `delete_file_owned_relationships`'s doc comment).
     for file in files {
-        delete_file_owned_rows(tx, project_id, &file_id(project_id, &file.relative_path))?;
+        delete_file_owned_relationships(tx, project_id, &file_id(project_id, &file.relative_path))?;
+    }
+    for file in files {
+        delete_file_owned_symbols(tx, &file_id(project_id, &file.relative_path))?;
     }
 
     let mut count = 0;
@@ -2422,5 +2456,97 @@ mod tests {
             .unwrap();
         assert_eq!(target_text, "doWork");
         assert_eq!(kind, "calls");
+    }
+
+    /// Regression (Fase 8 pilot, real-repo incremental edit crash): when an
+    /// incremental batch re-submits BOTH a file whose symbol is targeted by
+    /// another file's edge AND that dependent file itself (design's
+    /// "Dependent Re-Resolution Scope" D-set correctly pulls the dependent
+    /// in), `apply_incremental` must not delete the target's symbols before
+    /// the dependent's own edge referencing them is gone too — `foreign_keys
+    /// = ON` checks are immediate, so doing it file-by-file in one
+    /// interleaved pass trips `FOREIGN KEY constraint failed` depending on
+    /// slice order, even though the edge is about to be rebuilt identically
+    /// a few statements later in the same transaction.
+    #[test]
+    fn apply_incremental_reindexing_a_target_and_its_dependent_together_does_not_violate_fk() {
+        let mut conn = db::open_in_memory().unwrap();
+        let project = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        let files = vec![
+            FileInput {
+                relative_path: "src/a.ts".to_string(),
+                language: "typescript".to_string(),
+                content_hash: "hash-a".to_string(),
+                modified_ns: 0,
+                size_bytes: 10,
+                symbols: vec![symbol("doWork", SymbolKind::Function, 0)],
+            },
+            FileInput {
+                relative_path: "src/b.ts".to_string(),
+                language: "typescript".to_string(),
+                content_hash: "hash-b".to_string(),
+                modified_ns: 0,
+                size_bytes: 10,
+                symbols: vec![symbol("run", SymbolKind::Function, 0)],
+            },
+        ];
+        reindex(&mut conn, &project, &files, &[], &[]).unwrap();
+
+        let sym_id = |path: &str, name: &str| -> String {
+            conn.query_row(
+                "SELECT s.id FROM symbols s JOIN files f ON f.id = s.file_id
+                 WHERE f.relative_path = ?1 AND s.name = ?2",
+                params![path, name],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let fil_id = |path: &str| -> String {
+            conn.query_row(
+                "SELECT id FROM files WHERE relative_path = ?1",
+                params![path],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let do_work = sym_id("src/a.ts", "doWork");
+        let run = sym_id("src/b.ts", "run");
+        let file_b = fil_id("src/b.ts");
+
+        let relationships = vec![RelationshipInput {
+            source_symbol_id: run.clone(),
+            target_symbol_id: Some(do_work.clone()),
+            target_external: None,
+            kind: RelationshipKind::Calls,
+            provenance: Provenance::Extracted,
+            confidence: Confidence::Exact,
+            source_file_id: file_b,
+            start_line: Some(1),
+            start_column: Some(0),
+            reason: None,
+        }];
+        reindex(&mut conn, &project, &files, &relationships, &[]).unwrap();
+
+        // Incremental batch re-submits BOTH files (a.ts is "the edit", b.ts
+        // is the D-set dependent pulled in because its edge targets a.ts's
+        // symbol) — same content, so the same deterministic symbol/file ids
+        // come back out, but the delete-then-reinsert sequence must not trip
+        // over the still-live inbound edge partway through.
+        let tx = conn.transaction().unwrap();
+        apply_incremental(&tx, &project, "ts-incr", &files, &relationships, &[], &[])
+            .expect("must not violate the foreign-key constraint mid-batch");
+        tx.commit().unwrap();
+
+        let remaining_calls: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM relationships WHERE kind = 'calls'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining_calls, 1,
+            "the edge survives the round-trip intact"
+        );
     }
 }
