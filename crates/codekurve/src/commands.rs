@@ -739,7 +739,7 @@ pub fn trace(args: &QueryArgs, to: &str) -> Result<(), CommandError> {
     } else {
         let (conn, project_id) = s.indexed()?;
         let target = resolve_symbol(conn, project_id, None, Some(to))?;
-        print_trace_result(&outcome, &target);
+        print_trace_result(conn, &outcome, &target);
     }
     Ok(())
 }
@@ -767,7 +767,8 @@ pub fn impact(args: &QueryArgs) -> Result<(), CommandError> {
             outcome.truncated,
         );
     } else {
-        print_impact_result(&outcome);
+        let (conn, _project_id) = s.indexed()?;
+        print_impact_result(conn, &outcome);
     }
     Ok(())
 }
@@ -990,14 +991,29 @@ fn truncation_reason_str(r: traverse::TruncationReason) -> &'static str {
     }
 }
 
-fn print_trace_result(outcome: &traverse::BfsOutcome, target: &str) {
+/// A reached/traversed node's display label: `qualified_name path:line`,
+/// falling back to the bare id if the symbol row is somehow gone (e.g. a
+/// stale index) rather than failing the whole command over one lookup miss.
+fn describe_symbol(conn: &Connection, symbol_id: &str) -> String {
+    match repo::find_symbol_by_id(conn, symbol_id) {
+        Ok(Some(sym)) => format!(
+            "{} ({}:{})",
+            sym.qualified_name, sym.relative_path, sym.span.start_line
+        ),
+        _ => symbol_id.to_string(),
+    }
+}
+
+fn print_trace_result(conn: &Connection, outcome: &traverse::BfsOutcome, target: &str) {
     match &outcome.path {
         Some(path) => {
             println!("path to {target} found ({} hop(s)):", path.len());
             for edge in path {
                 println!(
                     "  -> {} [{}, {}]",
-                    edge.neighbor_symbol_id, edge.kind, edge.confidence
+                    describe_symbol(conn, &edge.neighbor_symbol_id),
+                    edge.kind,
+                    edge.confidence
                 );
             }
         }
@@ -1006,10 +1022,14 @@ fn print_trace_result(outcome: &traverse::BfsOutcome, target: &str) {
     print_truncation(outcome);
 }
 
-fn print_impact_result(outcome: &traverse::BfsOutcome) {
+fn print_impact_result(conn: &Connection, outcome: &traverse::BfsOutcome) {
     println!("{} node(s) reached", outcome.reached.len());
     for r in &outcome.reached {
-        println!("  {} (depth {})", r.symbol_id, r.depth);
+        println!(
+            "  {} (depth {})",
+            describe_symbol(conn, &r.symbol_id),
+            r.depth
+        );
     }
     print_truncation(outcome);
 }
