@@ -7,6 +7,10 @@ target/
 # CodeKurve local index / data directory
 .codekurve/
 
+# CodeGraph local index (the other tool's per-checkout index — each checkout
+# builds its own, so it is never shared or committed)
+.codegraph/
+
 # Synthetic benchmark fixtures (generated at runtime by scripts/bench.py,
 # not committed — design PR3 D13)
 fixtures/bench/
