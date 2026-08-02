@@ -10,8 +10,11 @@ use codekurve::{commands, install, watch};
 use commands::CommandError;
 
 const USAGE: &str = "usage: codekurve <version|init|index|watch|mcp|status|search|symbol|doctor|\
-references|callers|callees|implementations|trace|impact|install> [args] [--root <path>] \
-[--debounce-ms <n>] [--client <name>]";
+references|callers|callees|implementations|trace|impact|install|uninstall> [args] \
+[--root <path>] [--debounce-ms <n>] [--client <name>] [--yes]\n\
+\x20      codekurve install [<client>]    configure every detected agent, or one by name\n\
+\x20      codekurve uninstall [<client>]  remove codekurve from agent configs\n\
+\x20      codekurve version | -v | --version";
 
 fn main() -> ExitCode {
     let mut raw = std::env::args().skip(1);
@@ -22,7 +25,7 @@ fn main() -> ExitCode {
     let args = Args::parse(raw);
 
     let result: Result<(), CommandError> = match command.as_str() {
-        "version" => {
+        "version" | "-v" | "--version" => {
             println!("codekurve {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
@@ -46,7 +49,11 @@ fn main() -> ExitCode {
         "doctor" => commands::doctor(&args.root).map_err(CommandError::from),
         "install" => {
             let client = args.positional(0).or(args.client.as_deref());
-            install::run(&args.root, client).map_err(CommandError::from)
+            install::run(&args.root, client, args.yes).map_err(CommandError::from)
+        }
+        "uninstall" => {
+            let client = args.positional(0).or(args.client.as_deref());
+            install::uninstall(&args.root, client, args.yes).map_err(CommandError::from)
         }
         "references" => commands::references(&query_args(&args)),
         "callers" => commands::callers(&query_args(&args)),

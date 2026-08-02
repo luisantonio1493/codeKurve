@@ -72,9 +72,25 @@ cargo build --release -p codekurve-bin
 # binary lands at target/release/codekurve
 ```
 
-Or run `codekurve install <client>` (`claude-code` / `cursor` / `codex-cli` /
-`copilot` / `opencode`) to write the config below automatically (backs up any
-existing file first).
+Or run `codekurve install` with no arguments: it detects every MCP client
+installed on the machine (`claude-code` / `cursor` / `codex-cli` / `copilot` /
+`opencode`), prints the plan (which agents, which config paths), and writes
+the configs below after a `[y/N]` confirmation — backing up any existing file
+first. Detection is filesystem probing only (`~/.claude`, `~/.cursor`,
+`$CODEX_HOME` or `~/.codex`, VS Code's user dir, `~/.config/opencode` or
+`~/.opencode`); CodeKurve never shells out to check.
+
+Pass `--yes` to skip the prompt; it is also skipped automatically when stdin
+is not a terminal, so scripted and agent-driven installs never hang.
+
+`codekurve install <client>` still targets a single client directly, with no
+prompt.
+
+`codekurve uninstall [<client>]` removes the `codekurve` entry from each
+client config that has one, preserving every sibling entry (a config with no
+`codekurve` entry is reported and skipped, not an error). It manages agent
+configs only — the CLI binary itself is removed by `install.sh --uninstall`
+(`install.ps1 -Uninstall` on Windows).
 
 ### Claude Code
 

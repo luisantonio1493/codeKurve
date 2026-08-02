@@ -64,13 +64,33 @@
 //! "--root", "/path"]`) — there is no separate `args` key. `type: "local"`
 //! is required. Project scope uses the same `Config` schema at
 //! `opencode.json` in the project root.
+//!
+//! ## Verified agent-detection signals (no-arg `codekurve install`)
+//!
+//! Detection is filesystem probing only — SECURITY_MODEL.md forbids shelling
+//! out, so there is no `which claude` / `codex --version` here. Each probe
+//! below was verified to exist against this machine's live installations:
+//!
+//! | client | signal (relative to `$HOME`, `%USERPROFILE%` on Windows) |
+//! |---|---|
+//! | `claude-code` | `.claude/` |
+//! | `cursor` | `.cursor/` |
+//! | `codex-cli` | `$CODEX_HOME` if set, else `.codex/` |
+//! | `copilot` | VS Code user dir: `Library/Application Support/Code/User` (macOS), `%APPDATA%\Code\User` (Windows), `.config/Code/User` (Linux) |
+//! | `opencode` | `.config/opencode/` **or** `.opencode/` (either counts) |
+//!
+//! `Client::is_installed` takes the home directory as a parameter rather than
+//! reading `$HOME` itself, so tests probe a `tempdir` instead of the
+//! developer's real config.
 
 use std::fs;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 use toml_edit::{DocumentMut, Item, Table};
 
+#[derive(Clone, Copy)]
 pub enum Client {
     ClaudeCode,
     Cursor,
@@ -80,6 +100,14 @@ pub enum Client {
 }
 
 impl Client {
+    const ALL: [Self; 5] = [
+        Self::ClaudeCode,
+        Self::Cursor,
+        Self::Codex,
+        Self::Copilot,
+        Self::OpenCode,
+    ];
+
     fn parse(name: &str) -> Option<Self> {
         match name {
             "claude-code" => Some(Self::ClaudeCode),
@@ -88,6 +116,44 @@ impl Client {
             "copilot" => Some(Self::Copilot),
             "opencode" => Some(Self::OpenCode),
             _ => None,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude-code",
+            Self::Cursor => "cursor",
+            Self::Codex => "codex-cli",
+            Self::Copilot => "copilot",
+            Self::OpenCode => "opencode",
+        }
+    }
+
+    /// Top-level object holding server entries in this client's JSON config
+    /// (meaningless for Codex, whose TOML equivalent is `[mcp_servers]`).
+    fn json_servers_key(&self) -> &'static str {
+        match self {
+            Self::Copilot => "servers",
+            Self::OpenCode => "mcp",
+            _ => "mcpServers",
+        }
+    }
+
+    /// Filesystem-only probe for an installed client (module doc's
+    /// verified-signals table). `home` is a parameter so tests probe a
+    /// `tempdir` rather than the developer's real config directories.
+    fn is_installed(&self, home: &Path) -> bool {
+        match self {
+            Self::ClaudeCode => home.join(".claude").exists(),
+            Self::Cursor => home.join(".cursor").exists(),
+            Self::Codex => match std::env::var("CODEX_HOME") {
+                Ok(dir) => Path::new(&dir).exists(),
+                Err(_) => home.join(".codex").exists(),
+            },
+            Self::Copilot => vscode_user_dir(home).exists(),
+            Self::OpenCode => {
+                home.join(".config").join("opencode").exists() || home.join(".opencode").exists()
+            }
         }
     }
 
@@ -140,21 +206,55 @@ fn manual_instructions(exe: &str, root: &str) -> String {
     )
 }
 
+/// `$HOME` (`%USERPROFILE%` on Windows) — the base every detection probe and
+/// `codex_config_path` resolves against.
+fn home_dir() -> Result<PathBuf, String> {
+    let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var(home_var)
+        .map(PathBuf::from)
+        .map_err(|_| format!("could not resolve home directory: ${home_var} is not set"))
+}
+
+/// VS Code's user-scope config dir, the `copilot` detection signal.
+fn vscode_user_dir(home: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        home.join("Library")
+            .join("Application Support")
+            .join("Code")
+            .join("User")
+    } else if cfg!(windows) {
+        // %APPDATA% is `<home>\AppData\Roaming` on every supported Windows.
+        home.join("AppData")
+            .join("Roaming")
+            .join("Code")
+            .join("User")
+    } else {
+        home.join(".config").join("Code").join("User")
+    }
+}
+
 /// `$CODEX_HOME/config.toml`, else `$HOME/.codex/config.toml`
 /// (`%USERPROFILE%\.codex\config.toml` on Windows) — design D12.
 fn codex_config_path() -> Result<PathBuf, String> {
     if let Ok(home) = std::env::var("CODEX_HOME") {
         return Ok(PathBuf::from(home).join("config.toml"));
     }
-    let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-    let home = std::env::var(home_var).map_err(|_| {
-        format!("could not resolve Codex config: neither $CODEX_HOME nor ${home_var} is set")
-    })?;
-    Ok(PathBuf::from(home).join(".codex").join("config.toml"))
+    let home = home_dir()
+        .map_err(|e| format!("could not resolve Codex config: $CODEX_HOME is not set and {e}"))?;
+    Ok(home.join(".codex").join("config.toml"))
 }
 
-/// `codekurve install <client> [--root <path>]`.
-pub fn run(root: &Path, client: Option<&str>) -> Result<(), String> {
+fn resolve_config_path(client: Client, root: &Path) -> Result<PathBuf, String> {
+    match client {
+        Client::Codex => codex_config_path(),
+        _ => Ok(client.config_path(root)),
+    }
+}
+
+/// `codekurve install [<client>] [--root <path>] [--yes]`. Without a client
+/// name, every detected agent (see the module doc's signals table) is
+/// configured after a `[y/N]` confirmation.
+pub fn run(root: &Path, client: Option<&str>, yes: bool) -> Result<(), String> {
     let exe = std::env::current_exe()
         .and_then(|p| p.canonicalize())
         .map_err(|e| format!("failed to resolve codekurve binary path: {e}"))?;
@@ -163,10 +263,7 @@ pub fn run(root: &Path, client: Option<&str>) -> Result<(), String> {
         .map_err(|e| format!("failed to resolve --root: {e}"))?;
 
     let Some(client_name) = client else {
-        return Err(format!(
-            "codekurve install requires a client name\n{}",
-            manual_instructions(&exe.to_string_lossy(), &root.to_string_lossy())
-        ));
+        return install_detected(&exe, &root, yes);
     };
 
     let Some(client) = Client::parse(client_name) else {
@@ -176,28 +273,193 @@ pub fn run(root: &Path, client: Option<&str>) -> Result<(), String> {
         ));
     };
 
-    let config_path = match client {
-        Client::Codex => codex_config_path()?,
-        _ => client.config_path(&root),
-    };
-    match client {
-        Client::Codex => write_codex_toml(&config_path, &exe, &root)?,
-        Client::OpenCode => write_opencode_json(&config_path, &exe, &root)?,
-        Client::Copilot => write_json_client(&config_path, &exe, &root, "servers", true)?,
-        _ => write_json_client(
-            &config_path,
-            &exe,
-            &root,
-            "mcpServers",
-            client.includes_stdio_type(),
-        )?,
-    }
+    let config_path = resolve_config_path(client, &root)?;
+    install_one(client, &config_path, &exe, &root)?;
     println!(
         "installed codekurve MCP server into {} ({})",
         config_path.display(),
         client.scope()
     );
     Ok(())
+}
+
+fn install_one(client: Client, config_path: &Path, exe: &Path, root: &Path) -> Result<(), String> {
+    match client {
+        Client::Codex => write_codex_toml(config_path, exe, root),
+        Client::OpenCode => write_opencode_json(config_path, exe, root),
+        _ => write_json_client(
+            config_path,
+            exe,
+            root,
+            client.json_servers_key(),
+            client.includes_stdio_type(),
+        ),
+    }
+}
+
+/// No-arg `codekurve install`: probe for every supported client, print the
+/// plan, confirm, then configure each detected one with the same writers the
+/// explicit form uses.
+fn install_detected(exe: &Path, root: &Path, yes: bool) -> Result<(), String> {
+    let home = home_dir()?;
+    let (detected, missing): (Vec<Client>, Vec<Client>) =
+        Client::ALL.into_iter().partition(|c| c.is_installed(&home));
+
+    if detected.is_empty() {
+        return Err(format!(
+            "no supported MCP client detected on this machine\n{}",
+            manual_instructions(&exe.to_string_lossy(), &root.to_string_lossy())
+        ));
+    }
+
+    let mut targets = Vec::new();
+    for client in detected {
+        targets.push((client, resolve_config_path(client, root)?));
+    }
+
+    println!("codekurve install will configure these detected agents:");
+    for (client, path) in &targets {
+        println!(
+            "  {:<12} {} ({})",
+            client.name(),
+            path.display(),
+            client.scope()
+        );
+    }
+    report_missing(&missing);
+    if !confirm(yes, "configure these agents?")? {
+        println!("aborted; no changes made.");
+        return Ok(());
+    }
+
+    let mut failures = Vec::new();
+    for (client, path) in &targets {
+        match install_one(*client, path, exe, root) {
+            Ok(()) => println!("configured {} -> {}", client.name(), path.display()),
+            Err(e) => {
+                println!("failed {}: {e}", client.name());
+                failures.push(client.name());
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("could not configure: {}", failures.join(", ")))
+    }
+}
+
+/// `codekurve uninstall [<client>] [--root <path>] [--yes]`: removes only the
+/// `codekurve` entry from each client config that has one, leaving sibling
+/// entries (and the file itself) intact.
+pub fn uninstall(root: &Path, client: Option<&str>, yes: bool) -> Result<(), String> {
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("failed to resolve --root: {e}"))?;
+
+    let clients: Vec<Client> = match client {
+        Some(name) => vec![Client::parse(name).ok_or_else(|| {
+            format!("unsupported client \"{name}\"\nsupported clients: {SUPPORTED_CLIENTS}")
+        })?],
+        None => Client::ALL.to_vec(),
+    };
+
+    // Collected rather than printed inline: the plan below is the headline,
+    // and per-client "nothing here" notes interleaved *before* it read as if
+    // the command had already started removing things. Summarized after the
+    // plan instead, mirroring install's "not detected, skipped: ..." line.
+    let mut targets = Vec::new();
+    let mut absent = Vec::new();
+    let mut unreadable = Vec::new();
+    for client in clients {
+        let path = resolve_config_path(client, &root)?;
+        match remove_entry(client, &path, false) {
+            Ok(true) => targets.push((client, path)),
+            Ok(false) => absent.push(client.name()),
+            Err(e) => unreadable.push(format!("{} ({e})", client.name())),
+        }
+    }
+
+    if targets.is_empty() {
+        println!("no codekurve entries found; nothing to do.");
+        if !unreadable.is_empty() {
+            println!("could not read: {}", unreadable.join(", "));
+        }
+        println!("{UNINSTALL_BINARY_NOTE}");
+        return Ok(());
+    }
+
+    println!("codekurve uninstall will remove the codekurve entry from:");
+    for (client, path) in &targets {
+        println!("  {:<12} {}", client.name(), path.display());
+    }
+    if !absent.is_empty() {
+        println!("no codekurve entry, skipped: {}", absent.join(", "));
+    }
+    if !unreadable.is_empty() {
+        println!("could not read: {}", unreadable.join(", "));
+    }
+    if !confirm(yes, "remove these entries?")? {
+        println!("aborted; no changes made.");
+        return Ok(());
+    }
+
+    let mut failures = Vec::new();
+    for (client, path) in &targets {
+        match remove_entry(*client, path, true) {
+            Ok(_) => println!("removed codekurve from {}", path.display()),
+            Err(e) => {
+                println!("failed {}: {e}", client.name());
+                failures.push(client.name());
+            }
+        }
+    }
+    println!("{UNINSTALL_BINARY_NOTE}");
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("could not clean: {}", failures.join(", ")))
+    }
+}
+
+const UNINSTALL_BINARY_NOTE: &str =
+    "note: this removes agent configs only. To remove the codekurve binary \
+     itself, use install.sh --uninstall (install.ps1 -Uninstall on Windows).";
+
+/// Dispatches to the format-specific remover. `apply == false` only reports
+/// whether an entry exists (used to build the confirmation plan), touching
+/// nothing.
+fn remove_entry(client: Client, path: &Path, apply: bool) -> Result<bool, String> {
+    match client {
+        Client::Codex => remove_codex_toml_entry(path, apply),
+        _ => remove_json_entry(path, client.json_servers_key(), apply),
+    }
+}
+
+fn report_missing(missing: &[Client]) {
+    if missing.is_empty() {
+        return;
+    }
+    let names: Vec<&str> = missing.iter().map(Client::name).collect();
+    println!("not detected, skipped: {}", names.join(", "));
+}
+
+/// `[y/N]` on stdin — auto-proceeds when `--yes` was passed or stdin is not a
+/// terminal, so scripted/agent use never hangs on a prompt nobody can answer.
+fn confirm(yes: bool, question: &str) -> Result<bool, String> {
+    if yes || !std::io::stdin().is_terminal() {
+        return Ok(true);
+    }
+    print!("{question} [y/N] ");
+    std::io::stdout().flush().map_err(|e| e.to_string())?;
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| e.to_string())?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 fn server_entry(exe: &Path, root: &Path, include_type: bool) -> Value {
@@ -445,6 +707,80 @@ fn manual_snippet_toml(exe: &Path, root: &Path) -> String {
     )
 }
 
+/// Removes the `codekurve` entry from a JSON client's `servers_key` object,
+/// leaving every sibling entry and the rest of the file intact. Returns
+/// whether an entry was present. A missing file or missing entry is `Ok(false)`
+/// (not an error — nothing to remove). With `apply == false` nothing is
+/// written; the answer is used to build the confirmation plan.
+fn remove_json_entry(path: &Path, servers_key: &str, apply: bool) -> Result<bool, String> {
+    let Ok(existing_bytes) = fs::read(path) else {
+        return Ok(false);
+    };
+    let text = String::from_utf8_lossy(&existing_bytes);
+    let parsed: Value = serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "{} is not valid JSON ({e}); no changes made",
+            path.display()
+        )
+    })?;
+    let Value::Object(mut doc) = parsed else {
+        return Err(format!(
+            "{} does not contain a JSON object at the top level; no changes made",
+            path.display()
+        ));
+    };
+
+    let Some(Value::Object(servers)) = doc.get_mut(servers_key) else {
+        return Ok(false);
+    };
+    if servers.remove("codekurve").is_none() {
+        return Ok(false);
+    }
+    if !apply {
+        return Ok(true);
+    }
+
+    backup(path, &existing_bytes)?;
+    let out = serde_json::to_string_pretty(&Value::Object(doc)).map_err(|e| e.to_string())?;
+    fs::write(path, out).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// `remove_json_entry`'s Codex counterpart: drops `[mcp_servers.codekurve]`
+/// via `toml_edit`, so sibling tables, comments and formatting survive.
+fn remove_codex_toml_entry(path: &Path, apply: bool) -> Result<bool, String> {
+    let Ok(existing_bytes) = fs::read(path) else {
+        return Ok(false);
+    };
+    let text = String::from_utf8_lossy(&existing_bytes);
+    let mut doc: DocumentMut = text.parse().map_err(|e| {
+        format!(
+            "{} is not valid TOML ({e}); no changes made",
+            path.display()
+        )
+    })?;
+
+    let Some(servers) = doc.get_mut("mcp_servers") else {
+        return Ok(false);
+    };
+    let servers_table = servers.as_table_mut().ok_or_else(|| {
+        format!(
+            "{} has a \"mcp_servers\" key that is not a table; no changes made",
+            path.display()
+        )
+    })?;
+    if servers_table.remove("codekurve").is_none() {
+        return Ok(false);
+    }
+    if !apply {
+        return Ok(true);
+    }
+
+    backup(path, &existing_bytes)?;
+    fs::write(path, doc.to_string()).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
 /// `<file>.bak` written before any modification (design rule 2), overwriting
 /// a prior backup — lets a user roll back without git.
 fn backup(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -552,7 +888,7 @@ mod tests {
     #[test]
     fn unsupported_client_makes_no_filesystem_changes() {
         let dir = tempdir().unwrap();
-        let err = run(dir.path(), Some("vscode")).unwrap_err();
+        let err = run(dir.path(), Some("vscode"), true).unwrap_err();
         assert!(err.contains("unsupported client"));
         assert!(err.contains("claude-code, cursor"));
         assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
@@ -561,21 +897,21 @@ mod tests {
     #[test]
     fn cursor_config_lands_under_dot_cursor_dir() {
         let dir = tempdir().unwrap();
-        run(dir.path(), Some("cursor")).unwrap();
+        run(dir.path(), Some("cursor"), true).unwrap();
         assert!(dir.path().join(".cursor").join("mcp.json").exists());
     }
 
     #[test]
     fn claude_code_config_lands_at_root() {
         let dir = tempdir().unwrap();
-        run(dir.path(), Some("claude-code")).unwrap();
+        run(dir.path(), Some("claude-code"), true).unwrap();
         assert!(dir.path().join(".mcp.json").exists());
     }
 
     #[test]
     fn copilot_config_lands_under_dot_vscode_dir_under_servers_key() {
         let dir = tempdir().unwrap();
-        run(dir.path(), Some("copilot")).unwrap();
+        run(dir.path(), Some("copilot"), true).unwrap();
         let path = dir.path().join(".vscode").join("mcp.json");
         assert!(path.exists());
         let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
@@ -586,7 +922,7 @@ mod tests {
     #[test]
     fn opencode_config_lands_at_root_with_single_command_array() {
         let dir = tempdir().unwrap();
-        run(dir.path(), Some("opencode")).unwrap();
+        run(dir.path(), Some("opencode"), true).unwrap();
         let path = dir.path().join("opencode.json");
         assert!(path.exists());
         let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
@@ -707,7 +1043,130 @@ mod tests {
     #[test]
     fn unsupported_client_message_lists_codex_cli() {
         let dir = tempdir().unwrap();
-        let err = run(dir.path(), Some("vscode")).unwrap_err();
+        let err = run(dir.path(), Some("vscode"), true).unwrap_err();
         assert!(err.contains("claude-code, cursor, codex-cli"));
+    }
+
+    #[test]
+    fn detection_finds_only_clients_whose_probe_dir_exists() {
+        let home = tempdir().unwrap();
+        fs::create_dir(home.path().join(".claude")).unwrap();
+        fs::create_dir_all(home.path().join(".config").join("opencode")).unwrap();
+
+        assert!(Client::ClaudeCode.is_installed(home.path()));
+        assert!(Client::OpenCode.is_installed(home.path()));
+        assert!(!Client::Cursor.is_installed(home.path()));
+        assert!(!Client::Copilot.is_installed(home.path()));
+    }
+
+    #[test]
+    fn opencode_detects_via_legacy_dot_opencode_dir() {
+        let home = tempdir().unwrap();
+        fs::create_dir(home.path().join(".opencode")).unwrap();
+        assert!(Client::OpenCode.is_installed(home.path()));
+    }
+
+    #[test]
+    fn copilot_detects_via_vscode_user_dir() {
+        let home = tempdir().unwrap();
+        assert!(!Client::Copilot.is_installed(home.path()));
+        fs::create_dir_all(vscode_user_dir(home.path())).unwrap();
+        assert!(Client::Copilot.is_installed(home.path()));
+    }
+
+    #[test]
+    fn uninstall_removes_only_codekurve_entry_from_json() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        fs::write(
+            &path,
+            r#"{"mcpServers":{"other":{"command":"foo"}},"extra":1}"#,
+        )
+        .unwrap();
+        write_json_client(&path, &exe(), &root(), "mcpServers", true).unwrap();
+
+        assert!(remove_json_entry(&path, "mcpServers", true).unwrap());
+
+        let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["mcpServers"]["other"]["command"], "foo");
+        assert!(value["mcpServers"].get("codekurve").is_none());
+        assert_eq!(value["extra"], 1);
+    }
+
+    #[test]
+    fn uninstall_leaves_valid_json_when_removing_last_entry() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        write_json_client(&path, &exe(), &root(), "mcpServers", true).unwrap();
+
+        assert!(remove_json_entry(&path, "mcpServers", true).unwrap());
+
+        let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(value["mcpServers"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn uninstall_without_entry_is_a_no_op() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        let original = r#"{"mcpServers":{"other":{"command":"foo"}}}"#;
+        fs::write(&path, original).unwrap();
+
+        assert!(!remove_json_entry(&path, "mcpServers", true).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!path.with_extension("json.bak").exists());
+
+        // A file that does not exist at all is equally a no-op.
+        assert!(!remove_json_entry(&dir.path().join("absent.json"), "mcpServers", true).unwrap());
+    }
+
+    #[test]
+    fn uninstall_removes_only_codekurve_table_from_codex_toml() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "# user comment\nmodel = \"gpt-5\"\n\n[mcp_servers.other]\ncommand = \"foo\"\n",
+        )
+        .unwrap();
+        write_codex_toml(&path, &exe(), &root()).unwrap();
+
+        assert!(remove_codex_toml_entry(&path, true).unwrap());
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# user comment"));
+        let doc: DocumentMut = text.parse().unwrap();
+        assert_eq!(
+            doc["mcp_servers"]["other"]["command"].as_str().unwrap(),
+            "foo"
+        );
+        assert!(doc["mcp_servers"]
+            .as_table()
+            .unwrap()
+            .get("codekurve")
+            .is_none());
+    }
+
+    #[test]
+    fn uninstall_codex_toml_without_entry_is_a_no_op() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "model = \"gpt-5\"\n";
+        fs::write(&path, original).unwrap();
+
+        assert!(!remove_codex_toml_entry(&path, true).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!remove_codex_toml_entry(&dir.path().join("absent.toml"), true).unwrap());
+    }
+
+    #[test]
+    fn plan_mode_reports_entry_without_writing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        write_json_client(&path, &exe(), &root(), "mcpServers", true).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+
+        assert!(remove_json_entry(&path, "mcpServers", false).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
     }
 }

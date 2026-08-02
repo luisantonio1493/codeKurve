@@ -20,6 +20,7 @@ pub struct Args {
     pub offset: Option<usize>,
     pub debounce_ms: Option<u64>,
     pub client: Option<String>,
+    pub yes: bool,
 }
 
 impl Args {
@@ -35,6 +36,7 @@ impl Args {
         let mut offset = None;
         let mut debounce_ms = None;
         let mut client = None;
+        let mut yes = false;
         let mut iter = args;
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -48,6 +50,7 @@ impl Args {
                 "--offset" => offset = iter.next().and_then(|v| v.parse().ok()),
                 "--debounce-ms" => debounce_ms = iter.next().and_then(|v| v.parse().ok()),
                 "--client" => client = iter.next(),
+                "--yes" | "-y" => yes = true,
                 _ => positionals.push(arg),
             }
         }
@@ -63,6 +66,7 @@ impl Args {
             offset,
             debounce_ms,
             client,
+            yes,
         }
     }
 

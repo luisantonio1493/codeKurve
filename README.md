@@ -77,9 +77,18 @@ limitations: [docs/FRAMEWORKS.md](docs/FRAMEWORKS.md).
 (Claude Code, Codex) instead of ad-hoc grepping. Full rules and client setup:
 `docs/AGENT_USAGE.md`.
 
-Quick start: `codekurve install <client>` wires the config automatically for
-`claude-code`, `cursor`, `codex-cli`, `copilot` (VS Code), or `opencode` — or
-add this to `.mcp.json` by hand (`codekurve` on PATH after
+Quick start: `codekurve install` detects every MCP client installed on the
+machine (`claude-code`, `cursor`, `codex-cli`, `copilot` (VS Code),
+`opencode`), prints what it will write, and configures them after a `[y/N]`
+confirmation — pass `--yes` (or run it non-interactively) to skip the prompt.
+Detection is filesystem probing only; CodeKurve never shells out.
+
+To target one client instead, name it: `codekurve install <client>`.
+`codekurve uninstall [<client>]` reverses it, removing only the `codekurve`
+entry and leaving sibling servers intact (it does not touch the binary — use
+`install.sh --uninstall` for that).
+
+Or add this to `.mcp.json` by hand (`codekurve` on PATH after
 [installing](#installation), or an absolute path to the binary):
 
 ```json
