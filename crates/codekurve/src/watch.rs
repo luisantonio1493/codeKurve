@@ -239,10 +239,14 @@ mod tests {
             tx.send(vec![PathBuf::from(format!("file{i}.ts"))]).unwrap();
             thread::sleep(Duration::from_millis(5));
         }
-        // Let the sliding window elapse and flush before disconnecting —
-        // otherwise the channel closing races the debounce timeout and the
-        // loop can exit via `Disconnected` before ever flushing.
-        thread::sleep(Duration::from_millis(150));
+        // Poll for the flush instead of a fixed sleep: a hardcoded wait races
+        // the debounce timeout under CI scheduling jitter (seen failing both
+        // as "too early, got 0" and "too late, split into 2" on macOS
+        // runners) — waiting on the actual condition has no such ceiling.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while flushes.lock().unwrap().is_empty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
         drop(tx);
 
         handle.join().unwrap();
