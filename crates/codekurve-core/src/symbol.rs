@@ -75,6 +75,24 @@ pub enum RelationshipKind {
     /// (design "Attributes"). Target text = the attribute's original name;
     /// span = the attribute's own span, not its enclosing list.
     Decorates,
+    /// Phase 7: a framework-recognized dependency-injection edge (e.g.
+    /// Angular constructor DI / `inject()`). Emitted only by the recognition
+    /// pass (`frameworks/`), never by a per-language analyzer.
+    Injects,
+    /// Phase 7: a framework-recognized DI-container registration (e.g.
+    /// Angular `providers`/`imports`, .NET `AddScoped<T,U>()`). Emitted only
+    /// by the recognition pass.
+    RegisteredAs,
+    /// Phase 7: a framework-recognized route binding (e.g. Angular `Routes`,
+    /// ASP.NET `[HttpGet]`/minimal-API `Map*`). Emitted only by the
+    /// recognition pass.
+    HandlesRoute,
+    /// Phase 7: a framework-recognized event trigger (e.g. Azure Functions
+    /// trigger attributes). Emitted only by the recognition pass.
+    Triggers,
+    /// Phase 7: a framework-recognized persistence binding (e.g. EF Core
+    /// `DbSet<T>`). Emitted only by the recognition pass.
+    PersistsTo,
 }
 
 impl RelationshipKind {
@@ -94,6 +112,39 @@ impl RelationshipKind {
             Self::Reads => "reads",
             Self::Writes => "writes",
             Self::Decorates => "decorates",
+            Self::Injects => "injects",
+            Self::RegisteredAs => "registeredas",
+            Self::HandlesRoute => "handlesroute",
+            Self::Triggers => "triggers",
+            Self::PersistsTo => "persiststo",
+        }
+    }
+}
+
+/// A framework-level role tag attached to an already-extracted symbol
+/// (design "Model and Storage Changes"). Not a new `SymbolKind` — a symbol
+/// keeps its structural kind (Class, Method, ...) and additionally carries
+/// zero or more roles. Emitted only by the recognition pass (`frameworks/`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FrameworkRole {
+    Controller,
+    Route,
+    Service,
+    Repository,
+    Component,
+    Decorator,
+}
+
+impl FrameworkRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Controller => "controller",
+            Self::Route => "route",
+            Self::Service => "service",
+            Self::Repository => "repository",
+            Self::Component => "component",
+            Self::Decorator => "decorator",
         }
     }
 }
@@ -214,4 +265,9 @@ pub struct Symbol {
     /// non-partial declaration, keeping the hashed input byte-identical to
     /// the pre-Phase-5 five-component tuple.
     pub partial_ordinal: Option<u32>,
+    /// Phase 7: framework-level role tags (design "Model and Storage
+    /// Changes"). Stored sorted + deduped. MUST NOT participate in
+    /// `symbol_key` (codekurve-store `repo.rs`) — a role tag never changes a
+    /// symbol's storage identity. Empty for every pre-Phase-7 symbol.
+    pub roles: Vec<FrameworkRole>,
 }

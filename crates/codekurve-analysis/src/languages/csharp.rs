@@ -252,6 +252,7 @@ fn push_namespace_symbol(
         is_partial: false,
         is_record: false,
         partial_ordinal: None,
+        roles: Vec::new(),
     });
     ctx.namespace_stack.push(full_name.clone());
     Some((local_key, full_name))
@@ -310,6 +311,7 @@ fn handle_type_decl(node: Node, container_key: Option<&str>, ctx: &mut CsCtx) {
         is_partial,
         is_record,
         partial_ordinal,
+        roles: Vec::new(),
     });
     collect_bases(node, &local_key, ctx);
     collect_attributes(node, &local_key, ctx);
@@ -361,6 +363,7 @@ fn handle_enum_decl(node: Node, container_key: Option<&str>, ctx: &mut CsCtx) {
         is_partial: false,
         is_record: false,
         partial_ordinal: None,
+        roles: Vec::new(),
     });
     collect_attributes(node, &local_key, ctx);
 
@@ -407,6 +410,7 @@ fn handle_enum_decl(node: Node, container_key: Option<&str>, ctx: &mut CsCtx) {
             is_partial: false,
             is_record: false,
             partial_ordinal: None,
+            roles: Vec::new(),
         });
         collect_attributes(member, &member_local_key, ctx);
     }
@@ -463,6 +467,7 @@ fn handle_member(node: Node, container_key: Option<&str>, ctx: &mut CsCtx) {
         is_partial,
         is_record: false,
         partial_ordinal,
+        roles: Vec::new(),
     });
     collect_attributes(node, &local_key, ctx);
     collect_member_body(node, &local_key, ctx);
@@ -586,6 +591,7 @@ fn handle_field_decl(node: Node, container_key: Option<&str>, ctx: &mut CsCtx) {
             is_partial: false,
             is_record: false,
             partial_ordinal: None,
+            roles: Vec::new(),
         });
         // design "field_declaration ... attribute_list (attached to every
         // declarator)": the single `attribute_list` on `field_declaration`

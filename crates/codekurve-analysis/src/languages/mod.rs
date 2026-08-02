@@ -49,6 +49,23 @@ pub fn same_resolution_domain(a: LanguageId, b: LanguageId) -> bool {
     )
 }
 
+/// D6: framework-level kinds (`Injects`, `RegisteredAs`, `HandlesRoute`,
+/// `Triggers`, `PersistsTo`) are answered by `frameworks::kind_matches`
+/// *before* falling through to `analyzer`'s own table — every call site
+/// that used to call `analyzer.kind_matches` directly now goes through this
+/// wrapper instead, so a framework edge is never silently accepted or
+/// rejected by a per-language table that has never heard of it. Neither
+/// `TypeScriptAnalyzer::kind_matches` nor `CSharpAnalyzer::kind_matches`
+/// changes — `frameworks::kind_matches` returns `None` for every grammar-
+/// level kind those tables already own.
+pub(crate) fn kind_matches(
+    analyzer: &dyn LanguageAnalyzer,
+    rel: RelationshipKind,
+    sym: SymbolKind,
+) -> bool {
+    crate::frameworks::kind_matches(rel, sym).unwrap_or_else(|| analyzer.kind_matches(rel, sym))
+}
+
 /// Reason text for a C# base-list entry (design "Architecture Decisions" —
 /// base-list edges are always emitted `Unresolved` with this reason, never
 /// routed through `resolve_pending`; PR5's `resolve.rs` reclassifies them to
@@ -81,7 +98,7 @@ pub(crate) fn resolve_pending(
     for rel in pending {
         let matches: Vec<&ExtractedSymbol> = symbols
             .iter()
-            .filter(|s| s.name == rel.target_name && analyzer.kind_matches(rel.kind, s.kind))
+            .filter(|s| s.name == rel.target_name && kind_matches(analyzer, rel.kind, s.kind))
             .collect();
         match matches.as_slice() {
             [] => out.push(ExtractedRelationship {

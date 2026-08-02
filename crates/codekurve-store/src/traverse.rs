@@ -390,6 +390,7 @@ mod tests {
             is_partial: false,
             is_record: false,
             partial_ordinal: None,
+            roles: Vec::new(),
         }
     }
 

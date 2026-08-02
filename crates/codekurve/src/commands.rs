@@ -218,6 +218,7 @@ fn module_symbol(relative_path: &str, language: LanguageId) -> Symbol {
         is_partial: false,
         is_record: false,
         partial_ordinal: None,
+        roles: Vec::new(),
     }
 }
 
@@ -257,6 +258,7 @@ pub(crate) fn build_file_inputs(
                 is_partial: s.is_partial,
                 is_record: s.is_record,
                 partial_ordinal: s.partial_ordinal,
+                roles: s.roles.clone(),
             })
             .collect();
         symbols.push(module_symbol(&analysis.file, meta.language));
@@ -536,6 +538,23 @@ fn modifiers_suffix(is_partial: bool, is_record: bool) -> &'static str {
     }
 }
 
+/// Phase 7 PR1 task 1.7 (phase-5 convention: an optional field prints only
+/// when non-empty — mirrors `modifiers_suffix`). No `--json` output exists
+/// for `symbol` yet, so there is no key to omit there.
+fn roles_suffix(roles: &[codekurve_core::FrameworkRole]) -> String {
+    if roles.is_empty() {
+        return String::new();
+    }
+    format!(
+        "  roles={}",
+        roles
+            .iter()
+            .map(|r| r.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
 /// `codekurve symbol <name> --root <path>`
 pub fn symbol(root: &Path, name: &str) -> Result<(), String> {
     let root = canonicalize(root)?;
@@ -550,12 +569,13 @@ pub fn symbol(root: &Path, name: &str) -> Result<(), String> {
     }
     for hit in &hits {
         println!(
-            "{} ({}) [{}] visibility={}{}",
+            "{} ({}) [{}] visibility={}{}{}",
             hit.name,
             hit.kind,
             hit.language,
             hit.visibility,
-            modifiers_suffix(hit.is_partial, hit.is_record)
+            modifiers_suffix(hit.is_partial, hit.is_record),
+            roles_suffix(&hit.roles)
         );
         println!(
             "  {}:{}:{}-{}:{}",

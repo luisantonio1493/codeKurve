@@ -16,8 +16,15 @@ use crate::languages::analyzer_for;
 /// intra-file relationships into a per-file `FileAnalysis`. Keeps its public
 /// signature; every existing caller (`commands.rs`, `incremental.rs`) is
 /// untouched by the seam refactor (design "Technical Approach").
+///
+/// D3: `frameworks::recognize` runs here, immediately after the per-language
+/// analyzer returns — this is the single entry point every caller already
+/// routes through, and the only place holding both the source text and the
+/// finished per-file symbol list.
 pub fn analyze(source: &str, language: LanguageId, relative_path: &str) -> Result<FileAnalysis> {
-    analyzer_for(language).analyze(source, relative_path)
+    let mut analysis = analyzer_for(language).analyze(source, relative_path)?;
+    crate::frameworks::recognize(source, language, &mut analysis);
+    Ok(analysis)
 }
 
 /// Reason text for a deferred (`PendingRel`) target with zero same-file

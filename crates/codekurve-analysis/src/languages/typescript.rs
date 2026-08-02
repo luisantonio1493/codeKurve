@@ -63,6 +63,11 @@ impl LanguageAnalyzer for TypeScriptAnalyzer {
                     SymbolKind::Class | SymbolKind::Function | SymbolKind::Interface
                 )
             }
+            // Task 2.4/spec "TypeScript Kind Matching Extends to Decorates
+            // Without TypeScript Regression": accepts `Decorates` the same
+            // unconditional way `CSharpAnalyzer::kind_matches` does (its own
+            // `_ => true` catch-all, csharp.rs) — every non-`Decorates`
+            // answer above is untouched.
             _ => true,
         }
     }
@@ -147,6 +152,14 @@ fn collect(node: Node, parent: Option<&str>, scope: Option<&str>, ctx: &mut Coll
             );
             if let Some(class_name) = &name {
                 collect_heritage(node, source, relative_path, class_name, &mut ctx.pending);
+                // Class-level decorators (`@Component`, `@Injectable`, ...)
+                // are a `decorator` field on `class_declaration` itself, not
+                // a child of `class_body` (task 2.2/2.5, D15's grammar note).
+                let class_key = qualified_name(relative_path, None, class_name);
+                let mut dcursor = node.walk();
+                for decorator in node.children_by_field_name("decorator", &mut dcursor) {
+                    push_decorator_edge(&mut ctx.out_rels, &class_key, decorator, source, None);
+                }
             }
             // Descend with the class name as the new parent so members get a
             // `Class.member` qualified name; this replaces the generic
@@ -157,6 +170,65 @@ fn collect(node: Node, parent: Option<&str>, scope: Option<&str>, ctx: &mut Coll
             }
             return;
         }
+        // Member decorators split into two grammar shapes (task 2.1's
+        // node-types.json check, verified against an actual parse — the
+        // per-type `fields` listing alone is misleading here): a
+        // `public_field_definition` (property) carries its own `decorator`
+        // field directly, but a `method_definition`'s decorator is *not* a
+        // field of the method — it surfaces as a `decorator` field on
+        // `class_body` itself, immediately preceding the method it
+        // annotates. Both are handled here so the shared recursion below
+        // still runs unmodified for every child.
+        "class_body" => {
+            let mut cursor = node.walk();
+            let children: Vec<Node> = node.named_children(&mut cursor).collect();
+            let mut pending_decorators: Vec<Node> = Vec::new();
+            for child in children {
+                if child.kind() == "decorator" {
+                    pending_decorators.push(child);
+                    continue;
+                }
+                if let Some(member_name) = member_name_text(child, source) {
+                    let member_key = qualified_name(relative_path, parent, &member_name);
+                    match child.kind() {
+                        "method_definition" => {
+                            for decorator in &pending_decorators {
+                                push_decorator_edge(
+                                    &mut ctx.out_rels,
+                                    &member_key,
+                                    *decorator,
+                                    source,
+                                    None,
+                                );
+                            }
+                        }
+                        "public_field_definition" => {
+                            let mut pcursor = child.walk();
+                            for decorator in child.children_by_field_name("decorator", &mut pcursor)
+                            {
+                                push_decorator_edge(
+                                    &mut ctx.out_rels,
+                                    &member_key,
+                                    decorator,
+                                    source,
+                                    None,
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                pending_decorators.clear();
+                collect(child, parent, scope, ctx);
+            }
+            return;
+        }
+        // A raw `decorator` node reached outside the anchor points above
+        // (e.g. a `required_parameter`'s `decorator` field, visited via the
+        // shared recursion below) is never walked generically — its inner
+        // `call_expression` would otherwise be picked up by the
+        // `call_expression` arm and misread as an ordinary call.
+        "decorator" => return,
         "interface_declaration" => {
             // Falls through to the shared recursion below (no early
             // `return`) — interface members (`property_signature`/
@@ -198,6 +270,15 @@ fn collect(node: Node, parent: Option<&str>, scope: Option<&str>, ctx: &mut Coll
                 confidence: Confidence::Exact,
                 reason: None,
             });
+            // Constructor-parameter decorators (`@Inject(TOKEN)`) — TS has no
+            // parameter symbols, so the source is the constructor itself
+            // (D15); `reason = "param:<index>"` is what lets a later pass
+            // match the decorator back to its parameter position. Only
+            // constructors get this treatment (task 2.3) — an ordinary
+            // method's parameter decorators are out of this PR's scope.
+            if kind == SymbolKind::Constructor {
+                collect_constructor_param_decorators(node, &method_key, source, &mut ctx.out_rels);
+            }
             // A method body can contain its own nested functions/classes;
             // recurse into it without the enclosing class as parent, but with
             // this method as the call/construct attribution scope.
@@ -237,6 +318,32 @@ fn collect(node: Node, parent: Option<&str>, scope: Option<&str>, ctx: &mut Coll
                 &mut ctx.out_rels,
                 &mut ctx.pending,
             );
+            // `export class Foo {}` moves the class's own decorator(s) onto
+            // `export_statement`'s `decorator` field rather than
+            // `class_declaration`'s (task 2.1 — verified against an actual
+            // parse, not just node-types.json's per-type field listing).
+            // Falls through to the shared recursion below, which still
+            // visits `declaration` normally for symbol/heritage extraction.
+            if let Some(decl) = node.child_by_field_name("declaration") {
+                if matches!(
+                    decl.kind(),
+                    "class_declaration" | "abstract_class_declaration"
+                ) {
+                    if let Some(class_name) = member_name_text(decl, source) {
+                        let class_key = qualified_name(relative_path, None, &class_name);
+                        let mut dcursor = node.walk();
+                        for decorator in node.children_by_field_name("decorator", &mut dcursor) {
+                            push_decorator_edge(
+                                &mut ctx.out_rels,
+                                &class_key,
+                                decorator,
+                                source,
+                                None,
+                            );
+                        }
+                    }
+                }
+            }
         }
         "call_expression" => {
             if let (Some(source_key), Some(target_name)) = (scope, callee_name(node, source)) {
@@ -556,6 +663,99 @@ fn referenced_type_name(node: Node, source: &[u8]) -> Option<String> {
     None
 }
 
+/// The literal decorator name text (task 2.2 — no framework name is ever
+/// special-cased here, only grammar shapes): `@Foo` → `Foo`; `@Foo(...)` →
+/// `Foo`; `@ns.Foo` / `@ns.Foo(...)` → `Foo` (last segment, mirroring
+/// `cs_simple_type_name`'s precedent); `@(expr)` unwraps one level of
+/// parens. Anything else falls back to its own source text.
+fn decorator_name(node: Node, source: &[u8]) -> Option<String> {
+    let inner = node.named_child(0)?;
+    decorator_expr_name(inner, source)
+}
+
+fn decorator_expr_name(node: Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "identifier" => node.utf8_text(source).ok().map(str::to_string),
+        "call_expression" => {
+            let func = node.child_by_field_name("function")?;
+            decorator_expr_name(func, source)
+        }
+        "member_expression" => node
+            .child_by_field_name("property")
+            .and_then(|p| p.utf8_text(source).ok())
+            .map(str::to_string),
+        "parenthesized_expression" => {
+            let inner = node.named_child(0)?;
+            decorator_expr_name(inner, source)
+        }
+        _ => node.utf8_text(source).ok().map(str::to_string),
+    }
+}
+
+/// Emits one `Decorates` edge for `decorator`, target
+/// `Unresolved(<literal name>)`, span = the decorator's own span (task 2.2).
+/// Silently skips a decorator whose name text can't be extracted rather than
+/// guessing.
+fn push_decorator_edge(
+    out: &mut Vec<ExtractedRelationship>,
+    source_key: &str,
+    decorator: Node,
+    source: &[u8],
+    reason: Option<String>,
+) {
+    let Some(name) = decorator_name(decorator, source) else {
+        return;
+    };
+    push_unresolved_edge(
+        out,
+        source_key,
+        RelationshipKind::Decorates,
+        &name,
+        span_of(decorator),
+        reason,
+    );
+}
+
+/// The plain `name` field text of a class member node — used ahead of
+/// `push_named` (by `class_body`'s decorator-pairing pass) so a member's
+/// qualified key can be computed before the member itself is visited.
+fn member_name_text(node: Node, source: &[u8]) -> Option<String> {
+    node.child_by_field_name("name")
+        .and_then(|n| n.utf8_text(source).ok())
+        .map(str::to_string)
+}
+
+/// Walks a constructor's `formal_parameters`, emitting one `Decorates` edge
+/// per parameter decorator (task 2.3) — `reason = "param:<index>"`, 0-based
+/// position in the parameter list, source = the constructor itself (D15: TS
+/// synthesizes no parameter symbols).
+fn collect_constructor_param_decorators(
+    node: Node,
+    method_key: &str,
+    source: &[u8],
+    out_rels: &mut Vec<ExtractedRelationship>,
+) {
+    let Some(params) = node.child_by_field_name("parameters") else {
+        return;
+    };
+    let mut cursor = params.walk();
+    for (index, param) in params.named_children(&mut cursor).enumerate() {
+        if !matches!(param.kind(), "required_parameter" | "optional_parameter") {
+            continue;
+        }
+        let mut dcursor = param.walk();
+        for decorator in param.children_by_field_name("decorator", &mut dcursor) {
+            push_decorator_edge(
+                out_rels,
+                method_key,
+                decorator,
+                source,
+                Some(format!("param:{index}")),
+            );
+        }
+    }
+}
+
 /// The best-effort enclosing symbol for a `References` edge: the innermost
 /// function/method scope (parameter/return type), else the enclosing class
 /// (a field's type annotation), else the file itself (a top-level
@@ -641,6 +841,9 @@ fn push_named(
         is_partial: false,
         is_record: false,
         partial_ordinal: None,
+        // Phase 7: recognition (frameworks::recognize) sets roles after
+        // analyze() returns; every analyzer construction site starts empty.
+        roles: Vec::new(),
     });
     Some(name)
 }
@@ -942,5 +1145,308 @@ function alsoTop() {
             a.symbols[0].signature_fingerprint,
             b.symbols[0].signature_fingerprint
         );
+    }
+
+    /// Task 2.5: class, method, property, and constructor-parameter
+    /// decorators each produce exactly one `Decorates` edge carrying the
+    /// literal decorator name text and the decorator's own span (spec
+    /// "TypeScript class decorator produces a decorates edge").
+    #[test]
+    fn all_four_decorator_positions_produce_decorates_edges() {
+        let source = r#"
+@Component({})
+export class InvoiceList {
+  @Input() name: string;
+
+  @HostListener('click')
+  onClick() {}
+
+  constructor(@Inject(TOKEN) private svc: Foo) {}
+}
+"#;
+        let analysis = analyze(source, LanguageId::TypeScript, "src/invoice-list.ts").unwrap();
+        let decorates: Vec<&ExtractedRelationship> = analysis
+            .relationships
+            .iter()
+            .filter(|r| r.kind == RelationshipKind::Decorates)
+            .collect();
+        assert_eq!(decorates.len(), 4, "class + property + method + param");
+
+        let class_edge = decorates
+            .iter()
+            .find(|r| r.source_local_key == "src/invoice-list.ts::InvoiceList")
+            .expect("class decorator");
+        assert_eq!(
+            class_edge.target,
+            EdgeTarget::Unresolved("Component".to_string())
+        );
+        assert!(class_edge.span.start_byte < class_edge.span.end_byte);
+        // The edge's own span is the decorator, not the whole class.
+        assert!(source[class_edge.span.start_byte..class_edge.span.end_byte].starts_with('@'));
+
+        let property_edge = decorates
+            .iter()
+            .find(|r| r.source_local_key == "src/invoice-list.ts::InvoiceList.name")
+            .expect("property decorator");
+        assert_eq!(
+            property_edge.target,
+            EdgeTarget::Unresolved("Input".to_string())
+        );
+
+        let method_edge = decorates
+            .iter()
+            .find(|r| r.source_local_key == "src/invoice-list.ts::InvoiceList.onClick")
+            .expect("method decorator");
+        assert_eq!(
+            method_edge.target,
+            EdgeTarget::Unresolved("HostListener".to_string())
+        );
+
+        let param_edge = decorates
+            .iter()
+            .find(|r| r.source_local_key == "src/invoice-list.ts::InvoiceList.constructor")
+            .expect("constructor-param decorator");
+        assert_eq!(
+            param_edge.target,
+            EdgeTarget::Unresolved("Inject".to_string())
+        );
+        assert_eq!(param_edge.reason.as_deref(), Some("param:0"));
+    }
+
+    /// Task 2.6: `@Inject(TOKEN) private svc: Foo` on a constructor
+    /// parameter → `Decorates` edge with `reason = "param:<index>"` (spec
+    /// "TypeScript constructor-parameter decorator produces a decorates
+    /// edge").
+    #[test]
+    fn constructor_param_decorator_carries_param_index_reason() {
+        let source =
+            "class Widget {\n  constructor(plain: Bar, @Inject(TOKEN) private svc: Foo) {}\n}\n";
+        let analysis = analyze(source, LanguageId::TypeScript, "src/widget-di.ts").unwrap();
+
+        let param_edge = analysis
+            .relationships
+            .iter()
+            .find(|r| r.kind == RelationshipKind::Decorates)
+            .expect("one Decorates edge for the decorated parameter");
+        assert_eq!(
+            param_edge.source_local_key,
+            "src/widget-di.ts::Widget.constructor"
+        );
+        assert_eq!(
+            param_edge.target,
+            EdgeTarget::Unresolved("Inject".to_string())
+        );
+        // svc is the second parameter (index 1) — plain has no decorator and
+        // emits nothing.
+        assert_eq!(param_edge.reason.as_deref(), Some("param:1"));
+    }
+
+    /// Task 2.7: exhaustive `(RelationshipKind, SymbolKind)` sweep —
+    /// `Decorates` matches unconditionally (mirroring `CSharpAnalyzer`'s own
+    /// `_ => true`), and every non-`Decorates` pair is unchanged from the
+    /// pre-existing table (spec "Existing TypeScript kind_matches answers
+    /// are unaffected").
+    #[test]
+    fn kind_matches_accepts_decorates_and_leaves_other_answers_unchanged() {
+        use crate::languages::analyzer_for;
+
+        const ALL_SYMBOL_KINDS: [SymbolKind; 16] = [
+            SymbolKind::Module,
+            SymbolKind::Namespace,
+            SymbolKind::Class,
+            SymbolKind::Interface,
+            SymbolKind::Struct,
+            SymbolKind::Enum,
+            SymbolKind::Function,
+            SymbolKind::Method,
+            SymbolKind::Constructor,
+            SymbolKind::Property,
+            SymbolKind::Field,
+            SymbolKind::Variable,
+            SymbolKind::Parameter,
+            SymbolKind::TypeAlias,
+            SymbolKind::Import,
+            SymbolKind::Export,
+        ];
+
+        fn pre_pr2_kind_matches(rel_kind: RelationshipKind, sym_kind: SymbolKind) -> bool {
+            match rel_kind {
+                RelationshipKind::Constructs => sym_kind == SymbolKind::Class,
+                RelationshipKind::Calls => matches!(
+                    sym_kind,
+                    SymbolKind::Function | SymbolKind::Method | SymbolKind::Constructor
+                ),
+                RelationshipKind::Inherits | RelationshipKind::Implements => {
+                    matches!(sym_kind, SymbolKind::Class | SymbolKind::Interface)
+                }
+                RelationshipKind::References => {
+                    matches!(
+                        sym_kind,
+                        SymbolKind::Class | SymbolKind::Interface | SymbolKind::TypeAlias
+                    )
+                }
+                RelationshipKind::Exports => {
+                    matches!(
+                        sym_kind,
+                        SymbolKind::Class | SymbolKind::Function | SymbolKind::Interface
+                    )
+                }
+                _ => true,
+            }
+        }
+
+        for analyzer in [
+            analyzer_for(LanguageId::TypeScript),
+            analyzer_for(LanguageId::JavaScript),
+        ] {
+            for &sym_kind in &ALL_SYMBOL_KINDS {
+                assert!(
+                    analyzer.kind_matches(RelationshipKind::Decorates, sym_kind),
+                    "Decorates must match every symbol kind, got false for {sym_kind:?}"
+                );
+                for &rel_kind in &[
+                    RelationshipKind::Defines,
+                    RelationshipKind::Contains,
+                    RelationshipKind::Imports,
+                    RelationshipKind::Exports,
+                    RelationshipKind::References,
+                    RelationshipKind::Calls,
+                    RelationshipKind::Constructs,
+                    RelationshipKind::Inherits,
+                    RelationshipKind::Implements,
+                    RelationshipKind::Overrides,
+                    RelationshipKind::UsesType,
+                    RelationshipKind::Reads,
+                    RelationshipKind::Writes,
+                ] {
+                    assert_eq!(
+                        analyzer.kind_matches(rel_kind, sym_kind),
+                        pre_pr2_kind_matches(rel_kind, sym_kind),
+                        "mismatch for ({rel_kind:?}, {sym_kind:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Task 2.8: no framework-specific string literal (Angular/ASP.NET/EF
+    /// Core catalogue names) is ever compared/matched against inside the
+    /// *production* extraction logic of `languages/typescript.rs` or
+    /// `languages/csharp.rs` (spec "No Angular-specific ... decorator name
+    /// MUST be special-cased inside `languages/typescript.rs`"), following
+    /// `scripts/check_licensing.py`'s grep-based-check precedent. Comments
+    /// and the `#[cfg(test)]` module are stripped first — both files
+    /// legitimately use realistic decorator/attribute names (`@Component`,
+    /// `[HttpGet]`, ...) as generic, framework-blind extraction examples;
+    /// this check is about branching logic, not illustrative test fixtures.
+    #[test]
+    fn no_framework_specific_names_in_language_analyzer_logic() {
+        const FRAMEWORK_MARKERS: &[&str] = &[
+            "Component",
+            "Injectable",
+            "NgModule",
+            "Directive",
+            "HostListener",
+            "Angular",
+            "ApiController",
+            "HttpGet",
+            "HttpPost",
+            "DbSet",
+            "DbContext",
+            "AddScoped",
+            "AddSingleton",
+            "AddTransient",
+            "UseMiddleware",
+            "MapGet",
+            "MapPost",
+            "AzureFunction",
+            "TimerTrigger",
+            "QueueTrigger",
+        ];
+        for (path, contents) in [
+            ("src/languages/typescript.rs", include_str!("typescript.rs")),
+            ("src/languages/csharp.rs", include_str!("csharp.rs")),
+        ] {
+            let production_code = production_code_only(contents);
+            for marker in FRAMEWORK_MARKERS {
+                assert!(
+                    !production_code.contains(marker),
+                    "{path} contains framework-specific marker {marker:?} outside comments/tests"
+                );
+            }
+        }
+    }
+
+    /// Drops everything from `#[cfg(test)]` onward (the test module) and
+    /// every `//`/`///` comment, leaving only the compiled, non-test source
+    /// text that task 2.8 cares about.
+    fn production_code_only(src: &str) -> String {
+        let code = src.split("#[cfg(test)]").next().unwrap_or(src);
+        code.lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Task 2.9: runtime harness — decorator extraction on a scratch `.ts`
+    /// source covering all four decorator positions, output asserted by
+    /// hand (name text + span + reason for every edge, no framework
+    /// semantics inferred).
+    #[test]
+    fn runtime_harness_scratch_file_all_decorator_positions() {
+        let source = r#"
+@Injectable()
+export class TokenStore {
+  @Input() token: string;
+
+  @HostListener('window:resize')
+  onResize() {}
+
+  constructor(@Inject(WINDOW) private win: Window, plain: Logger) {}
+}
+"#;
+        let analysis = analyze(source, LanguageId::TypeScript, "src/token-store.ts").unwrap();
+        let mut decorates: Vec<(&str, String, Option<&str>)> = analysis
+            .relationships
+            .iter()
+            .filter(|r| r.kind == RelationshipKind::Decorates)
+            .map(|r| {
+                let EdgeTarget::Unresolved(name) = &r.target else {
+                    panic!("Decorates target must be Unresolved");
+                };
+                (
+                    r.source_local_key.as_str(),
+                    name.clone(),
+                    r.reason.as_deref(),
+                )
+            })
+            .collect();
+        decorates.sort();
+
+        let mut expected = vec![
+            (
+                "src/token-store.ts::TokenStore",
+                "Injectable".to_string(),
+                None,
+            ),
+            (
+                "src/token-store.ts::TokenStore.token",
+                "Input".to_string(),
+                None,
+            ),
+            (
+                "src/token-store.ts::TokenStore.onResize",
+                "HostListener".to_string(),
+                None,
+            ),
+            (
+                "src/token-store.ts::TokenStore.constructor",
+                "Inject".to_string(),
+                Some("param:0"),
+            ),
+        ];
+        expected.sort();
+
+        assert_eq!(decorates, expected);
     }
 }

@@ -10,5 +10,6 @@ pub use config::Config;
 pub use error::{Error, Result};
 pub use language::LanguageId;
 pub use symbol::{
-    Confidence, Provenance, RelationshipKind, SourceSpan, Symbol, SymbolKind, Visibility,
+    Confidence, FrameworkRole, Provenance, RelationshipKind, SourceSpan, Symbol, SymbolKind,
+    Visibility,
 };

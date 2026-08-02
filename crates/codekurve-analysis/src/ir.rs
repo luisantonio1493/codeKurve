@@ -3,7 +3,8 @@
 //! §Interfaces, plan §18, §22).
 
 use codekurve_core::{
-    Confidence, LanguageId, Provenance, RelationshipKind, SourceSpan, SymbolKind, Visibility,
+    Confidence, FrameworkRole, LanguageId, Provenance, RelationshipKind, SourceSpan, SymbolKind,
+    Visibility,
 };
 
 /// One file's extracted symbols/relationships, pre-resolution.
@@ -46,6 +47,10 @@ pub struct ExtractedSymbol {
     /// Disambiguates multiple `partial` fragments of the same type in one
     /// file for `symbol_key`. `None` for every TypeScript symbol.
     pub partial_ordinal: Option<u32>,
+    /// Phase 7: framework-level role tags, set by `frameworks::recognize`
+    /// after `analyzer.analyze()` returns (design "Data Flow"). Every
+    /// per-language analyzer construction site sets this to `vec![]`.
+    pub roles: Vec<FrameworkRole>,
 }
 
 /// A relationship edge extracted from one file, before its target is

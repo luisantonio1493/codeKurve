@@ -45,6 +45,15 @@ Full command surface and flags: `docs/ROADMAP.md`; CLI conventions: the plan
 CodeKurve indexes TypeScript, JavaScript, and C#. See the concise coverage
 matrix and C# limitations in [docs/LANGUAGES.md](docs/LANGUAGES.md).
 
+## Framework awareness
+
+CodeKurve recognizes Angular (`@Component`, `@Injectable`, DI, routes) and
+.NET (attribute-driven controllers/Azure Functions, minimal APIs, DI
+registration, EF Core) idioms as a separate heuristic pass downstream of
+extraction. Every framework edge is marked `Heuristic` and never upgrades to
+a resolved fact. Full catalogue, confidence semantics, and published
+limitations: [docs/FRAMEWORKS.md](docs/FRAMEWORKS.md).
+
 ## MCP server
 
 `codekurve mcp` serves the query layer over MCP stdio for agent clients

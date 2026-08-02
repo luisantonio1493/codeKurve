@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use codekurve_core::{
-    Confidence, LanguageId, Provenance, RelationshipKind, SourceSpan, Symbol, SymbolKind,
-    Visibility,
+    Confidence, FrameworkRole, LanguageId, Provenance, RelationshipKind, SourceSpan, Symbol,
+    SymbolKind, Visibility,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 
@@ -83,6 +83,10 @@ pub struct StoredSymbol {
     pub visibility: String,
     pub is_partial: bool,
     pub is_record: bool,
+    /// Phase 7 PR1 (design "Model and Storage Changes"): parsed back from
+    /// the comma-joined `symbols.roles` column via `parse_roles`. Empty for
+    /// every pre-Phase-7 row.
+    pub roles: Vec<FrameworkRole>,
 }
 
 /// Deterministic file storage id. Exposed so a caller (the `codekurve`
@@ -255,13 +259,21 @@ fn insert_file_and_symbols(
         );
         let symbol_id = symbol_id(&file_id, &symbol_key);
         let qualified = &symbol.qualified_name;
+        let mut roles = symbol.roles.clone();
+        roles.sort();
+        roles.dedup();
+        let roles_text = roles
+            .iter()
+            .map(|r| r.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
         tx.execute(
             "INSERT INTO symbols(id, project_id, file_id, symbol_key, name, qualified_name,
                  kind, language, start_byte, end_byte, start_line, start_column,
                  end_line, end_column, provenance, confidence, visibility, is_partial,
-                 is_record, generation, created_at, updated_at)
+                 is_record, roles, generation, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                 'tree-sitter', 'high', ?15, ?16, ?17, 1, ?18, ?18)",
+                 'tree-sitter', 'high', ?15, ?16, ?17, ?18, 1, ?19, ?19)",
             params![
                 symbol_id,
                 project_id,
@@ -280,6 +292,7 @@ fn insert_file_and_symbols(
                 symbol.visibility.as_str(),
                 symbol.is_partial,
                 symbol.is_record,
+                roles_text,
                 ts,
             ],
         )?;
@@ -929,7 +942,7 @@ pub fn search(
     let mut stmt = conn.prepare(
         "SELECT s.id, s.name, s.qualified_name, s.kind, s.language, f.relative_path,
                 s.start_byte, s.end_byte, s.start_line, s.start_column, s.end_line, s.end_column,
-                s.visibility, s.is_partial, s.is_record
+                s.visibility, s.is_partial, s.is_record, s.roles
          FROM symbols s
          JOIN files f ON f.id = s.file_id
          WHERE s.project_id = ?2
@@ -958,7 +971,7 @@ pub fn find_by_name(conn: &Connection, project_id: &str, name: &str) -> Result<V
     let mut stmt = conn.prepare(
         "SELECT s.id, s.name, s.qualified_name, s.kind, s.language, f.relative_path,
                 s.start_byte, s.end_byte, s.start_line, s.start_column, s.end_line, s.end_column,
-                s.visibility, s.is_partial, s.is_record
+                s.visibility, s.is_partial, s.is_record, s.roles
          FROM symbols s
          JOIN files f ON f.id = s.file_id
          WHERE s.project_id = ?1 AND s.name = ?2
@@ -975,7 +988,7 @@ pub fn find_symbol_by_id(conn: &Connection, id: &str) -> Result<Option<StoredSym
     let mut stmt = conn.prepare(
         "SELECT s.id, s.name, s.qualified_name, s.kind, s.language, f.relative_path,
                 s.start_byte, s.end_byte, s.start_line, s.start_column, s.end_line, s.end_column,
-                s.visibility, s.is_partial, s.is_record
+                s.visibility, s.is_partial, s.is_record, s.roles
          FROM symbols s
          JOIN files f ON f.id = s.file_id
          WHERE s.id = ?1",
@@ -1170,6 +1183,7 @@ fn map_stored(row: &Row) -> rusqlite::Result<StoredSymbol> {
         visibility: row.get(12)?,
         is_partial: row.get(13)?,
         is_record: row.get(14)?,
+        roles: parse_roles(&row.get::<_, String>(15)?),
     })
 }
 
@@ -1189,6 +1203,29 @@ fn parse_visibility(s: &str) -> Visibility {
         "privateprotected" => Visibility::PrivateProtected,
         _ => Visibility::Default,
     }
+}
+
+/// Reverse of the comma-joined `symbols.roles` column written by
+/// `insert_file_and_symbols` (each token itself `FrameworkRole::as_str`),
+/// for reading it back into `StoredSymbol.roles` (Phase 7 PR1, mirrors
+/// `parse_visibility`). Empty string → empty `Vec`. An unrecognized token is
+/// skipped rather than erroring — every stored value was written by
+/// `as_str` itself, so this is unreachable in practice.
+fn parse_roles(s: &str) -> Vec<FrameworkRole> {
+    if s.is_empty() {
+        return Vec::new();
+    }
+    s.split(',')
+        .filter_map(|token| match token {
+            "controller" => Some(FrameworkRole::Controller),
+            "route" => Some(FrameworkRole::Route),
+            "service" => Some(FrameworkRole::Service),
+            "repository" => Some(FrameworkRole::Repository),
+            "component" => Some(FrameworkRole::Component),
+            "decorator" => Some(FrameworkRole::Decorator),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Reverse of `SymbolKind::as_str` (codekurve-core), for reading `symbols.kind`
@@ -1269,7 +1306,7 @@ pub fn now_ts() -> String {
 mod tests {
     use super::*;
     use crate::db;
-    use codekurve_core::{LanguageId, SymbolKind};
+    use codekurve_core::{FrameworkRole, LanguageId, SymbolKind};
 
     fn symbol(name: &str, kind: SymbolKind, start_byte: usize) -> Symbol {
         Symbol {
@@ -1291,6 +1328,7 @@ mod tests {
             is_partial: false,
             is_record: false,
             partial_ordinal: None,
+            roles: Vec::new(),
         }
     }
 
@@ -1337,6 +1375,47 @@ mod tests {
         let hits = find_by_name(&conn, &pid, "findMember").unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].kind, "function");
+    }
+
+    /// Phase 7 PR1 task 1.10: `roles` sorted + deduped round-trips through
+    /// `insert_file_and_symbols` → `parse_roles` for a symbol carrying 2+
+    /// roles, written out of order with a duplicate.
+    #[test]
+    fn roles_round_trip_sorted_and_deduped() {
+        let mut conn = db::open_in_memory().unwrap();
+        let project = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        let mut sym = symbol("WidgetService", SymbolKind::Class, 0);
+        sym.roles = vec![
+            FrameworkRole::Service,
+            FrameworkRole::Component,
+            FrameworkRole::Service,
+        ];
+        let files = vec![FileInput {
+            relative_path: "src/widget.ts".to_string(),
+            language: "typescript".to_string(),
+            content_hash: "test-hash".to_string(),
+            modified_ns: 0,
+            size_bytes: 42,
+            symbols: vec![sym],
+        }];
+        reindex(&mut conn, &project, &files, &[], &[]).unwrap();
+
+        let hits = find_by_name(&conn, &project, "WidgetService").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].roles,
+            vec![FrameworkRole::Service, FrameworkRole::Component],
+            "roles sorted (derive order) and deduped on write"
+        );
+
+        let roles_text: String = conn
+            .query_row(
+                "SELECT roles FROM symbols WHERE name = 'WidgetService'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(roles_text, "service,component");
     }
 
     #[test]

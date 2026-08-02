@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use codekurve_core::{Confidence, LanguageId, Provenance, RelationshipKind, SymbolKind};
 
 use crate::ir::{EdgeTarget, ExtractedRelationship, FileAnalysis, UnresolvedReference};
-use crate::languages::{analyzer_for, same_resolution_domain, BASE_LIST_REASON};
+use crate::languages::{analyzer_for, kind_matches, same_resolution_domain, BASE_LIST_REASON};
 
 /// Minimal `tsconfig.json` `compilerOptions.paths` alias map: prefix (with a
 /// single trailing `*`) -> replacement prefix. Deliberately narrow scope
@@ -425,6 +425,24 @@ fn resolve_one(
             unresolved,
             report,
         ),
+        // D4/D5: the 5 framework-level kinds always arrive as
+        // `EdgeTarget::Unresolved(<name as written>)` from `frameworks::
+        // recognize`, bound here through the same by-name project lookup
+        // every other kind uses — but never promoted past the D5 provenance
+        // floor (`resolve_framework_edge`/`push_framework_edge` below).
+        RelationshipKind::Injects
+        | RelationshipKind::RegisteredAs
+        | RelationshipKind::HandlesRoute
+        | RelationshipKind::Triggers
+        | RelationshipKind::PersistsTo => resolve_framework_edge(
+            source_language,
+            &rel,
+            &text,
+            table,
+            new_rels,
+            unresolved,
+            report,
+        ),
         // `Defines`/`Overrides`/`UsesType`/`Reads`/`Writes` aren't produced
         // by `extract::analyze` yet — nothing to resolve, pass through
         // unchanged.
@@ -455,7 +473,7 @@ fn resolve_by_name(
         .flatten()
         .filter(|ps| {
             same_resolution_domain(source_language, ps.language)
-                && analyzer.kind_matches(rel.kind, ps.kind)
+                && kind_matches(analyzer, rel.kind, ps.kind)
         })
         .collect();
 
@@ -494,6 +512,125 @@ fn resolve_by_name(
             }
         }
     }
+}
+
+/// D5 provenance floor's confidence side: `Exact > High > Medium > Low >
+/// Unresolved`, as a rank where a *larger* number is weaker. `min_confidence`
+/// picks whichever of the two inputs is weaker — the recognition-time
+/// ceiling never gets upgraded by a clean resolution outcome.
+fn confidence_rank(c: Confidence) -> u8 {
+    match c {
+        Confidence::Exact => 0,
+        Confidence::High => 1,
+        Confidence::Medium => 2,
+        Confidence::Low => 3,
+        Confidence::Unresolved => 4,
+    }
+}
+
+fn min_confidence(a: Confidence, b: Confidence) -> Confidence {
+    if confidence_rank(a) >= confidence_rank(b) {
+        a
+    } else {
+        b
+    }
+}
+
+/// Project-wide by-name lookup for the 5 framework-level kinds (D4), sharing
+/// `resolve_by_name`'s candidate search but never `resolve_by_name`'s
+/// `push_global` — a framework edge is bound through `push_framework_edge`
+/// instead, which is what enforces the D5 provenance floor.
+fn resolve_framework_edge(
+    source_language: LanguageId,
+    rel: &ExtractedRelationship,
+    text: &str,
+    table: &SymbolTable,
+    new_rels: &mut Vec<ExtractedRelationship>,
+    unresolved: &mut Vec<UnresolvedReference>,
+    report: &mut ResolutionReport,
+) {
+    let analyzer = analyzer_for(source_language);
+    let matches: Vec<&ProjectSymbol> = table
+        .by_name
+        .get(text)
+        .into_iter()
+        .flatten()
+        .filter(|ps| {
+            same_resolution_domain(source_language, ps.language)
+                && kind_matches(analyzer, rel.kind, ps.kind)
+        })
+        .collect();
+
+    match matches.as_slice() {
+        [] => {
+            unresolved.push(unresolved_ref(rel, text, "no matching symbol in project"));
+            report.unresolved += 1;
+        }
+        [only] => {
+            // Q1 resolution table's interface cap (design.md "Q1 — Angular
+            // and .NET DI inference"), scoped to `Injects` only: a single
+            // `Interface` candidate never resolves past `Medium` — an
+            // interface names a contract, not the implementation that runs,
+            // and only a future `RegisteredAs` edge says which impl that is.
+            // Every other framework kind (and every non-Interface `Injects`
+            // candidate) keeps the pre-existing single-candidate `High`.
+            let resolution_confidence =
+                if rel.kind == RelationshipKind::Injects && only.kind == SymbolKind::Interface {
+                    Confidence::Medium
+                } else {
+                    Confidence::High
+                };
+            push_framework_edge(
+                new_rels,
+                rel,
+                &only.file,
+                &only.qualified_name,
+                resolution_confidence,
+            );
+            report.resolved += 1;
+        }
+        many => {
+            for candidate in many {
+                push_framework_edge(
+                    new_rels,
+                    rel,
+                    &candidate.file,
+                    &candidate.qualified_name,
+                    Confidence::Low,
+                );
+                report.resolved += 1;
+            }
+        }
+    }
+}
+
+/// D5 provenance floor, load-bearing part of this PR: `provenance` is
+/// carried through from `rel` verbatim — a `Heuristic` edge stays
+/// `Heuristic`, *never* upgraded to `Resolved`/`Extracted` no matter how
+/// clean the resolution match was. `confidence` is capped at `min(rel's
+/// recognition-time ceiling, this resolution's own confidence)`, so a
+/// single-candidate match can only ever *keep or lower* the ceiling the
+/// recognition pass assigned, never raise it. This is what keeps a
+/// heuristic guess from ever becoming indistinguishable from a parsed fact.
+fn push_framework_edge(
+    new_rels: &mut Vec<ExtractedRelationship>,
+    rel: &ExtractedRelationship,
+    file: &str,
+    qualified_name: &str,
+    resolution_confidence: Confidence,
+) {
+    new_rels.push(ExtractedRelationship {
+        source_local_key: rel.source_local_key.clone(),
+        target: EdgeTarget::Global {
+            file: file.to_string(),
+            qualified_name: qualified_name.to_string(),
+        },
+        kind: rel.kind,
+        span: rel.span,
+        provenance: rel.provenance,
+        confidence: min_confidence(rel.confidence, resolution_confidence),
+        reason: rel.reason.clone(),
+    });
 }
 
 fn resolve_base_entry(
@@ -829,7 +966,7 @@ fn unresolved_ref(
 mod tests {
     use super::*;
     use crate::extract::analyze;
-    use codekurve_core::LanguageId;
+    use codekurve_core::{LanguageId, SourceSpan};
 
     fn analyzed(path: &str, source: &str) -> FileAnalysis {
         analyze(source, LanguageId::TypeScript, path).unwrap()
@@ -1310,5 +1447,111 @@ mod tests {
                 && reference.reason == "no matching symbol in project"
         }));
         assert!(report.unresolved >= 1);
+    }
+
+    /// Task 3.9 — the D5 provenance floor, unit-tested with a synthetic
+    /// edge *before any catalogue exists* (PR4/5/6 land later): a
+    /// `Heuristic`/`Medium` framework edge with exactly one project-wide
+    /// candidate must resolve to `Heuristic`/`Medium`, never `Resolved`/
+    /// `Exact` — proving the floor holds even though the by-name lookup
+    /// below is the exact same "exactly one candidate" shape that gives
+    /// `resolve_by_name` `Provenance::Resolved`/`Confidence::High`.
+    #[test]
+    fn provenance_floor_never_upgrades_a_heuristic_framework_edge() {
+        let dummy_span = SourceSpan {
+            start_byte: 0,
+            end_byte: 0,
+            start_line: 1,
+            start_column: 0,
+            end_line: 1,
+            end_column: 0,
+        };
+        let synthetic = FileAnalysis {
+            file: "src/widget.ts".to_string(),
+            language: LanguageId::TypeScript,
+            symbols: vec![],
+            relationships: vec![ExtractedRelationship {
+                source_local_key: "widget".to_string(),
+                target: EdgeTarget::Unresolved("Service".to_string()),
+                kind: RelationshipKind::Injects,
+                span: dummy_span,
+                provenance: Provenance::Heuristic,
+                confidence: Confidence::Medium,
+                reason: Some("di:ctor-param:0".to_string()),
+            }],
+            unresolved: vec![],
+            diagnostics: vec![],
+        };
+        let mut files = vec![
+            synthetic,
+            analyzed("src/service.ts", "export class Service {}"),
+        ];
+
+        let report = resolve(&mut files, &TsconfigAliases::new());
+        assert_eq!(report.unresolved, 0);
+
+        let edge = files[0]
+            .relationships
+            .iter()
+            .find(|r| r.kind == RelationshipKind::Injects)
+            .expect("Injects edge must survive resolution");
+
+        // Exactly one candidate ("Service" the class) would give
+        // `resolve_by_name` `Provenance::Resolved`/`Confidence::High` — the
+        // floor must keep provenance at `Heuristic` and cap confidence at
+        // the recognition-time ceiling (`Medium`), never let resolution
+        // raise it to `High`.
+        assert_eq!(edge.provenance, Provenance::Heuristic);
+        assert_eq!(edge.confidence, Confidence::Medium);
+        assert_eq!(
+            edge.target,
+            EdgeTarget::Global {
+                file: "src/service.ts".to_string(),
+                qualified_name: "src/service.ts::Service".to_string(),
+            }
+        );
+    }
+
+    /// Same shape, zero candidates: an `UnresolvedReference` is preserved
+    /// exactly as any other kind's zero-candidate case, never dropped.
+    #[test]
+    fn provenance_floor_zero_candidates_becomes_unresolved_reference() {
+        let dummy_span = SourceSpan {
+            start_byte: 0,
+            end_byte: 0,
+            start_line: 1,
+            start_column: 0,
+            end_line: 1,
+            end_column: 0,
+        };
+        let synthetic = FileAnalysis {
+            file: "src/widget.ts".to_string(),
+            language: LanguageId::TypeScript,
+            symbols: vec![],
+            relationships: vec![ExtractedRelationship {
+                source_local_key: "widget".to_string(),
+                target: EdgeTarget::Unresolved("NeverDefined".to_string()),
+                kind: RelationshipKind::Injects,
+                span: dummy_span,
+                provenance: Provenance::Heuristic,
+                confidence: Confidence::High,
+                reason: Some("di:ctor-param:0".to_string()),
+            }],
+            unresolved: vec![],
+            diagnostics: vec![],
+        };
+        let mut files = vec![synthetic];
+
+        let report = resolve(&mut files, &TsconfigAliases::new());
+        assert_eq!(report.unresolved, 1);
+        assert!(files[0]
+            .relationships
+            .iter()
+            .all(|r| r.kind != RelationshipKind::Injects));
+        assert!(files[0]
+            .unresolved
+            .iter()
+            .any(|r| r.relationship_kind == RelationshipKind::Injects
+                && r.target_text == "NeverDefined"));
     }
 }
