@@ -21,6 +21,9 @@ pub struct Args {
     pub debounce_ms: Option<u64>,
     pub client: Option<String>,
     pub yes: bool,
+    /// `uninstall --binary`: also remove the codekurve executable. Opt-in
+    /// only — plain `uninstall` still touches agent configs and nothing else.
+    pub binary: bool,
 }
 
 impl Args {
@@ -37,6 +40,7 @@ impl Args {
         let mut debounce_ms = None;
         let mut client = None;
         let mut yes = false;
+        let mut binary = false;
         let mut iter = args;
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -51,6 +55,7 @@ impl Args {
                 "--debounce-ms" => debounce_ms = iter.next().and_then(|v| v.parse().ok()),
                 "--client" => client = iter.next(),
                 "--yes" | "-y" => yes = true,
+                "--binary" => binary = true,
                 _ => positionals.push(arg),
             }
         }
@@ -67,6 +72,7 @@ impl Args {
             debounce_ms,
             client,
             yes,
+            binary,
         }
     }
 

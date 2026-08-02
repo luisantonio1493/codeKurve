@@ -421,7 +421,25 @@ fn apply(exe: &Path, root: &Path, targets: &[(Client, PathBuf)]) -> Result<(), S
 /// `codekurve uninstall [<client>] [--root <path>] [--yes]`: removes only the
 /// `codekurve` entry from each client config that has one, leaving sibling
 /// entries (and the file itself) intact.
-pub fn uninstall(root: &Path, client: Option<&str>, yes: bool) -> Result<(), String> {
+/// `remove_binary` is opt-in (`--binary`) and never the default: escalating a
+/// previously config-only command into one that deletes an executable would
+/// be a surprising, hard-to-undo default, and it would contradict ADR 0012's
+/// own reasoning that the subprocess is only ever reached by explicit user
+/// intent. (This deliberately diverges from codegraph, whose `uninstall`
+/// removes both by default with `--keep-cli` to opt out — see ADR 0012.)
+pub fn uninstall(
+    root: &Path,
+    client: Option<&str>,
+    yes: bool,
+    remove_binary: bool,
+) -> Result<(), String> {
+    // Checked up front, before any config is edited: `--binary` on a
+    // non-terminal stdin without `--yes` must refuse outright rather than
+    // clean the configs and then bail halfway through (ADR 0012).
+    if remove_binary {
+        crate::update::precheck_binary_removal(yes)?;
+    }
+
     let root = root
         .canonicalize()
         .map_err(|e| format!("failed to resolve --root: {e}"))?;
@@ -454,8 +472,7 @@ pub fn uninstall(root: &Path, client: Option<&str>, yes: bool) -> Result<(), Str
         if !unreadable.is_empty() {
             println!("could not read: {}", unreadable.join(", "));
         }
-        println!("{UNINSTALL_BINARY_NOTE}");
-        return Ok(());
+        return finish_uninstall(remove_binary, yes, Vec::new());
     }
 
     println!("codekurve uninstall will remove the codekurve entry from:");
@@ -483,17 +500,29 @@ pub fn uninstall(root: &Path, client: Option<&str>, yes: bool) -> Result<(), Str
             }
         }
     }
-    println!("{UNINSTALL_BINARY_NOTE}");
-    if failures.is_empty() {
-        Ok(())
+    finish_uninstall(remove_binary, yes, failures)
+}
+
+/// Shared tail of both `uninstall` exits: report config failures, then either
+/// print the "configs only" note (default) or hand off to the one subprocess
+/// path that can delete the executable (`--binary`, ADR 0012).
+fn finish_uninstall(remove_binary: bool, yes: bool, failures: Vec<&str>) -> Result<(), String> {
+    if !failures.is_empty() {
+        return Err(format!("could not clean: {}", failures.join(", ")));
+    }
+    if remove_binary {
+        println!();
+        crate::update::remove_binary(yes)
     } else {
-        Err(format!("could not clean: {}", failures.join(", ")))
+        println!("{UNINSTALL_BINARY_NOTE}");
+        Ok(())
     }
 }
 
 const UNINSTALL_BINARY_NOTE: &str =
     "note: this removes agent configs only. To remove the codekurve binary \
-     itself, use install.sh --uninstall (install.ps1 -Uninstall on Windows).";
+     itself too, re-run as `codekurve uninstall --binary` (or use \
+     install.sh --uninstall / install.ps1 -Uninstall directly).";
 
 /// Dispatches to the format-specific remover. `apply == false` only reports
 /// whether an entry exists (used to build the confirmation plan), touching
