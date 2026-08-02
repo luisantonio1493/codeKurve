@@ -273,11 +273,12 @@ mod tests {
         });
 
         // Send an event every 20ms (< 50ms debounce, so the sliding window
-        // never elapses on its own) for 300ms — long enough to blow past
-        // the 120ms hard cap at least once.
+        // never elapses on its own) for 600ms — long enough to blow past
+        // the 120ms hard cap several times even under CI scheduling jitter
+        // (a 300ms window proved flaky on loaded macOS runners: only 1 flush).
         let start = Instant::now();
         let mut i = 0;
-        while start.elapsed() < Duration::from_millis(300) {
+        while start.elapsed() < Duration::from_millis(600) {
             tx.send(vec![PathBuf::from(format!("file{i}.ts"))]).unwrap();
             i += 1;
             thread::sleep(Duration::from_millis(20));
