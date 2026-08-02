@@ -22,3 +22,22 @@ serde_json = "1"
 # on directly, so only one crossterm ends up in the tree.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
 crossterm = "0.29"
+
+# Measured 2026-08-02 on a cold build of `codekurve-bin` (plan §38 deferred
+# this until real workloads existed to measure against; phase 8's pilot
+# supplied them):
+#
+#   defaults : 16.41 MB, 29.7 s wall
+#   this     : 13.62 MB, 63.0 s wall  (-17 % size, 2.1x wall)
+#
+# CI does not pay that: its `clippy`/`test` steps build the dev profile, so
+# only the Release workflow's four tagged targets rebuild here, in parallel.
+# A 2.8 MB saving on every download is worth ~30 s on a release.
+#
+# `panic = "abort"` is deliberately NOT set: the TUI installs a panic hook to
+# restore the terminal (ADR 0011), and aborting would skip it and leave the
+# user's shell in raw mode.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
