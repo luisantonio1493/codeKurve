@@ -7,14 +7,15 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use cli::Args;
-use codekurve::{commands, install, update, watch};
+use codekurve::{commands, export, install, update, watch};
 use commands::CommandError;
 
 /// One dense line, printed to stderr when the invocation is wrong. `--help`
 /// gets [`HELP`] on stdout instead — see the note there.
 const USAGE: &str =
     "usage: codekurve <version|init|index|watch|mcp|tui|status|search|symbol|doctor|\
-references|callers|callees|implementations|unresolved|trace|impact|install|uninstall|update> \
+references|callers|callees|implementations|unresolved|trace|impact|export|install|uninstall|\
+update> \
 [args] [--root <path>] [--debounce-ms <n>] [--client <name>] [--yes] [--binary]\n\
 run `codekurve --help` for the full command list.";
 
@@ -51,6 +52,9 @@ querying
 
 interactive
   tui                           terminal code-graph explorer
+  export <out.html> [--depth N] one self-contained HTML file picturing a
+                                symbol's neighbourhood, both directions; open
+                                it with file://, no server. --yes to overwrite.
 
 agents
   mcp                           serve the query layer over MCP stdio
@@ -131,6 +135,13 @@ fn main() -> ExitCode {
         // project, `codekurve unresolved <target-text>` filters to one target.
         "unresolved" => commands::unresolved(&query_args(&args), args.positional(0)),
         "impact" => commands::impact(&query_args(&args)),
+        "export" => match args.positional(0) {
+            Some(out) => export::run(&query_args(&args), std::path::Path::new(out), args.yes),
+            None => Err(usage_error(
+                "usage: codekurve export <output.html> [--symbol-id <id>|--symbol-name <name>] \
+[--depth <n>] [--root <path>] [--yes]",
+            )),
+        },
         "trace" => match args.positional(0) {
             Some(to) => commands::trace(&query_args(&args), to),
             None => Err(usage_error(
