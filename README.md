@@ -105,8 +105,4 @@ analysis beyond what's listed in §6/§7 of the plan for v0.1.
 
 ## Licensing
 
-Licensing has not been finalized — see `docs/LICENSING.md`. The repository
-and `v0.1.0` release binaries are public (installable via the scripts above)
-as a deliberate choice to unblock installation; this is not a resolution of
-the licensing question. See `docs/ROADMAP.md`'s Phase 8 note for the current
-state of that open item.
+MIT. See [`LICENSE`](LICENSE) and `docs/LICENSING.md` for the rationale.
