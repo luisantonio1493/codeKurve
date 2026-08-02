@@ -39,6 +39,34 @@ fn kind_counts(analyses: &[FileAnalysis]) -> HashMap<RelationshipKind, usize> {
     counts
 }
 
+/// A typed feature registration (`AddDbContext<T>()`) resolves to the project
+/// type its type argument names — the Category B shape.
+fn assert_registered_as_target(analyses: &[FileAnalysis], simple_name: &str) {
+    let found = analyses.iter().any(|a| {
+        a.relationships.iter().any(|rel| {
+            rel.kind == RelationshipKind::RegisteredAs
+                && matches!(&rel.target, EdgeTarget::Global { qualified_name, .. }
+                    if qualified_name.ends_with(simple_name))
+        })
+    });
+    assert!(found, "no RegisteredAs edge resolved to {simple_name}");
+}
+
+/// A bare feature registration (`AddOpenApi()`) names a framework feature,
+/// never a project symbol — the Category C shape is recognized, but by
+/// design it survives resolution as an `UnresolvedReference`, not an edge.
+fn assert_unresolved_registration(analyses: &[FileAnalysis], feature: &str) {
+    let found = analyses.iter().any(|a| {
+        a.unresolved.iter().any(|u| {
+            u.relationship_kind == RelationshipKind::RegisteredAs && u.target_text == feature
+        })
+    });
+    assert!(
+        found,
+        "no RegisteredAs UnresolvedReference recorded for {feature}"
+    );
+}
+
 const CONTROLLER_FILES: &[&str] = &[
     "Invoice.cs",
     "AppDbContext.cs",
@@ -69,13 +97,18 @@ fn controller_variant_produces_expected_framework_edge_counts_and_roles() {
         Some(1)
     );
     // AddScoped<IInvoiceRepository, InvoiceRepository>() -> paired
-    // RegisteredAs edges.
+    // RegisteredAs edges; AddDbContext<AppDbContext>() -> one more (typed
+    // feature registration, target = the type argument). AddControllers()
+    // also fires, but `Controllers` names no project symbol, so it is kept
+    // as an UnresolvedReference rather than an edge (asserted below).
     assert_eq!(
         counts.get(&RelationshipKind::RegisteredAs).copied(),
-        Some(2)
+        Some(3)
     );
     // DbSet<Invoice> in AppDbContext -> one PersistsTo.
     assert_eq!(counts.get(&RelationshipKind::PersistsTo).copied(), Some(1));
+    assert_registered_as_target(&analyses, "AppDbContext");
+    assert_unresolved_registration(&analyses, "Controllers");
 
     let controller = analyses
         .iter()
@@ -102,11 +135,15 @@ fn minimal_api_variant_matches_the_controller_variants_shape() {
         counts.get(&RelationshipKind::HandlesRoute).copied(),
         Some(2)
     );
+    // Same shape as the controller variant: the AddScoped pair plus the
+    // AddDbContext<AppDbContext> typed feature registration.
     assert_eq!(
         counts.get(&RelationshipKind::RegisteredAs).copied(),
-        Some(2)
+        Some(3)
     );
     assert_eq!(counts.get(&RelationshipKind::PersistsTo).copied(), Some(1));
+    assert_registered_as_target(&analyses, "AppDbContext");
+    assert_unresolved_registration(&analyses, "OpenApi");
 
     let program = analyses.iter().find(|a| a.file == "Program.cs").unwrap();
     let resolves_to_handler = program.relationships.iter().any(|rel| {

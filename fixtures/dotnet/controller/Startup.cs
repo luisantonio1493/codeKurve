@@ -10,5 +10,6 @@ public class Startup
     {
         services.AddScoped<IInvoiceRepository, InvoiceRepository>();
         services.AddDbContext<AppDbContext>();
+        services.AddControllers();
     }
 }

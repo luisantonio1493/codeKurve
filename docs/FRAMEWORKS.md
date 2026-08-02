@@ -91,12 +91,32 @@ import already does, keeping `HandlesRoute` traversable from the method.
 | `MapGroup("prefix")` | recorded as a prefix for chained `Map*` calls on the same statement only |
 | `Add{Scoped,Transient,Singleton}<TService, TImpl>()` (2 type arguments) | two `RegisteredAs` edges from the enclosing method: `Unresolved(TImpl)` with `reason = "lifetime:scoped;role:impl;service:TService"`, `Unresolved(TService)` with `reason = "lifetime:scoped;role:service;impl:TImpl"` |
 | `Add*<T>()` (1 type argument), or `AddSingleton(typeof(A), typeof(B))` | same pair, ceiling Low (partial shape) |
+| Typed feature registration — `AddDbContext<T>()`, `AddDbContextFactory<T>()`, `AddDbContextPool<T>()`, `AddPooledDbContextFactory<T>()`, `AddDbContextCheck<T>()`, `AddHostedService<T>()`, `AddHttpClient<T>()`, `AddDocumentTransformer<T>()`, `AddOperationTransformer<T>()`, `AddSchemaTransformer<T>()` | `RegisteredAs` to `Unresolved(<T>)`, `reason = "key:feature:<CallName>"`, ceiling High. **No type argument = no edge** — the bare overload registers a framework service, not a project type |
+| Bare feature registration — `AddOpenApi()`, `AddAuthentication()`, `AddAuthorization()`, `AddApiVersioning()`, `AddRateLimiter()`, `AddHttpContextAccessor()`, `AddEndpointsApiExplorer()`, `AddControllers()`, `AddControllersWithViews()`, `AddRazorPages()`, `AddMvc()`, `AddRouting()`, `AddCors()`, `AddAntiforgery()`, `AddSignalR()`, `AddHealthChecks()`, `AddMemoryCache()`, `AddDistributedMemoryCache()`, `AddResponseCompression()`, `AddResponseCaching()`, `AddOutputCache()`, `AddSession()`, `AddProblemDetails()`, `AddSwaggerGen()`, `AddDatabaseDeveloperPageExceptionFilter()` | `RegisteredAs` to `Unresolved(<name minus the `Add` prefix>)`, `reason = "key:feature:<CallName>"`, ceiling High |
 | `Use<Name>()` / `UseMiddleware<T>()` | `RegisteredAs` to `Unresolved(<T or Name>)`, `reason = "key:middleware"` |
 | `DbSet<T>` property/field in a `DbContext` subclass | `PersistsTo`, source = the `DbContext` subclass, target `Unresolved(<T>)`, `reason = "dbset:<PropertyName>"` |
 
 `Add*`/`Use*` are matched by **exact name from a closed list, never by
 prefix** — `AddSomethingCustom` produces no edge, not a silent Low-confidence
-guess.
+guess. This is also what keeps EF migration and model-configuration calls
+that merely *look* like registrations out of the graph: `AddColumn`,
+`AddForeignKey`, `AddAnnotation`, `AddPolicy`, `AddTicks`,
+`UseIdentityColumn`, `UseInMemoryDatabase`, `UseSqlServer`, `UseNpgsql`, and
+`UseSqlite` are in no list and produce no edge.
+
+A bare feature registration's target (`OpenApi`, `Controllers`) names a
+framework feature, not a project symbol, so — like `UseCors()` — it is
+recognized and then preserved as an `UnresolvedReference` rather than stored
+as a resolved edge. The typed registrations are the structurally load-bearing
+ones: `AddDbContextFactory<TodoDbContext>()` resolves to the project's own
+`TodoDbContext`.
+
+`Use*` middleware names currently recognized: `UseAuthentication`,
+`UseAuthorization`, `UseCors`, `UseHttpsRedirection`, `UseHsts`, `UseRouting`,
+`UseEndpoints`, `UseStaticFiles`, `UseSwagger`, `UseSwaggerUI`,
+`UseExceptionHandler`, `UseDeveloperExceptionPage`, `UseSession`,
+`UseResponseCompression`, `UseResponseCaching`, `UseOutputCache`,
+`UseRateLimiter`, `UseWebSockets`, `UseAntiforgery`.
 
 ## Confidence and provenance
 
@@ -147,7 +167,9 @@ out-of-process type checker is invoked.
 | Runtime/reflection-based DI | Assembly scanning, reflection-based registration, and any DI wiring without direct attribute or call-site evidence produce no edge. |
 | Convention-based MVC routing | Routes inferred purely by naming convention (no `[Route]`/`[Http*]` attribute) are not recognized. |
 | `MapGroup` prefix in a variable | A `MapGroup("prefix")` result is only applied as a prefix to `Map*` calls chained on the *same statement*. If the group result is assigned to a variable and used later, the prefix is lost — a published limitation, not a bug. |
-| `Add*`/`Use*` matched by exact name only | The .NET call-driven catalogue is a closed list matched by exact method name, never by prefix. A custom extension method like `AddSomethingCustom` produces no edge rather than a guessed Low-confidence one. |
+| `Add*`/`Use*` matched by exact name only | The .NET call-driven catalogue is a closed list matched by exact method name, never by prefix. A custom extension method like `AddSomethingCustom` produces no edge rather than a guessed Low-confidence one. The lists are representative of the standard ASP.NET Core / EF Core registration APIs, not exhaustive. |
+| Bare feature registrations do not resolve | `AddOpenApi()`/`AddControllers()`-style calls are recognized, but their target is a framework feature name with no project symbol behind it, so they end as `UnresolvedReference` rows rather than stored edges. Only typed registrations (`AddDbContext<T>()`) and the lifetime pair reach the graph as edges. |
+| Registration options lambdas | `AddDbContext(o => o.UseSqlServer(cs))` and `AddCors(o => o.AddPolicy(...))` are recognized only by the outer call name; nothing inside the configuration lambda (connection strings, provider choice, named policies) is modelled. |
 | EF Core's single narrow exception | The only generic-type-argument-derived edge in the system is `DbSet<T>` inside a `DbContext` subclass → `PersistsTo`. General generic type-argument resolution is out of scope; `List<T>`, `Task<T>`, `IQueryable<T>`, and `Dictionary<K,V>` produce no edge regardless of context. |
 | Cross-stack edges | An Angular `HttpClient` call is never linked to the .NET endpoint it hits — that needs a URL-matching model this phase does not build. |
 | No new `SymbolKind` | Framework roles are tags on existing symbols (`FrameworkRole`), never a new kind; a `Controller` is still a `Class`. |

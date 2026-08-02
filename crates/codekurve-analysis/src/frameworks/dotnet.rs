@@ -62,6 +62,67 @@ const ADD_LIFETIMES: &[(&str, &str)] = &[
     ("AddSingleton", "singleton"),
 ];
 
+/// Closed exact-name list of ASP.NET Core / EF Core registrations whose
+/// **type argument** names the registered type — the same evidence shape
+/// `UseMiddleware<T>()` already uses (the type argument is the target, the
+/// method name is only the discriminator). Matched by exact name, never by
+/// an `Add` prefix (design "Q2" D9); a call from this list with **no** type
+/// argument emits nothing, because its bare overload registers a framework
+/// service rather than a project type and inventing one would be a guess.
+// ponytail: a representative closed list of the standard typed registration
+// APIs, not an exhaustive one — same published bound as
+// `MIDDLEWARE_USE_NAMES`; extend it if a real fixture needs one more entry.
+const TYPED_FEATURE_ADD_NAMES: &[&str] = &[
+    "AddDbContext",
+    "AddDbContextFactory",
+    "AddDbContextPool",
+    "AddPooledDbContextFactory",
+    "AddDbContextCheck",
+    "AddHostedService",
+    "AddHttpClient",
+    "AddDocumentTransformer",
+    "AddOperationTransformer",
+    "AddSchemaTransformer",
+];
+
+/// Closed exact-name list of ASP.NET Core feature registrations that take no
+/// project type at all (`builder.Services.AddOpenApi()`) — the feature itself
+/// is the target, exactly as `MIDDLEWARE_USE_NAMES` treats a `Use<Name>()`
+/// call. Matched by exact name, never by an `Add` prefix (D9), which is what
+/// keeps unrelated `.Add*(` calls (`AddColumn`, `AddForeignKey`, `AddTicks`,
+/// `AddPolicy`, `AddAnnotation`) out of the graph.
+// ponytail: a representative closed list of the standard ASP.NET Core
+// service-registration call names, not an exhaustive one — same published
+// bound as `MIDDLEWARE_USE_NAMES`; extend it if a real fixture needs one
+// more entry.
+const BARE_FEATURE_ADD_NAMES: &[&str] = &[
+    "AddAntiforgery",
+    "AddApiVersioning",
+    "AddAuthentication",
+    "AddAuthorization",
+    "AddControllers",
+    "AddControllersWithViews",
+    "AddCors",
+    "AddDatabaseDeveloperPageExceptionFilter",
+    "AddDistributedMemoryCache",
+    "AddEndpointsApiExplorer",
+    "AddHealthChecks",
+    "AddHttpContextAccessor",
+    "AddMemoryCache",
+    "AddMvc",
+    "AddOpenApi",
+    "AddOutputCache",
+    "AddProblemDetails",
+    "AddRateLimiter",
+    "AddRazorPages",
+    "AddResponseCaching",
+    "AddResponseCompression",
+    "AddRouting",
+    "AddSession",
+    "AddSignalR",
+    "AddSwaggerGen",
+];
+
 /// Task 6.5's closed exact-name list of ASP.NET Core middleware `Use*` calls
 /// — matched by exact name, never by a `Use` prefix (design "Q2": "`Add*`
 /// and `Use*` are matched by exact name from the closed list, never by
@@ -85,6 +146,12 @@ const MIDDLEWARE_USE_NAMES: &[&str] = &[
     "UseDeveloperExceptionPage",
     "UseSession",
     "UseResponseCompression",
+    "UseResponseCaching",
+    "UseOutputCache",
+    "UseRateLimiter",
+    "UseWebSockets",
+    "UseAntiforgery",
+    "UseHsts",
 ];
 
 /// One resolved `invocation_expression`'s callee name, its type-argument
@@ -201,6 +268,37 @@ fn recognize_call(node: Node, source: &[u8], analysis: &mut FileAnalysis, source
     }
     if let Some((_, lifetime)) = ADD_LIFETIMES.iter().find(|(n, _)| *n == info.name) {
         recognize_add_call(node, source, analysis, source_key, lifetime, &info);
+        return;
+    }
+    if TYPED_FEATURE_ADD_NAMES.contains(&info.name.as_str()) {
+        // Same shape as the `UseMiddleware<T>` branch below: the type
+        // argument *is* the registered type. No type argument = a bare
+        // framework-service overload, which names no project type — emit
+        // nothing rather than guess one.
+        if let Some(target) = info.type_args.first() {
+            push_heuristic_unresolved(
+                analysis,
+                source_key,
+                RelationshipKind::RegisteredAs,
+                target,
+                span_of(node),
+                Confidence::High,
+                Some(format!("key:feature:{}", info.name)),
+            );
+        }
+        return;
+    }
+    if BARE_FEATURE_ADD_NAMES.contains(&info.name.as_str()) {
+        let target = info.name.strip_prefix("Add").unwrap_or(&info.name);
+        push_heuristic_unresolved(
+            analysis,
+            source_key,
+            RelationshipKind::RegisteredAs,
+            target,
+            span_of(node),
+            Confidence::High,
+            Some(format!("key:feature:{}", info.name)),
+        );
         return;
     }
     if info.name == "UseMiddleware" {
@@ -1312,6 +1410,104 @@ app.UseCors();
                 && r.reason.as_deref() == Some("key:middleware")));
     }
 
+    // --- typed / bare feature registrations ----------------------------------
+
+    #[test]
+    fn typed_feature_add_call_registers_its_type_argument() {
+        let source = r#"
+var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddDbContextFactory<TodoDbContext>();
+builder.Services.AddHostedService<CleanupWorker>();
+"#;
+        let analysis = analyze_program(source);
+        let regs = call_driven_rel(&analysis, RelationshipKind::RegisteredAs);
+        assert_eq!(regs.len(), 2);
+
+        let db = regs
+            .iter()
+            .find(|r| r.target == EdgeTarget::Unresolved("TodoDbContext".to_string()))
+            .expect("expected the AddDbContextFactory edge");
+        assert_eq!(
+            db.reason.as_deref(),
+            Some("key:feature:AddDbContextFactory")
+        );
+        assert_eq!(db.confidence, Confidence::High);
+        assert_eq!(db.provenance, Provenance::Heuristic);
+
+        let worker = regs
+            .iter()
+            .find(|r| r.target == EdgeTarget::Unresolved("CleanupWorker".to_string()))
+            .expect("expected the AddHostedService edge");
+        assert_eq!(
+            worker.reason.as_deref(),
+            Some("key:feature:AddHostedService")
+        );
+        assert_eq!(worker.confidence, Confidence::High);
+    }
+
+    #[test]
+    fn typed_feature_add_call_without_a_type_argument_produces_no_edge() {
+        let source = r#"
+var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddHttpClient();
+builder.Services.AddDbContext(options => options.UseSqlServer(cs));
+"#;
+        let analysis = analyze_program(source);
+        assert!(call_driven_rel(&analysis, RelationshipKind::RegisteredAs).is_empty());
+    }
+
+    #[test]
+    fn bare_feature_add_call_registers_the_feature_name() {
+        let source = r#"
+var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddOpenApi();
+builder.Services.AddProblemDetails();
+"#;
+        let analysis = analyze_program(source);
+        let regs = call_driven_rel(&analysis, RelationshipKind::RegisteredAs);
+        assert_eq!(regs.len(), 2);
+
+        let open_api = regs
+            .iter()
+            .find(|r| r.target == EdgeTarget::Unresolved("OpenApi".to_string()))
+            .expect("expected the AddOpenApi edge");
+        assert_eq!(open_api.reason.as_deref(), Some("key:feature:AddOpenApi"));
+        assert_eq!(open_api.confidence, Confidence::High);
+        assert_eq!(open_api.provenance, Provenance::Heuristic);
+
+        assert!(regs.iter().any(|r| r.target
+            == EdgeTarget::Unresolved("ProblemDetails".to_string())
+            && r.reason.as_deref() == Some("key:feature:AddProblemDetails")));
+    }
+
+    /// D9's exact-name rule, proven negatively: EF migration/model-builder
+    /// calls and `DateTime` arithmetic all match a naive `.Add*(`/`.Use*(`
+    /// regex but are not registrations, so none of them is in either closed
+    /// list and none produces an edge.
+    #[test]
+    fn non_registration_add_and_use_calls_produce_no_edge() {
+        let source = r#"
+public class Migration
+{
+    public void Up(MigrationBuilder migrationBuilder, ModelBuilder modelBuilder)
+    {
+        migrationBuilder.AddColumn<string>("Title", "Todos");
+        migrationBuilder.AddForeignKey("FK_Todo_User", "Todos", "UserId");
+        modelBuilder.Entity<Todo>().Property(t => t.Id).UseIdentityColumn();
+        modelBuilder.HasAnnotation("Relational:Collation", "x").AddAnnotation("a", "b");
+        var later = DateTime.UtcNow.AddTicks(5);
+        options.UseInMemoryDatabase("todos");
+        options.UseSqlServer(connectionString);
+        options.UseNpgsql(connectionString);
+        options.UseSqlite(connectionString);
+        options.AddPolicy("default", policy => policy.AllowAnyOrigin());
+    }
+}
+"#;
+        let analysis = analyze(source);
+        assert!(call_driven_rel(&analysis, RelationshipKind::RegisteredAs).is_empty());
+    }
+
     // --- task 6.11 -------------------------------------------------------------
 
     #[test]
@@ -1395,6 +1591,8 @@ public class AppDbContext : DbContext
         let source = r#"
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddScoped<IInvoiceRepository, InvoiceRepository>();
+builder.Services.AddDbContext<AppDbContext>();
+builder.Services.AddOpenApi();
 var app = builder.Build();
 app.UseMiddleware<RequestLoggingMiddleware>();
 app.MapGet("/invoices/{id}", GetInvoice);
