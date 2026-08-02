@@ -5,6 +5,7 @@
 //! these modules instead of declaring them locally.
 
 pub mod commands;
+pub mod export;
 pub mod incremental;
 pub mod install;
 pub mod query;

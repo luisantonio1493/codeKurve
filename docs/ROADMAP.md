@@ -28,6 +28,16 @@ what was designed up front versus what was added afterwards.
   `crossterm`, +401 KiB on the release binary) and serves humans, whereas
   the plan's primary consumer is an agent over MCP. Justification, measured
   cost, and the exit condition for removing it: `docs/adr/0011-ratatui-tui.md`.
+- **HTML subgraph export (`codekurve export <out.html>`)** — added on
+  2026-08-02, unplanned. Writes one self-contained file picturing a symbol's
+  bidirectional neighbourhood, then exits. It sits close to the plan's "no web
+  UI" non-goal (§7) and does not violate it — the non-goal is about servers and
+  hosted browsing apps, not output formats — but the wording was ambiguous
+  enough that it needed sharpening rather than a quiet reinterpretation: see
+  `docs/adr/0013-html-subgraph-export.md`, which scopes the non-goal, and the
+  corrected README line. No new dependency, no new traversal, no schema or
+  analyzer change; like the TUI it serves humans, whereas the plan's primary
+  consumer is an agent over MCP.
 
 > **Public distribution note**: the repo is public and release binaries are
 > published on GitHub Releases (see [Installation](../README.md#installation)).

@@ -14,8 +14,13 @@ structure by grepping the tree each time (§1).
 ## What it is NOT
 
 Not a compiler, not a Language Server, not `ripgrep`, not a VCS. No cloud,
-no web UI, no embeddings, no vector database, no LLM-built graph, no code
-execution or modification. Full non-goal list: §7.
+**no server and no hosted UI** — nothing listens on a port, nothing runs in
+the background for you to browse. No embeddings, no vector database, no
+LLM-built graph, no code execution or modification. Full non-goal list: §7.
+
+(`codekurve export` writes a *file*, the same way `--json` and the release
+SBOM do. It is an output format, not a service:
+[`docs/adr/0013-html-subgraph-export.md`](docs/adr/0013-html-subgraph-export.md).)
 
 ## Status
 
@@ -128,6 +133,36 @@ same message the CLI gives.
 Requires a real terminal; it is not part of the MCP surface, and no
 non-interactive command's behaviour changed. Rationale and dependency
 justification: [`docs/adr/0011-ratatui-tui.md`](docs/adr/0011-ratatui-tui.md).
+
+## HTML subgraph export
+
+```bash
+codekurve export graph.html --symbol-name SmartDBContext
+codekurve export graph.html --symbol-name UserController --depth 3 --yes
+```
+
+Writes **one self-contained HTML file** picturing a symbol's neighbourhood in
+both directions at once — what it reaches *and* what reaches it — then stops.
+Open it with `file://`; there is no server, no daemon and no network. All CSS,
+JS and geometry are inlined, so it renders identically with the cable
+unplugged, and it survives being emailed or attached to a ticket.
+
+- Layout is **radial by BFS depth**, computed in Rust: the focus symbol at the
+  centre, one ring per hop. Distance therefore *means* hops, and the same
+  index always produces byte-identical output.
+- **Dashed edges are `Heuristic`-provenance** — framework inferences (Angular
+  DI, ASP.NET routing, EF Core, …), never parsed facts. Solid edges are
+  `Extracted`/`Resolved`. Colour is the relationship kind, opacity is
+  confidence, and the legend says all three.
+- Hover a node for its full qualified name and path; click it to keep only its
+  incident edges lit.
+- The same BFS caps `impact`/`trace` respect apply. If one fired, the file says
+  so in a banner — a picture that silently omits nodes is worse than one that
+  admits it.
+
+Flags: `--symbol-name <name>` or `--symbol-id <id>`, `--depth N` (default 2),
+`--min-confidence <level>`, `--root <path>`. An existing output path is
+refused unless `--yes` is passed.
 
 ## Supported languages
 
