@@ -222,7 +222,7 @@ mod tests {
         let handle = thread::spawn(move || {
             debounce_loop(
                 &rx,
-                Duration::from_millis(30),
+                Duration::from_millis(100),
                 Duration::from_millis(1000),
                 |paths| {
                     flushes_clone.lock().unwrap().push(paths.clone());
@@ -232,14 +232,17 @@ mod tests {
             .unwrap();
         });
 
+        // 5ms between sends against a 100ms sliding window — wide margin so
+        // CI scheduling jitter between two sends can't exceed the window and
+        // force a premature flush mid-burst (seen with a tighter 30ms window).
         for i in 0..5 {
             tx.send(vec![PathBuf::from(format!("file{i}.ts"))]).unwrap();
             thread::sleep(Duration::from_millis(5));
         }
-        // Let the 30ms sliding window elapse and flush before disconnecting
-        // — otherwise the channel closing races the debounce timeout and
-        // the loop can exit via `Disconnected` before ever flushing.
-        thread::sleep(Duration::from_millis(60));
+        // Let the sliding window elapse and flush before disconnecting —
+        // otherwise the channel closing races the debounce timeout and the
+        // loop can exit via `Disconnected` before ever flushing.
+        thread::sleep(Duration::from_millis(150));
         drop(tx);
 
         handle.join().unwrap();
