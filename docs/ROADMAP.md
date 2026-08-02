@@ -51,8 +51,14 @@ All green on Windows, macOS, and Linux CI (plan §43).
 - **Toolchain version pin**: `rust-toolchain.toml` currently floats on
   `stable`; pin to an exact version via ADR if reproducibility issues
   appear.
-- **`[profile.release]` tuning**: not configured; revisit once real
-  workloads exist to measure against (plan §38).
+- ~~**`[profile.release]` tuning**~~: **resolved 2026-08-02.** Phase 8's
+  pilot supplied the real workloads this was waiting on. Measured on a cold
+  build: `lto = "fat"` + `codegen-units = 1` + `strip = "symbols"` takes the
+  binary from 16.41 MB to 13.62 MB (−17 %) for 2.1x wall-clock build time,
+  which only the Release workflow pays — CI's `clippy`/`test` build the dev
+  profile. `panic = "abort"` was rejected: it would skip the TUI's
+  terminal-restoring panic hook. Rationale is in `Cargo.toml` next to the
+  profile.
 - **CI cache**: no cache action in Phase 0 (auditability over speed);
   reconsider only when CI slowness is measured, then pin and
   security-review the action.
