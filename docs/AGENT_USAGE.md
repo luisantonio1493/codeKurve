@@ -48,6 +48,20 @@ with an English gloss under each for readability.
    stale, read the current file — a stale flag (project-level or per-symbol
    on `get_symbol`) means the index may not reflect what's on disk right now.
 
+### `find_callers` empty ≠ "nothing calls this"
+
+`find_callers`/`find_callees` only return `Calls` edges — a real invocation
+expression (`foo()`). A route handler, DI-registered service, or Angular
+component is typically *never* called directly by name — the framework
+invokes it through a decorator, attribute, or delegate reference instead
+(Angular `@Component`, .NET `[HttpGet]`, `app.MapGet("/x", Handler)`, `<Add
+Scoped, Transient, Singleton><T>()`). CodeKurve models that as a separate
+`Injects`/`RegisteredAs`/`HandlesRoute`/`Triggers` edge, `Heuristic`
+provenance (`docs/FRAMEWORKS.md`) — not as `Calls`. Empty `find_callers` on a
+symbol that looks like an entry point is a signal to run `find_references`
+instead (it returns every relationship kind, including framework edges), not
+a signal that the symbol is dead code.
+
 ## Connecting a client over stdio
 
 `codekurve mcp` speaks MCP over stdio only (no network port, no auth
