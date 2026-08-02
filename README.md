@@ -46,6 +46,23 @@ irm https://raw.githubusercontent.com/luisantonio1493/codeKurve/main/install.ps1
 Both scripts install the latest release binary and add it to your PATH.
 Re-run the same command to upgrade.
 
+Or, once installed, upgrade from the CLI:
+
+```bash
+codekurve update          # add --yes for non-interactive use
+```
+
+`codekurve update` is exactly equivalent to re-running the install script
+above: it prints the command it is about to run, asks for confirmation, then
+spawns it. CodeKurve has no HTTP client and makes no network request of its
+own — the script does the download. Without a terminal to confirm at, it
+refuses unless you pass `--yes`. See
+[`docs/adr/0012-update-via-install-script.md`](docs/adr/0012-update-via-install-script.md),
+which is honest about the supply-chain cost.
+
+To remove the binary: `codekurve uninstall --binary`, or
+`install.sh --uninstall` (`install.ps1 -Uninstall` on Windows) directly.
+
 ## Quickstart
 
 ```bash
@@ -56,6 +73,7 @@ codekurve callers <symbol>
 codekurve unresolved [<target-text>]
 codekurve tui
 codekurve mcp
+codekurve update
 ```
 
 Full command surface and flags: `docs/ROADMAP.md`; CLI conventions: the plan
@@ -159,8 +177,14 @@ never appears — those paths print the plan and behave exactly as before.
 
 To target one client instead, name it: `codekurve install <client>`.
 `codekurve uninstall [<client>]` reverses it, removing only the `codekurve`
-entry and leaving sibling servers intact (it does not touch the binary — use
-`install.sh --uninstall` for that).
+entry and leaving sibling servers intact. The distinction is worth being
+explicit about:
+
+- `codekurve uninstall` — agent configs only. The binary is left alone.
+- `codekurve uninstall --binary` — agent configs **and** the executable. This
+  spawns `install.sh --uninstall` (`install.ps1 -Uninstall` on Windows) and
+  follows the same rules as `codekurve update`: it prints the exact command,
+  confirms, and refuses without a terminal unless `--yes` is passed.
 
 Or add this to `.mcp.json` by hand (`codekurve` on PATH after
 [installing](#installation), or an absolute path to the binary):
@@ -180,7 +204,14 @@ Or add this to `.mcp.json` by hand (`codekurve` on PATH after
 ## Security promise
 
 Local-only, no network, no telemetry, respects `.gitignore`, never executes
-analyzed code. Full model: `docs/SECURITY_MODEL.md` (plan §5.8, §29).
+analyzed code. CodeKurve has no HTTP client dependency at all: indexing,
+querying, watching and MCP make zero network requests and spawn zero
+subprocesses. The single scoped exception is `codekurve update` /
+`codekurve uninstall --binary`, which you must type yourself and confirm, and
+which spawns the published install script rather than downloading anything
+from Rust — see
+[`docs/adr/0012-update-via-install-script.md`](docs/adr/0012-update-via-install-script.md).
+Full model: `docs/SECURITY_MODEL.md` (plan §5.8, §29).
 
 ## Limitations
 

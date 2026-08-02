@@ -5,18 +5,31 @@
 #
 #   irm https://raw.githubusercontent.com/luisantonio1493/codeKurve/main/install.ps1 | iex
 #
-# Upgrade: re-run this same command (overwrites the binary in place). There is
-# no `codekurve upgrade` subcommand — re-running the installer *is* the
-# upgrade path.
+# Upgrade: re-run this same command (overwrites the binary in place), or run
+# `codekurve update`, which spawns exactly this script.
+#
+# Uninstall (irm | iex cannot pass arguments, so use the scriptblock form):
+#   &([scriptblock]::Create((irm https://raw.githubusercontent.com/luisantonio1493/codeKurve/main/install.ps1))) -Uninstall
 #
 # Environment:
 #   CODEKURVE_VERSION  release tag to install (default: latest)
 #   CODEKURVE_BIN_DIR  install location (default: %LOCALAPPDATA%\codekurve\bin)
 
+param([switch]$Uninstall)
+
 $ErrorActionPreference = 'Stop'
 $repo = 'luisantonio1493/codeKurve'
 $binDir = if ($env:CODEKURVE_BIN_DIR) { $env:CODEKURVE_BIN_DIR } else { Join-Path $env:LOCALAPPDATA 'codekurve\bin' }
 $dest = Join-Path $binDir 'codekurve.exe'
+
+# Mirrors `install.sh --uninstall`: removes the binary only. PATH is left
+# alone — the entry is harmless once empty, and stripping it could clobber a
+# concurrent edit to the user's PATH.
+if ($Uninstall) {
+  Remove-Item -Force -ErrorAction SilentlyContinue $dest
+  Write-Host "codekurve uninstalled (removed $dest)."
+  exit 0
+}
 
 # 1. Detect architecture. Only an x64 Windows build is published today; on
 # Arm64 there is no native binary yet, so fail clearly instead of silently

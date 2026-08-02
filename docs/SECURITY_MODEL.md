@@ -23,6 +23,19 @@ redaction; dependency audit and SBOM; release checksums (plan §29.2).
 The application does not depend on an HTTP client. See
 `docs/ARCHITECTURE.md` and plan §29.4.
 
+## One scoped carve-out: `update` / `uninstall --binary`
+
+`docs/adr/0012-update-via-install-script.md` scopes — does not supersede —
+both the "never shell out" control above and ADR 0005. `codekurve update` and
+the opt-in `codekurve uninstall --binary` spawn the published install script
+(`install.sh` / `install.ps1`), which performs the download or removal.
+CodeKurve gains no HTTP client and makes no network call from Rust; no
+analysis path (`index`, `watch`, `mcp`, `tui`, any query) spawns a subprocess
+or touches the network. Both paths are reachable only by the user typing the
+command, print the exact command first, require `[y/N]` confirmation, and
+refuse on a non-terminal stdin unless `--yes` is passed. ADR 0012 states the
+supply-chain cost plainly.
+
 ## Ignored files
 
 Respects `.gitignore` plus configurable exclusions; sensitive-file patterns

@@ -35,6 +35,18 @@ jobs:
       - name: licensing check
         run: python scripts/check_licensing.py
 
+      # The installers are the one shipped surface with no compiler behind it:
+      # a syntax error in either would only surface on a user's machine, at
+      # the exact moment they are trying to install or update. Parse-check
+      # each on the platform that actually runs it.
+      - name: install.sh syntax
+        if: runner.os != 'Windows'
+        run: sh -n install.sh
+
+      - name: install.ps1 syntax
+        if: runner.os == 'Windows'
+        run: $null = [ScriptBlock]::Create((Get-Content -Raw install.ps1))
+
   audit:
     runs-on: ubuntu-latest
     steps:

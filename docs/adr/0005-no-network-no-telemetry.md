@@ -12,6 +12,14 @@ CodeKurve makes no outbound network requests and collects no telemetry, in
 any mode. No HTTP client crate is added to the workspace without a new ADR
 explicitly superseding this one.
 
+> **Scoped, not superseded, by ADR 0012**
+> (`0012-update-via-install-script.md`): `codekurve update` and
+> `codekurve uninstall --binary` spawn the published install script, which is
+> what downloads or deletes the release binary. CodeKurve itself still has no
+> HTTP client and makes no network call from Rust, and no analysis path
+> (`index`, `watch`, `mcp`, `tui`, any query) reaches the network or spawns a
+> subprocess. This ADR stands.
+
 ## Alternatives
 
 - **Opt-in telemetry**: rejected — even opt-in telemetry requires a network

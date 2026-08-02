@@ -131,9 +131,31 @@ prompt.
 
 `codekurve uninstall [<client>]` removes the `codekurve` entry from each
 client config that has one, preserving every sibling entry (a config with no
-`codekurve` entry is reported and skipped, not an error). It manages agent
-configs only — the CLI binary itself is removed by `install.sh --uninstall`
-(`install.ps1 -Uninstall` on Windows).
+`codekurve` entry is reported and skipped, not an error). By default it
+manages agent **configs only** and leaves the binary alone.
+
+`codekurve uninstall --binary` does both: the configs, then the CLI binary
+itself (by spawning `install.sh --uninstall`, or `install.ps1 -Uninstall` on
+Windows). Removing the binary is opt-in, never the default.
+
+## `codekurve update` — agents, do not run this
+
+`codekurve update [--yes]` upgrades the binary by spawning the published
+install script; `codekurve uninstall --binary` removes it the same way. These
+are the only two commands in CodeKurve that spawn a subprocess or cause a
+network request, and both exist for a human at a keyboard.
+
+**They will not silently run under you.** Both print the exact command first,
+require a `[y/N]` confirmation, and — unlike `install`/`uninstall`, which
+auto-proceed on a non-terminal stdin — *refuse* when stdin is not a terminal
+unless `--yes` is passed explicitly. An agent piping stdin gets a non-zero
+exit and an error, not a replaced executable.
+
+After a successful update, an MCP client that already has a `codekurve mcp`
+server running keeps serving from the **old** binary until that client
+restarts it. Restart the client if a fix you expect is missing.
+
+Rationale and the honest supply-chain cost: `docs/adr/0012-update-via-install-script.md`.
 
 ### Claude Code
 
