@@ -1194,9 +1194,7 @@ mod symbol_ids_tests {
             .iter()
             .filter(|r| {
                 r.kind == RelationshipKind::Contains
-                    && ctor_targets
-                        .iter()
-                        .any(|t| *t == r.target_symbol_id.as_ref())
+                    && ctor_targets.contains(&r.target_symbol_id.as_ref())
             })
             .collect();
         assert_eq!(

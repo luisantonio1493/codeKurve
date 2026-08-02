@@ -774,10 +774,7 @@ mod tests {
     use crate::resolve;
     use codekurve_core::LanguageId;
 
-    fn rel<'a>(
-        analysis: &'a FileAnalysis,
-        kind: RelationshipKind,
-    ) -> Vec<&'a ExtractedRelationship> {
+    fn rel(analysis: &FileAnalysis, kind: RelationshipKind) -> Vec<&ExtractedRelationship> {
         analysis
             .relationships
             .iter()
