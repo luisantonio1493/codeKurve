@@ -2,6 +2,11 @@ name: CI
 
 on:
   push:
+    # Branches only. A bare `push:` also matches tag pushes, so cutting a
+    # release ran CI twice over identical bytes — once for the branch commit
+    # and once for the tag pointing at it — on top of the Release workflow.
+    # A tag always points at a commit CI already checked on its branch.
+    branches: ["**"]
   pull_request:
 
 jobs:
