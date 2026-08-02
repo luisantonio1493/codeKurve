@@ -29,7 +29,7 @@ what was designed up front versus what was added afterwards.
   the plan's primary consumer is an agent over MCP. Justification, measured
   cost, and the exit condition for removing it: `docs/adr/0011-ratatui-tui.md`.
 
-> **Public distribution note**: the repo is public and `v0.1.0` binaries are
+> **Public distribution note**: the repo is public and release binaries are
 > published on GitHub Releases (see [Installation](../README.md#installation)).
 > Licensing (previously unresolved) is now MIT — see `docs/LICENSING.md`.
 

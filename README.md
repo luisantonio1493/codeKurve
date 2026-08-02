@@ -22,7 +22,7 @@ execution or modification. Full non-goal list: §7.
 **Experimental.** Phases 0–7 of `CODEKURVE_MASTER_PLAN.md` are complete,
 verified, and archived under `openspec/changes/archive/`: scaffold, TypeScript
 graph, incremental watcher, MCP server, C# support, enterprise hardening, and
-Angular/.NET framework awareness. First tagged release: `v0.1.0`.
+Angular/.NET framework awareness. Latest release: `v0.2.0` (first was `v0.1.0`).
 
 Fase 8 (real-repo pilot evaluation) is in progress — see `docs/ROADMAP.md` for
 what's measured and what's still open.
