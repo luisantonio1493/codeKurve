@@ -1,15 +1,19 @@
 name: Release
 
-# CI-artifacts-only: this workflow builds binaries + SBOM + license report +
-# checksums and uploads them as GitHub Actions workflow artifacts. It
-# deliberately has NO publish step (no `gh release create`, no public
-# download URL, no registry push) — see design decision D6/D7/D8 and the
-# release-packaging spec's "No public distribution occurs" scenario.
+# Builds binaries + SBOM + license report + checksums, uploads them as
+# GitHub Actions workflow artifacts (`bundle` job), and — only when the run
+# was triggered by a `v*` tag push — publishes that same bundle as a public
+# GitHub Release via `gh release create` (`publish` job). A bare
+# `workflow_dispatch` run (no tag) still builds and bundles but never
+# publishes, so ad-hoc runs can't accidentally cut a release.
 on:
   workflow_dispatch:
   push:
     tags:
       - "v*"
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -122,3 +126,20 @@ jobs:
         with:
           name: codekurve-release-bundle
           path: bundle
+
+  publish:
+    needs: [bundle]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: codekurve-release-bundle
+          path: bundle
+
+      - name: create GitHub release and upload assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "${{ github.ref_name }}" bundle/* --generate-notes

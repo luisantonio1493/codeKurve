@@ -27,6 +27,23 @@ querying, and MCP behavior work today for TypeScript/JavaScript. Phase 5
 test coverage) and is not yet merged — see `docs/ROADMAP.md` and
 `openspec/changes/phase-5-csharp/verify-report.md`.
 
+## Installation
+
+macOS/Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/luisantonio1493/codeKurve/main/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/luisantonio1493/codeKurve/main/install.ps1 | iex
+```
+
+Both scripts install the latest release binary and add it to your PATH.
+Re-run the same command to upgrade.
+
 ## Quickstart
 
 ```bash
