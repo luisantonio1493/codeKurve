@@ -14,6 +14,11 @@ introduces no new compatibility conflict.
 Every crate's `Cargo.toml` sets `license.workspace = true`, resolving to
 `license = "MIT"` in `[workspace.package]` (`Cargo.toml` at the repo root).
 
+`scripts/check_licensing.py` (run in CI) enforces that this stays consistent:
+`LICENSE` must exist, `[workspace.package]` must declare a license, that SPDX
+id must match `LICENSE`'s actual text, and every crate under `crates/` must
+declare one. Adding a new crate without `license.workspace = true` fails CI.
+
 - No code from Graphify, CodeGraph, or any other proprietary tool is
   copied — general ideas and patterns only, with inspiration documented
   without assuming license compatibility.
