@@ -10,17 +10,60 @@ use cli::Args;
 use codekurve::{commands, install, update, watch};
 use commands::CommandError;
 
+/// One dense line, printed to stderr when the invocation is wrong. `--help`
+/// gets [`HELP`] on stdout instead — see the note there.
 const USAGE: &str =
     "usage: codekurve <version|init|index|watch|mcp|tui|status|search|symbol|doctor|\
 references|callers|callees|implementations|unresolved|trace|impact|install|uninstall|update> \
 [args] [--root <path>] [--debounce-ms <n>] [--client <name>] [--yes] [--binary]\n\
-\x20      codekurve unresolved [<target-text>]  references the analyzer could not resolve, and why\n\
-\x20      codekurve tui                   interactive code-graph explorer\n\
-\x20      codekurve install [<client>]    configure every detected agent, or one by name\n\
-\x20      codekurve uninstall [<client>]  remove codekurve from agent configs\n\
-\x20      codekurve uninstall --binary    ...and delete the codekurve executable too\n\
-\x20      codekurve update [--yes]        re-run the published install script to upgrade\n\
-\x20      codekurve version | -v | --version";
+run `codekurve --help` for the full command list.";
+
+/// The full listing. Printed to **stdout** with exit **0**, because
+/// `--help` is a successful request for information, not a usage error —
+/// and because `install.sh` signs off with "Run: codekurve --help", which
+/// used to land the reader on a red, exit-2 screen.
+const HELP: &str = "\
+codekurve — a local-first code graph for C#/.NET and Angular, queryable from
+the CLI or by a coding agent over MCP.
+
+usage: codekurve <command> [args] [--root <path>]
+
+indexing
+  init                          create .codekurve/ in this project
+  index                         index (incremental; safe to re-run)
+  watch [--debounce-ms <n>]     re-index on file changes
+  status                        counts, freshness, schema version
+  doctor                        diagnose the install and this project
+
+querying
+  search <query>                full-text search over symbols
+  symbol <name>                 one symbol's details
+  references                    every relationship touching a symbol
+  callers | callees             call edges in either direction
+  implementations               what implements or extends a symbol
+  unresolved [<target-text>]    references the analyzer could not resolve,
+                                and the reason each one stopped
+  trace <to>                    path from one symbol to another
+  impact                        what a change to a symbol could reach
+
+  Symbol-taking commands accept --symbol-name <name> or --symbol-id <id>,
+  plus --limit, --offset, --min-confidence and --json.
+
+interactive
+  tui                           terminal code-graph explorer
+
+agents
+  mcp                           serve the query layer over MCP stdio
+  install [<client>]            configure every detected agent, or one of
+                                claude-code|cursor|codex-cli|copilot|opencode
+  uninstall [<client>]          remove codekurve from agent configs
+  uninstall --binary            ...and delete the codekurve executable too
+
+lifecycle
+  update [--yes]                re-run the published install script
+  version | -v | --version      print the version
+
+Docs: https://github.com/luisantonio1493/codeKurve";
 
 fn main() -> ExitCode {
     let mut raw = std::env::args().skip(1);
@@ -31,6 +74,10 @@ fn main() -> ExitCode {
     let args = Args::parse(raw);
 
     let result: Result<(), CommandError> = match command.as_str() {
+        "help" | "-h" | "--help" => {
+            println!("{HELP}");
+            return ExitCode::SUCCESS;
+        }
         "version" | "-v" | "--version" => {
             println!("codekurve {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
