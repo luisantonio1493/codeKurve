@@ -137,7 +137,7 @@ justification: [`docs/adr/0011-ratatui-tui.md`](docs/adr/0011-ratatui-tui.md).
 ## HTML subgraph export
 
 ```bash
-codekurve export graph.html --symbol-name SmartDBContext
+codekurve export graph.html --symbol-name DBContext
 codekurve export graph.html --symbol-name UserController --depth 3 --yes
 ```
 
