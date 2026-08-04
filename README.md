@@ -48,6 +48,20 @@ Windows (PowerShell):
 irm https://raw.githubusercontent.com/luisantonio1493/codeKurve/main/install.ps1 | iex
 ```
 
+The prebuilt `.exe` above is unsigned, so Windows Defender/SmartScreen may
+block or quarantine it (`Access is denied` when running, or `Move-Item`
+failing during install). If that happens, or you want to skip it entirely,
+build from source instead — it compiles locally, so nothing gets flagged:
+
+```powershell
+winget install Rustlang.Rustup
+cargo install --git https://github.com/luisantonio1493/codeKurve codekurve-bin
+```
+
+This installs the `codekurve` binary to `%USERPROFILE%\.cargo\bin`, which
+`rustup` puts on your PATH automatically. Re-run the same `cargo install`
+command to upgrade.
+
 Both scripts install the latest release binary and add it to your PATH.
 Re-run the same command to upgrade.
 
