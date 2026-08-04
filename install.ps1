@@ -60,7 +60,12 @@ try {
   Remove-Item -Force -ErrorAction SilentlyContinue $tmp
   throw "codekurve: download failed: $url`n$_"
 }
-Move-Item -Force $tmp $dest
+try {
+  Move-Item -Force $tmp $dest
+} catch {
+  Remove-Item -Force -ErrorAction SilentlyContinue $tmp
+  throw "codekurve: could not replace $dest (file in use). Close any running codekurve.exe (or terminal using it) and re-run this installer.`n$_"
+}
 
 Write-Host "Installed  $dest"
 
