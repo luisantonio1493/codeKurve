@@ -35,16 +35,20 @@ pub struct DoctorInput {}
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ReindexInput {}
 
-/// `search_symbols` (§28.2): `kinds`/`languages`/`path_prefix` are in the
-/// schema so clients can discover the shape, but any non-`None` value is
-/// rejected (spec "search_symbols Tool Rejects Unsupported Filters",
-/// confirmed decision 3) — `repo::search` has no SQL predicate for them yet.
+/// `search_symbols` accepts only the filters it can execute. Unknown fields
+/// are rejected rather than advertised and then refused at runtime.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SearchSymbolsInput {
     pub query: String,
-    pub kinds: Option<Vec<String>>,
-    pub languages: Option<Vec<String>>,
-    pub path_prefix: Option<String>,
+    pub limit: Option<u32>,
+}
+
+/// Find framework-recognized HTTP route bindings. `query` matches a verb,
+/// path fragment, or both (for example `POST /api/PatientReferrals/Submit`).
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct FindRoutesInput {
+    pub query: Option<String>,
     pub limit: Option<u32>,
 }
 
@@ -138,14 +142,12 @@ impl CodeKurve {
     }
 
     #[tool(
-        description = "Full-text search over symbol name/qualified name/kind/path (query, limit only — kinds/languages/path_prefix are rejected, not yet supported)"
+        description = "Search symbols by name or qualified name. Uses a partial-name fallback when exact full-text search has no results."
     )]
     fn codekurve_search_symbols(
         &self,
         Parameters(input): Parameters<SearchSymbolsInput>,
     ) -> Result<CallToolResult, McpError> {
-        reject_unsupported_search_filters(&input)?;
-
         let session = self.session.lock().unwrap();
         let search_input = SearchInput {
             query: &input.query,
@@ -177,6 +179,38 @@ impl CodeKurve {
                 })
             })
             .collect();
+        drop(session);
+
+        let envelope = query::envelope(
+            &project,
+            serde_json::Value::Array(rows),
+            warnings,
+            page.truncated,
+            Some(page.total),
+        );
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            envelope.to_string(),
+        )]))
+    }
+
+    #[tool(description = "Find framework-recognized HTTP route bindings by method or path")]
+    fn codekurve_find_routes(
+        &self,
+        Parameters(input): Parameters<FindRoutesInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let session = self.session.lock().unwrap();
+        let default_limit = session.config().queries.default_limit as usize;
+        let max_limit = session.config().queries.max_limit as usize;
+        let limit = input
+            .limit
+            .map(|limit| limit as usize)
+            .unwrap_or(default_limit)
+            .min(max_limit);
+        let page = query::routes(&session, input.query.as_deref(), limit)
+            .map_err(|e| McpError::internal_error(e.message, None))?;
+        let warnings = session.warnings();
+        let project = session.config().project.name.clone();
+        let rows: Vec<_> = page.rows.iter().map(query::relationship_row).collect();
         drop(session);
 
         let envelope = query::envelope(
@@ -391,7 +425,7 @@ impl CodeKurve {
     }
 
     #[tool(
-        description = "Report project-wide counts (files/symbols/relationships) plus a per-language file breakdown"
+        description = "Report project-wide counts, language breakdown, and framework-recognized route entry points"
     )]
     fn codekurve_project_overview(
         &self,
@@ -414,6 +448,7 @@ impl CodeKurve {
             "symbols": data.symbols,
             "relationships": data.relationships,
             "languages": languages,
+            "entry_points": data.entry_points.iter().map(query::relationship_row).collect::<Vec<_>>(),
         });
         let envelope = query::envelope(&project, result, warnings, false, None);
         Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -530,19 +565,4 @@ impl CodeKurve {
             envelope.to_string(),
         )]))
     }
-}
-
-/// Spec "search_symbols Tool Rejects Unsupported Filters" (confirmed
-/// decision 3): `kinds`/`languages`/`path_prefix` are in the schema for
-/// discoverability, but the store can't filter on any of them yet — reject
-/// explicitly, one message naming every supported filter, rather than
-/// silently dropping the value.
-fn reject_unsupported_search_filters(input: &SearchSymbolsInput) -> Result<(), McpError> {
-    if input.kinds.is_some() || input.languages.is_some() || input.path_prefix.is_some() {
-        return Err(McpError::invalid_params(
-            "invalid params: filter not supported yet (supported: query, limit)",
-            None,
-        ));
-    }
-    Ok(())
 }

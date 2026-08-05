@@ -1065,6 +1065,106 @@ pub fn search(
          LIMIT ?3",
     )?;
     let rows = stmt.query_map(params![fts_query, project_id, limit], map_stored)?;
+    let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    if !rows.is_empty() {
+        return Ok(rows);
+    }
+    search_partial(conn, project_id, query, limit)
+}
+
+/// Fallback for agents that guessed a longer PascalCase name than the source
+/// uses (`SubmitReferral` -> `Submit`). It only runs after exact FTS misses.
+fn search_partial(
+    conn: &Connection,
+    project_id: &str,
+    query: &str,
+    limit: u32,
+) -> Result<Vec<StoredSymbol>> {
+    let terms = partial_terms(query);
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let where_terms = std::iter::repeat_n(
+        "(LOWER(s.name) LIKE ? OR LOWER(s.qualified_name) LIKE ?)",
+        terms.len(),
+    )
+    .collect::<Vec<_>>()
+    .join(" OR ");
+    let sql = format!(
+        "SELECT s.id, s.name, s.qualified_name, s.kind, s.language, f.relative_path,
+                s.start_byte, s.end_byte, s.start_line, s.start_column, s.end_line, s.end_column,
+                s.visibility, s.is_partial, s.is_record, s.roles
+         FROM symbols s
+         JOIN files f ON f.id = s.file_id
+         WHERE s.project_id = ? AND ({where_terms})
+         ORDER BY CASE WHEN LOWER(s.name) LIKE ? THEN 0 ELSE 1 END, s.name
+         LIMIT ?"
+    );
+    let mut binds = vec![project_id.to_owned()];
+    for term in &terms {
+        let pattern = format!("%{term}%");
+        binds.push(pattern.clone());
+        binds.push(pattern);
+    }
+    binds.push(format!("{}%", terms[0]));
+    binds.push(limit.to_string());
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), map_stored)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn partial_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    for ch in query.chars() {
+        if !ch.is_alphanumeric() {
+            push_partial_term(&mut terms, &mut current);
+        } else {
+            if ch.is_uppercase() && !current.is_empty() {
+                push_partial_term(&mut terms, &mut current);
+            }
+            current.extend(ch.to_lowercase());
+        }
+    }
+    push_partial_term(&mut terms, &mut current);
+    terms
+        .into_iter()
+        .filter(|term| term.len() >= 3)
+        .take(3)
+        .collect()
+}
+
+fn push_partial_term(terms: &mut Vec<String>, current: &mut String) {
+    if !current.is_empty() && !terms.contains(current) {
+        terms.push(std::mem::take(current));
+    } else {
+        current.clear();
+    }
+}
+
+/// Framework route bindings, optionally narrowed by verb/path text.
+pub fn routes(
+    conn: &Connection,
+    project_id: &str,
+    route_query: Option<&str>,
+) -> Result<Vec<StoredRelationship>> {
+    let pattern = format!(
+        "%{}%",
+        route_query.unwrap_or("").replace('/', "").to_lowercase()
+    );
+    let mut stmt = conn.prepare(
+        "SELECT r.source_symbol_id, src.qualified_name, r.target_symbol_id, tgt.qualified_name,
+                r.target_external, r.kind, r.provenance, r.confidence, r.start_line, r.start_column,
+                src_file.relative_path
+         FROM relationships r
+         JOIN symbols src ON src.id = r.source_symbol_id
+         JOIN files src_file ON src_file.id = src.file_id
+         LEFT JOIN symbols tgt ON tgt.id = r.target_symbol_id
+         WHERE r.project_id = ? AND r.kind = 'handlesroute'
+           AND LOWER(REPLACE(COALESCE(r.target_external, ''), '/', '')) LIKE ?
+         ORDER BY r.target_external, src.qualified_name",
+    )?;
+    let rows = stmt.query_map([project_id, &pattern], map_relationship)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 

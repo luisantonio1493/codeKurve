@@ -17,6 +17,7 @@ const A_TS: &str = "export function getEligibility(): boolean {\n  return true;\
 /// fixture's populated case for `find_unresolved`. It adds no `Calls` edge,
 /// so every other tool's expected counts are unchanged.
 const B_TS: &str = "export function callAmbiguous(): boolean {\n  return getEligibility();\n}\n\nexport function callGhost(): void {\n  missingThing();\n}\n";
+const CONTROLLER_CS: &str = "[ApiController]\n[Route(\"api/PatientReferrals\")]\npublic class PatientReferralsController\n{\n    [HttpPost(\"Submit\")]\n    public void Submit() {}\n}\n";
 
 /// `init` + `index` via the real `codekurve` binary — same setup CLI golden
 /// tests use (`crates/codekurve-bin/tests/graph_queries.rs`), so the MCP
@@ -25,6 +26,11 @@ fn seed_project(root: &Path) {
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src").join("a.ts"), A_TS).unwrap();
     std::fs::write(root.join("src").join("b.ts"), B_TS).unwrap();
+    std::fs::write(
+        root.join("src").join("PatientReferralsController.cs"),
+        CONTROLLER_CS,
+    )
+    .unwrap();
     AssertCommand::cargo_bin("codekurve")
         .unwrap()
         .arg("init")
@@ -190,11 +196,11 @@ fn assert_envelope_shape(envelope: &serde_json::Value) {
     }
 }
 
-/// Task 5.8: golden coverage for all eight tools, one fixture project,
+/// Golden coverage for all read tools, one fixture project,
 /// covering both the "populated" and "small/empty result" shapes per tool
 /// where the fixture allows it.
 #[test]
-fn all_eight_tools_return_the_28_3_envelope() {
+fn all_read_tools_return_the_28_3_envelope() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     seed_project(root);
@@ -217,6 +223,7 @@ fn all_eight_tools_return_the_28_3_envelope() {
             "codekurve_find_callers",
             "codekurve_find_implementations",
             "codekurve_find_references",
+            "codekurve_find_routes",
             "codekurve_find_unresolved",
             "codekurve_get_symbol",
             "codekurve_project_overview",
@@ -225,9 +232,46 @@ fn all_eight_tools_return_the_28_3_envelope() {
             "codekurve_trace_path",
         ]
     );
+    let search_schema = tools_list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "codekurve_search_symbols")
+        .unwrap();
+    assert!(search_schema["inputSchema"]["properties"]
+        .get("kinds")
+        .is_none());
+    assert!(search_schema["inputSchema"]["properties"]
+        .get("languages")
+        .is_none());
+    assert!(search_schema["inputSchema"]["properties"]
+        .get("path_prefix")
+        .is_none());
     // `codekurve_reindex` stays absent — `[mcp] allow_reindex` defaults to
     // off (task 6.4, covered end-to-end in `tests/reindex.rs`).
     assert!(!tool_names.contains(&"codekurve_reindex"));
+
+    let result = session.call(
+        "codekurve_search_symbols",
+        serde_json::json!({"query": "SubmitReferral"}),
+    );
+    let envelope = envelope_of(&result);
+    assert!(envelope["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["name"] == "Submit"));
+
+    let result = session.call(
+        "codekurve_find_routes",
+        serde_json::json!({"query": "POST /api/PatientReferrals/Submit"}),
+    );
+    let envelope = envelope_of(&result);
+    assert_envelope_shape(&envelope);
+    assert_eq!(
+        envelope["result"][0]["target_external"],
+        "POST api/PatientReferrals/Submit"
+    );
 
     // search_symbols
     let result = session.call(
@@ -385,10 +429,10 @@ fn all_eight_tools_return_the_28_3_envelope() {
     session.finish();
 }
 
-/// Task 5.9: one unsupported-filter case per filter — `search_symbols` must
-/// reject explicitly, not silently drop the filter.
+/// Unsupported filters are absent from the schema and rejected as unknown
+/// fields instead of being advertised and then refused at runtime.
 #[test]
-fn search_symbols_rejects_each_unsupported_filter() {
+fn search_symbols_rejects_unknown_filters() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     seed_project(root);
@@ -400,11 +444,11 @@ fn search_symbols_rejects_each_unsupported_filter() {
         serde_json::json!({"query": "getEligibility", "path_prefix": "src/"}),
     ] {
         let result = session.call("codekurve_search_symbols", args.clone());
-        let message = result["error"]["message"]
+        let message = result["result"]["content"][0]["text"]
             .as_str()
-            .unwrap_or_else(|| panic!("expected a JSON-RPC error for {args}: {result}"));
+            .unwrap_or_else(|| panic!("expected an invalid-params response for {args}: {result}"));
         assert!(
-            message.contains("filter not supported yet (supported: query, limit)"),
+            message.contains("unknown field"),
             "unexpected error message for {args}: {message}"
         );
     }
@@ -573,12 +617,16 @@ fn project_overview_and_doctor_return_the_28_3_envelope() {
     // `project_overview`/`doctor` don't paginate — no `total` key (same
     // `envelope(.., None)` shape `codekurve_project_status` already uses).
     assert_envelope_shape_without_total(&envelope);
-    assert_eq!(envelope["result"]["files"], 2);
+    assert_eq!(envelope["result"]["files"], 3);
     assert!(envelope["result"]["symbols"].as_u64().unwrap() > 0);
     let languages = envelope["result"]["languages"].as_array().unwrap();
     assert!(languages
         .iter()
         .any(|l| l["language"] == "typescript" && l["files"] == 2));
+    assert_eq!(
+        envelope["result"]["entry_points"][0]["target_external"],
+        "POST api/PatientReferrals/Submit"
+    );
 
     let result = session.call("codekurve_doctor", serde_json::json!({}));
     let envelope = envelope_of(&result);

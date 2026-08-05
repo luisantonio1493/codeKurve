@@ -376,6 +376,24 @@ pub fn search(s: &Session, q: &SearchInput) -> Result<Page<StoredSymbol>, Comman
     })
 }
 
+/// Framework-recognized HTTP route bindings, bounded by the caller's limit.
+pub fn routes(
+    s: &Session,
+    route_query: Option<&str>,
+    limit: usize,
+) -> Result<Page<StoredRelationship>, CommandError> {
+    let (conn, project_id) = s.indexed()?;
+    let mut rows = repo::routes(conn, project_id, route_query)
+        .map_err(|e| CommandError::from(e.to_string()))?;
+    let total = rows.len();
+    commands::paginate(&mut rows, Some(limit), None);
+    Ok(Page {
+        rows,
+        total,
+        truncated: total > limit,
+    })
+}
+
 /// A single resolved symbol by id — the shape `get_symbol` needs to chain
 /// off a `search` hit. `ctx_lines`-driven source snippet/staleness
 /// (`source_slice`, design "get_symbol Staleness") is PR5 scope; this PR
@@ -513,6 +531,7 @@ pub struct OverviewData {
     pub symbols: usize,
     pub relationships: usize,
     pub languages: Vec<(String, usize)>,
+    pub entry_points: Vec<StoredRelationship>,
 }
 
 pub fn overview(s: &Session) -> Result<OverviewData, CommandError> {
@@ -524,11 +543,13 @@ pub fn overview(s: &Session) -> Result<OverviewData, CommandError> {
                 .map_err(|e| CommandError::from(e.to_string()))?;
             let languages = repo::language_breakdown(conn, project_id)
                 .map_err(|e| CommandError::from(e.to_string()))?;
+            let entry_points = routes(s, None, 20)?.rows;
             Ok(OverviewData {
                 files: st.files,
                 symbols: st.symbols,
                 relationships: st.relationships,
                 languages,
+                entry_points,
             })
         }
         Session::NotIndexed { .. } => Ok(OverviewData {
@@ -536,6 +557,7 @@ pub fn overview(s: &Session) -> Result<OverviewData, CommandError> {
             symbols: 0,
             relationships: 0,
             languages: Vec::new(),
+            entry_points: Vec::new(),
         }),
     }
 }
