@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::error::{Error, Result};
 
 /// Schema version applied by this build.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 const MIGRATION_0001: &str = r#"
 CREATE TABLE projects (
@@ -168,6 +168,18 @@ const MIGRATION_0005: &str = r#"
 ALTER TABLE symbols ADD COLUMN roles TEXT NOT NULL DEFAULT '';
 "#;
 
+/// Migration 0006: additive `projects.analyzer_version` — the `codekurve`
+/// binary version that last fully indexed this project. NULL on every row
+/// migrated from an earlier schema (a legacy index never recorded one),
+/// which `commands::index`/`watch::reconcile` read as "stale, force one
+/// full reindex" — the same signal a real version mismatch produces. Not a
+/// wipe: nothing here changes any existing symbol/relationship id, so no
+/// reindex is forced by the migration itself, only by that stale-version
+/// read.
+const MIGRATION_0006: &str = r#"
+ALTER TABLE projects ADD COLUMN analyzer_version TEXT;
+"#;
+
 /// Apply all pending migrations. Idempotent: already-applied versions are
 /// skipped.
 pub fn apply(conn: &Connection) -> Result<()> {
@@ -239,6 +251,17 @@ pub fn apply(conn: &Connection) -> Result<()> {
         tx.commit()?;
     }
 
+    if current < 6 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_0006)
+            .map_err(|e| Error::Migration(format!("0006: {e}")))?;
+        tx.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (6, datetime('now'))",
+            [],
+        )?;
+        tx.commit()?;
+    }
+
     Ok(())
 }
 
@@ -259,13 +282,13 @@ mod tests {
     use crate::db;
 
     /// Spec scenario "Fresh database migration": a fresh DB ends at
-    /// `SCHEMA_VERSION` (5), the pre-existing relationship-graph tables
+    /// `SCHEMA_VERSION` (6), the pre-existing relationship-graph tables
     /// still exist, and Phase 3's `index_state` table (plus the
     /// `files.content_hash`/`modified_ns` columns) is present.
     #[test]
-    fn fresh_database_reaches_schema_version_5() {
+    fn fresh_database_reaches_schema_version_6() {
         let conn = db::open_in_memory().unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 5);
+        assert_eq!(current_version(&conn).unwrap(), 6);
 
         let table_exists = |name: &str| -> bool {
             conn.query_row(
@@ -306,6 +329,7 @@ mod tests {
         assert!(column_exists("symbols", "is_partial"));
         assert!(column_exists("symbols", "is_record"));
         assert!(column_exists("symbols", "roles"));
+        assert!(column_exists("projects", "analyzer_version"));
     }
 
     /// Migrations must apply cleanly and idempotently on top of an
@@ -316,7 +340,7 @@ mod tests {
         // Re-running apply() on an already-migrated connection must be a
         // no-op, not an error (idempotency).
         apply(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 5);
+        assert_eq!(current_version(&conn).unwrap(), 6);
     }
 
     /// Phase 5 PR1 task 1.10 / symbol-index "Schema Migration 0004 ... Without
@@ -337,7 +361,8 @@ mod tests {
              ALTER TABLE symbols DROP COLUMN is_partial;
              ALTER TABLE symbols DROP COLUMN is_record;
              ALTER TABLE symbols DROP COLUMN roles;
-             DELETE FROM schema_migrations WHERE version IN (4, 5);",
+             ALTER TABLE projects DROP COLUMN analyzer_version;
+             DELETE FROM schema_migrations WHERE version IN (4, 5, 6);",
         )
         .unwrap();
         assert_eq!(current_version(&conn).unwrap(), 3);
@@ -370,7 +395,7 @@ mod tests {
             .unwrap();
 
         apply(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 5);
+        assert_eq!(current_version(&conn).unwrap(), 6);
 
         let symbol_count_after: i64 = conn
             .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
@@ -421,7 +446,8 @@ mod tests {
         // the `roles` column and downgrading the recorded version.
         conn.execute_batch(
             "ALTER TABLE symbols DROP COLUMN roles;
-             DELETE FROM schema_migrations WHERE version = 5;",
+             ALTER TABLE projects DROP COLUMN analyzer_version;
+             DELETE FROM schema_migrations WHERE version IN (5, 6);",
         )
         .unwrap();
         assert_eq!(current_version(&conn).unwrap(), 4);
@@ -456,7 +482,7 @@ mod tests {
             .unwrap();
 
         apply(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 5);
+        assert_eq!(current_version(&conn).unwrap(), 6);
 
         let symbol_count_after: i64 = conn
             .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))

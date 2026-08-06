@@ -52,14 +52,24 @@ pub fn run(root: &Path, debounce_ms_override: Option<u64>) -> Result<(), String>
 }
 
 fn reconcile(setup: &mut IndexSetup) -> Result<(), String> {
+    let force_full = commands::analyzer_version_changed(&setup.conn, &setup.project_id)?;
     let changes = incremental::detect(
         &setup.conn,
         &setup.project_id,
         &setup.root,
         &setup.options,
         None,
+        force_full,
     )?;
     if changes.is_empty() {
+        if force_full {
+            codekurve_store::repo::set_analyzer_version(
+                &setup.conn,
+                &setup.project_id,
+                commands::ANALYZER_VERSION,
+            )
+            .map_err(|e| e.to_string())?;
+        }
         return Ok(());
     }
     let ctx = IndexContext {
@@ -70,6 +80,12 @@ fn reconcile(setup: &mut IndexSetup) -> Result<(), String> {
         full_reindex_threshold_pct: setup.config.index.watch.full_reindex_threshold_pct,
     };
     let outcome = incremental::apply_batch(&mut setup.conn, &ctx, &changes)?;
+    codekurve_store::repo::set_analyzer_version(
+        &setup.conn,
+        &setup.project_id,
+        commands::ANALYZER_VERSION,
+    )
+    .map_err(|e| e.to_string())?;
     println!(
         "reconciled {} file(s) changed, {} deleted{}",
         outcome.files_changed,
@@ -103,6 +119,7 @@ fn apply_flush(setup: &mut IndexSetup, paths: &HashSet<PathBuf>) -> Result<(), S
         &setup.root,
         &setup.options,
         Some(&filter),
+        false,
     ) {
         Ok(changes) => changes,
         Err(e) if e.contains("max_total_files") => return Err(e),

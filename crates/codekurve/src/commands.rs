@@ -77,14 +77,37 @@ pub(crate) fn setup_index(root: &Path) -> Result<IndexSetup, String> {
     })
 }
 
+/// The `codekurve` binary's own version — stamped onto a project after a
+/// full (re)index and compared against the stored value on every run (see
+/// [`analyzer_version_changed`]).
+pub(crate) const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// True when the project's stored `analyzer_version` (§ repo::
+/// analyzer_version) doesn't match this build — a binary upgrade changed
+/// extraction logic without touching any source file, so content-hash-based
+/// change detection alone would never notice and stale relationships (e.g.
+/// a bug fix in the extractor) would stick around until something else
+/// happened to touch every file. `None` (never indexed, or migrated from a
+/// schema before this column existed) counts as changed too — one honest
+/// full reindex either way.
+pub(crate) fn analyzer_version_changed(conn: &Connection, project_id: &str) -> Result<bool, String> {
+    let stored = repo::analyzer_version(conn, project_id).map_err(|e| e.to_string())?;
+    Ok(stored.as_deref() != Some(ANALYZER_VERSION))
+}
+
 /// `codekurve index --root <path>` (task 5.5, design's shared engine):
 /// delegates to [`crate::incremental::detect`] then
 /// [`crate::incremental::apply_batch`] instead of always running a full
 /// reindex. On a never-indexed project every discovered file is `Created`
 /// and the oversized-batch fallback (task 5.4) naturally takes the full
-/// [`repo::reindex`] path — no separate bootstrap case needed.
+/// [`repo::reindex`] path — no separate bootstrap case needed. A binary
+/// upgrade forces the same full-reindex path via `force_full`
+/// ([`analyzer_version_changed`]), since unchanged source files would
+/// otherwise hide new/fixed extraction logic behind "up to date, no changes
+/// detected" forever.
 pub fn index(root: &Path) -> Result<(), String> {
     let mut setup = setup_index(root)?;
+    let force_full = analyzer_version_changed(&setup.conn, &setup.project_id)?;
 
     let changes = crate::incremental::detect(
         &setup.conn,
@@ -92,8 +115,13 @@ pub fn index(root: &Path) -> Result<(), String> {
         &setup.root,
         &setup.options,
         None,
+        force_full,
     )?;
     if changes.is_empty() {
+        if force_full {
+            repo::set_analyzer_version(&setup.conn, &setup.project_id, ANALYZER_VERSION)
+                .map_err(|e| e.to_string())?;
+        }
         println!("index up to date, no changes detected");
         return Ok(());
     }
@@ -106,6 +134,8 @@ pub fn index(root: &Path) -> Result<(), String> {
         full_reindex_threshold_pct: setup.config.index.watch.full_reindex_threshold_pct,
     };
     let outcome = crate::incremental::apply_batch(&mut setup.conn, &ctx, &changes)?;
+    repo::set_analyzer_version(&setup.conn, &setup.project_id, ANALYZER_VERSION)
+        .map_err(|e| e.to_string())?;
 
     println!(
         "indexed {} file(s) changed, {} deleted{}",

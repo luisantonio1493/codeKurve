@@ -156,6 +156,31 @@ pub fn upsert_project(
     Ok(id)
 }
 
+/// The `codekurve` binary version that last fully indexed this project, or
+/// `None` for a never-indexed project or one migrated from a schema before
+/// `analyzer_version` existed. Read by `commands::index`/`watch::reconcile`
+/// to decide whether a version bump (new extraction logic, same source
+/// files) needs a forced full reindex — file content alone can't signal
+/// that (§ analyzer-version staleness).
+pub fn analyzer_version(conn: &Connection, project_id: &str) -> Result<Option<String>> {
+    let version = conn.query_row(
+        "SELECT analyzer_version FROM projects WHERE id = ?1",
+        params![project_id],
+        |row| row.get(0),
+    )?;
+    Ok(version)
+}
+
+/// Stamps the current build's version onto a project after it has been
+/// fully (re)indexed — see [`analyzer_version`].
+pub fn set_analyzer_version(conn: &Connection, project_id: &str, version: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE projects SET analyzer_version = ?1 WHERE id = ?2",
+        params![version, project_id],
+    )?;
+    Ok(())
+}
+
 /// Rebuild the whole index for a project in a single transaction. The index is
 /// disposable (§5.5): the previous generation is wiped and replaced.
 pub fn reindex(

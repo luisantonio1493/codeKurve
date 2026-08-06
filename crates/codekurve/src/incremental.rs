@@ -62,15 +62,27 @@ pub struct BatchOutcome {
 /// `(size_bytes, modified_ns)` equal to stored -> unchanged, no read.
 /// Otherwise confirm via BLAKE3 `content_hash` before calling it `Modified`
 /// (spec "Mtime touch without content change is not a false positive").
+///
+/// `force_full`: treats every stored file as untracked, so every discovered
+/// file comes back `Created` — the same shape a never-indexed project
+/// already produces, which `apply_batch`'s oversized-batch check naturally
+/// routes into a full [`repo::reindex`] (no separate codepath needed). Set
+/// by callers that detected an analyzer-version mismatch (new extraction
+/// logic, unchanged source files — content hashes alone can't see that).
 pub fn detect(
     conn: &Connection,
     project_id: &str,
     root: &Path,
     opts: &DiscoveryOptions,
     filter: Option<&HashSet<String>>,
+    force_full: bool,
 ) -> Result<Vec<FileChange>, String> {
     let discovered = discovery::discover(root, opts).map_err(|e| e.to_string())?;
-    let stored = repo::file_snapshot(conn, project_id).map_err(|e| e.to_string())?;
+    let stored = if force_full {
+        HashMap::new()
+    } else {
+        repo::file_snapshot(conn, project_id).map_err(|e| e.to_string())?
+    };
 
     let mut changes = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -510,7 +522,7 @@ mod tests {
         // brand new file.
         std_fs::write(root.join("added.ts"), "export const d = 1;\n").unwrap();
 
-        let changes = detect(&conn, &project, root, &discovery_opts(), None).unwrap();
+        let changes = detect(&conn, &project, root, &discovery_opts(), None, false).unwrap();
 
         assert!(
             !changes
@@ -554,7 +566,7 @@ mod tests {
         // A raw directory path, exactly what a macOS FSEvents batch can
         // hand `watch::relative_paths` — not `src/a.ts` itself.
         let filter: HashSet<String> = ["src".to_string()].into_iter().collect();
-        let changes = detect(&conn, &project, root, &discovery_opts(), Some(&filter)).unwrap();
+        let changes = detect(&conn, &project, root, &discovery_opts(), Some(&filter), false).unwrap();
 
         assert_eq!(
             changes,

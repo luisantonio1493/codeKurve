@@ -670,12 +670,15 @@ pub fn doctor(s: &Session) -> DoctorReport {
 /// `NotIndexed`).
 pub fn reindex(root: &Path) -> Result<crate::incremental::BatchOutcome, CommandError> {
     let mut setup = commands::setup_index(root).map_err(CommandError::from)?;
+    let force_full = commands::analyzer_version_changed(&setup.conn, &setup.project_id)
+        .map_err(CommandError::from)?;
     let changes = crate::incremental::detect(
         &setup.conn,
         &setup.project_id,
         &setup.root,
         &setup.options,
         None,
+        force_full,
     )
     .map_err(CommandError::from)?;
     let ctx = crate::incremental::IndexContext {
@@ -685,7 +688,15 @@ pub fn reindex(root: &Path) -> Result<crate::incremental::BatchOutcome, CommandE
         options: &setup.options,
         full_reindex_threshold_pct: setup.config.index.watch.full_reindex_threshold_pct,
     };
-    crate::incremental::apply_batch(&mut setup.conn, &ctx, &changes).map_err(CommandError::from)
+    let outcome = crate::incremental::apply_batch(&mut setup.conn, &ctx, &changes)
+        .map_err(CommandError::from)?;
+    codekurve_store::repo::set_analyzer_version(
+        &setup.conn,
+        &setup.project_id,
+        commands::ANALYZER_VERSION,
+    )
+    .map_err(|e| CommandError::from(e.to_string()))?;
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -764,6 +775,7 @@ mod tests {
             &setup.root,
             &setup.options,
             None,
+            false,
         )
         .unwrap();
         let ctx = crate::incremental::IndexContext {
