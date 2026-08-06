@@ -456,6 +456,62 @@ fn search_symbols_rejects_unknown_filters() {
     session.finish();
 }
 
+/// Route discovery must reject unsupported input rather than silently ignoring
+/// it, and its bounded pages must still let a client retrieve the remainder.
+#[test]
+fn find_routes_paginates_and_rejects_unknown_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    seed_project(root);
+
+    let actions = (0..51)
+        .map(|index| {
+            format!("    [HttpGet(\"Route{index:02}\")]\n    public void Route{index:02}() {{}}\n")
+        })
+        .collect::<String>();
+    std::fs::write(
+        root.join("src").join("MoreRoutesController.cs"),
+        format!(
+            "[ApiController]\n[Route(\"api/MoreRoutes\")]\npublic class MoreRoutesController\n{{\n{actions}}}\n"
+        ),
+    )
+    .unwrap();
+    AssertCommand::cargo_bin("codekurve")
+        .unwrap()
+        .arg("index")
+        .arg("--root")
+        .arg(root)
+        .assert()
+        .success();
+
+    let mut session = McpSession::start(root);
+    let first =
+        envelope_of(&session.call("codekurve_find_routes", serde_json::json!({"limit": 500})));
+    assert_eq!(first["result"].as_array().unwrap().len(), 50);
+    assert_eq!(first["total"], 52);
+    assert_eq!(first["truncated"], true);
+
+    let second = envelope_of(&session.call(
+        "codekurve_find_routes",
+        serde_json::json!({"limit": 500, "offset": 50}),
+    ));
+    assert_eq!(second["result"].as_array().unwrap().len(), 2);
+    assert_eq!(second["total"], 52);
+    assert_eq!(second["truncated"], false);
+    assert_ne!(first["result"][0], second["result"][0]);
+
+    let invalid = session.call("codekurve_find_routes", serde_json::json!({"page": 1}));
+    let message = invalid["result"]["content"][0]["text"]
+        .as_str()
+        .expect("expected an invalid-params response");
+    assert!(
+        message.contains("unknown field"),
+        "unexpected error: {message}"
+    );
+
+    session.finish();
+}
+
 /// Task 5.10: `--limit 1` on `find_callers` (2 real callers) caps the
 /// result — `truncated: true` and `total` greater than the returned rows.
 #[test]

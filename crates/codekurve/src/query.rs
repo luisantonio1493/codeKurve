@@ -376,21 +376,23 @@ pub fn search(s: &Session, q: &SearchInput) -> Result<Page<StoredSymbol>, Comman
     })
 }
 
-/// Framework-recognized HTTP route bindings, bounded by the caller's limit.
+/// Framework-recognized HTTP route bindings, bounded and paginated by the caller.
 pub fn routes(
     s: &Session,
     route_query: Option<&str>,
     limit: usize,
+    offset: Option<usize>,
 ) -> Result<Page<StoredRelationship>, CommandError> {
     let (conn, project_id) = s.indexed()?;
     let mut rows = repo::routes(conn, project_id, route_query)
         .map_err(|e| CommandError::from(e.to_string()))?;
     let total = rows.len();
-    commands::paginate(&mut rows, Some(limit), None);
+    commands::paginate(&mut rows, Some(limit), offset);
+    let truncated = total > offset.unwrap_or(0) + rows.len();
     Ok(Page {
         rows,
         total,
-        truncated: total > limit,
+        truncated,
     })
 }
 
@@ -543,7 +545,7 @@ pub fn overview(s: &Session) -> Result<OverviewData, CommandError> {
                 .map_err(|e| CommandError::from(e.to_string()))?;
             let languages = repo::language_breakdown(conn, project_id)
                 .map_err(|e| CommandError::from(e.to_string()))?;
-            let entry_points = routes(s, None, 20)?.rows;
+            let entry_points = routes(s, None, 20, None)?.rows;
             Ok(OverviewData {
                 files: st.files,
                 symbols: st.symbols,

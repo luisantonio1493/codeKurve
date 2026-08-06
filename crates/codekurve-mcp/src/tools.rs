@@ -47,9 +47,11 @@ pub struct SearchSymbolsInput {
 /// Find framework-recognized HTTP route bindings. `query` matches a verb,
 /// path fragment, or both (for example `POST /api/PatientReferrals/Submit`).
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FindRoutesInput {
     pub query: Option<String>,
     pub limit: Option<u32>,
+    pub offset: Option<u32>,
 }
 
 /// `get_symbol` (§28.2): `ctx_lines` extra lines of context on each side of
@@ -193,7 +195,9 @@ impl CodeKurve {
         )]))
     }
 
-    #[tool(description = "Find framework-recognized HTTP route bindings by method or path")]
+    #[tool(
+        description = "Find framework-recognized HTTP route bindings by method or path, with offset pagination"
+    )]
     fn codekurve_find_routes(
         &self,
         Parameters(input): Parameters<FindRoutesInput>,
@@ -201,13 +205,22 @@ impl CodeKurve {
         let session = self.session.lock().unwrap();
         let default_limit = session.config().queries.default_limit as usize;
         let max_limit = session.config().queries.max_limit as usize;
+        // ponytail: a route row can carry a long framework path; keep one MCP
+        // response comfortably bounded. Use offset to retrieve every page.
+        const MAX_ROUTE_PAGE_SIZE: usize = 50;
         let limit = input
             .limit
             .map(|limit| limit as usize)
             .unwrap_or(default_limit)
-            .min(max_limit);
-        let page = query::routes(&session, input.query.as_deref(), limit)
-            .map_err(|e| McpError::internal_error(e.message, None))?;
+            .min(max_limit)
+            .min(MAX_ROUTE_PAGE_SIZE);
+        let page = query::routes(
+            &session,
+            input.query.as_deref(),
+            limit,
+            input.offset.map(|offset| offset as usize),
+        )
+        .map_err(|e| McpError::internal_error(e.message, None))?;
         let warnings = session.warnings();
         let project = session.config().project.name.clone();
         let rows: Vec<_> = page.rows.iter().map(query::relationship_row).collect();
