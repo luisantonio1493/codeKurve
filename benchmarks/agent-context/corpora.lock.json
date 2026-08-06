@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "corpora": [
+    {
+      "id": "angular-futbolsinfrontera",
+      "repository": "https://github.com/luisantonio1493/futbolsinfronteraAngular.git",
+      "identity": {
+        "kind": "git_commit",
+        "value": "66665aa669b3ab466bb5945572685f11cb08f439"
+      },
+      "default_path": "../FutbolSinFronteras/futbolsinfronterasAngular"
+    },
+    {
+      "id": "csharp-iungo-provider-api",
+      "repository": "local-only",
+      "identity": {
+        "kind": "content_sha256",
+        "value": "efdb63aeb448ac891ba79aa477b1b6d1e8d794217bb57745a3c43b99749b3783"
+      },
+      "default_path": "../iungo-provider-api"
+    }
+  ]
+}

@@ -18,7 +18,7 @@ near-production code rather than fixtures:
 |---|---|---|---|
 | `futbolsinfronterasAngular` | Angular (standalone components) | 22 | the Angular side |
 | `MinimalApi-main` | .NET 9, minimal APIs, EF Core | 22 | modern .NET style |
-| `iungo-provider-api` | .NET, classic ASP.NET Core, 6-project solution | 350 | **production**, layered (API/BL/DAL/Services), plus an Azure Function |
+| private production .NET solution | .NET, classic ASP.NET Core, 6-project solution | 350 | **production**, layered (API/BL/DAL/Services), plus an Azure Function |
 
 The third was added mid-pilot and proved decisive: it is a different
 *generation* of ASP.NET than the sample project, and it surfaced gaps the
@@ -104,7 +104,7 @@ real startup class and `AddDbContext<T>` linking to both real `DbContext`s.
   calls are recognized but their targets are framework features with no
   project symbol, so they remain unresolved references. Documented in
   `docs/FRAMEWORKS.md`.
-- **Multi-project solutions are flattened.** `iungo-provider-api` has six
+- **Multi-project solutions are flattened.** The private production solution has six
   `.csproj` projects; codekurve indexes every `.cs` file below the root as one
   flat project. Project references and assembly-level `internal` scope are not
   modelled (`docs/LANGUAGES.md`).

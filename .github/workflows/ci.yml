@@ -35,6 +35,9 @@ jobs:
       - name: licensing check
         run: python scripts/check_licensing.py
 
+      - name: agent-context benchmark runner tests
+        run: python tests/test_bench_agent_context.py
+
       # The installers are the one shipped surface with no compiler behind it:
       # a syntax error in either would only surface on a user's machine, at
       # the exact moment they are trying to install or update. Parse-check

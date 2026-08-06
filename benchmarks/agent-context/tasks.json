@@ -1,0 +1,86 @@
+{
+  "version": 1,
+  "tasks": [
+    {
+      "id": "route-flow",
+      "corpus": "angular-futbolsinfrontera",
+      "prompt": "For the /noticias route, identify the routed page component and the nested component that fetches article data through the API client.",
+      "expected": {
+        "required_evidence": [
+          {"path": "src/app/app.routes.ts", "symbol": "routes", "relationship": "routes_to"},
+          {"path": "src/app/features/news-page/pages/news-page/news-page.component.ts", "symbol": "NewsPageComponent", "relationship": "imports"},
+          {"path": "src/app/features/news/pages/news-list/news-list.component.ts", "symbol": "NewsListComponent.fetchNews", "relationship": "calls"}
+        ],
+        "forbidden_evidence": []
+      }
+    },
+    {
+      "id": "symbol-ambiguity",
+      "corpus": "angular-futbolsinfrontera",
+      "prompt": "Which public ApiClientService method fetches paginated news, and which component invokes it? Distinguish it from the similarly shaped matches method.",
+      "expected": {
+        "required_evidence": [
+          {"path": "src/app/core/services/api-client.service.ts", "symbol": "ApiClientService.getNews", "relationship": "defines"},
+          {"path": "src/app/features/news/pages/news-list/news-list.component.ts", "symbol": "NewsListComponent.fetchNews", "relationship": "calls"}
+        ],
+        "forbidden_evidence": [
+          {"path": "src/app/features/matches/pages/matches-list/matches-list.component.ts", "symbol": "MatchesListComponent.loadMatches", "relationship": "calls"}
+        ]
+      }
+    },
+    {
+      "id": "impact-radius",
+      "corpus": "angular-futbolsinfrontera",
+      "prompt": "If NewsResponse.news.nextCursor were removed, identify the method that consumes it and the caller that can reach that method when loading additional pages.",
+      "expected": {
+        "required_evidence": [
+          {"path": "src/app/core/services/api-client.service.ts", "symbol": "NewsResponse", "relationship": "defines"},
+          {"path": "src/app/features/news/pages/news-list/news-list.component.ts", "symbol": "NewsListComponent.fetchNews", "relationship": "reads"},
+          {"path": "src/app/features/news/pages/news-list/news-list.component.ts", "symbol": "NewsListComponent.loadMore", "relationship": "calls"}
+        ],
+        "forbidden_evidence": []
+      }
+    },
+    {
+      "id": "route-flow",
+      "corpus": "csharp-iungo-provider-api",
+      "prompt": "Trace the POST /api/Register flow: identify the controller method, the registration manager method it calls, and the domain entity collection used by that manager to check active provider contracts.",
+      "expected": {
+        "required_evidence": [
+          {"path": "IUNGO.Provider.API/Controllers/ProviderAcount/RegisterController.cs", "symbol": "RegisterController.Post", "relationship": "calls"},
+          {"path": "IUNGO.Provider.BL/RegisterManager.cs", "symbol": "RegisterManager.ValidHealthCareEntity", "relationship": "uses"},
+          {"path": "IUNGO.Provider.DAL/Models/HealthCareNetworkAssociation.cs", "symbol": "HealthCareNetworkAssociation", "relationship": "defines"}
+        ],
+        "forbidden_evidence": []
+      }
+    },
+    {
+      "id": "symbol-ambiguity",
+      "corpus": "csharp-iungo-provider-api",
+      "prompt": "Which RegisterManager method is invoked by RegisterController.Post for current registration validation? Distinguish it from the similarly named legacy ValidHealthCareEntity1 and ValidHealthCareEntity2 methods.",
+      "expected": {
+        "required_evidence": [
+          {"path": "IUNGO.Provider.API/Controllers/ProviderAcount/RegisterController.cs", "symbol": "RegisterController.Post", "relationship": "calls"},
+          {"path": "IUNGO.Provider.BL/RegisterManager.cs", "symbol": "RegisterManager.ValidHealthCareEntity", "relationship": "defines"}
+        ],
+        "forbidden_evidence": [
+          {"path": "IUNGO.Provider.BL/RegisterManager.cs", "symbol": "RegisterManager.ValidHealthCareEntity1", "relationship": "calls"},
+          {"path": "IUNGO.Provider.BL/RegisterManager.cs", "symbol": "RegisterManager.ValidHealthCareEntity2", "relationship": "calls"}
+        ]
+      }
+    },
+    {
+      "id": "impact-radius",
+      "corpus": "csharp-iungo-provider-api",
+      "prompt": "If HealthCareEntity.BlockRegistration changes, identify the entity member, the manager method that reads it during validation, and the API endpoint that reaches that method.",
+      "expected": {
+        "required_evidence": [
+          {"path": "IUNGO.Provider.DAL/Models/HealthCareEntity.cs", "symbol": "HealthCareEntity.BlockRegistration", "relationship": "defines"},
+          {"path": "IUNGO.Provider.BL/RegisterManager.cs", "symbol": "RegisterManager.ValidHealthCareEntity", "relationship": "reads"},
+          {"path": "IUNGO.Provider.API/Controllers/ProviderAcount/RegisterController.cs", "symbol": "RegisterController.Post", "relationship": "calls"}
+        ],
+        "forbidden_evidence": []
+      }
+    }
+  ]
+}

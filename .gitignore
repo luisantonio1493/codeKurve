@@ -15,6 +15,10 @@ target/
 # not committed — design PR3 D13)
 fixtures/bench/
 
+# Agent-context benchmark output. Summaries are generated locally; raw Codex
+# JSONL is only retained in an explicit debug directory outside this checkout.
+benchmarks/agent-context/results/
+
 # Gentle-AI generated skill registry (managed automatically)
 .atl/.skill-registry.cache.json
 .atl/skill-registry.md

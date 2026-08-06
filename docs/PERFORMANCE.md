@@ -63,6 +63,66 @@ two. It is not part of routine CI; run it locally (as above) or on a
 lower-frequency schedule instead, to avoid CI cost/flakiness from the
 largest fixture (spec "Large tier does not run on every PR").
 
+## Agent-context benchmark (Codex)
+
+This is a separate benchmark for the product claim that CodeKurve lowers an
+agent's exploration cost. It does **not** infer savings from fewer tool calls.
+`scripts/bench_agent_context.py` runs identical repository questions through
+Codex CLI 0.146.1 with `gpt-5.6-sol`, five times per arm:
+
+- **with** uses only the CodeKurve MCP server injected on the command line;
+- **without** uses no MCP server;
+- both use `--ephemeral --ignore-user-config --sandbox read-only`, the same
+  prompt, checkout, output schema, and standard Codex tools.
+
+The runner checks that CodeKurve is injected in the `with` command only. It
+indexes each local checkout before measurements and reports preparation time
+separately. It never clones or downloads a corpus.
+
+The versioned corpus lock and questions live in
+`benchmarks/agent-context/`. The Angular checkout is pinned to
+`66665aa669b3ab466bb5945572685f11cb08f439`. The local-only C# corpus,
+`iungo-provider-api`, is pinned with a deterministic SHA-256 source-tree
+snapshot instead of Git. The snapshot excludes VCS metadata and generated
+output (`bin`, `obj`, `node_modules`, and local indexes), and changes to an
+included file stop the benchmark before a model call. It is never cloned,
+pushed, or uploaded to GitHub or another source repository.
+
+Override either local location when necessary:
+
+```sh
+cargo build --release -p codekurve-bin
+python3 scripts/bench_agent_context.py \
+  --corpus csharp-iungo-provider-api=/path/to/iungo-provider-api
+```
+
+### Measurements and decision rule
+
+Primary cost is the real Codex JSONL `input_tokens + output_tokens`; cached
+input is reported but never added again. A run is inconclusive if Codex does
+not emit those real usage fields. Answers must satisfy the schema and all
+required structured evidence (path, symbol, relationship), while containing
+no forbidden evidence.
+
+Secondary measurements are tool calls, explicit file-read metadata when
+Codex provides it, wall time, maximum input tokens per turn, and context
+residual when Codex emits a context-window field. Missing secondary telemetry
+is recorded as unavailable, never estimated. As CodeGraph notes, lower
+processed tokens do not by themselves prove lower resident context.
+
+- **Ahorro demostrado**: lower aggregate median tokens, at least 4 of 6 tasks
+  improve, and CodeKurve does not reduce correctness.
+- **Ahorro fuerte**: at least 25% lower aggregate median, at least 5 of 6
+  tasks improve, and correctness is equal or better.
+- Every other result is **inconcluso**.
+
+Generated summaries contain aggregate metrics only and are ignored under
+`benchmarks/agent-context/results/`. Raw JSONL is discarded by default. To
+retain it for diagnosis, pass `--debug-dir` pointing outside this repository;
+it can contain prompts and must never be committed.
+
+No real cohort has been run yet, so this document makes no savings claim.
+
 ## Deferred decision
 
 `[profile.release]` tuning (LTO, codegen-units, etc., plan §38) is not

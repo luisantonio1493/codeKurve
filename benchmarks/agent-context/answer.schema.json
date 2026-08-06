@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["answer", "evidence"],
+  "properties": {
+    "answer": {"type": "string"},
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "symbol", "relationship", "claim"],
+        "properties": {
+          "path": {"type": "string"},
+          "symbol": {"type": "string"},
+          "relationship": {"type": "string"},
+          "claim": {"type": "string"}
+        }
+      }
+    }
+  }
+}
