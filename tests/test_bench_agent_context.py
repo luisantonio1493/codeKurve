@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -75,6 +76,10 @@ class AgentContextBenchmarkTests(unittest.TestCase):
         records[0]["correct"] = False
         self.assertEqual(bench.summarize(records)["aggregate"]["verdict"], "inconcluso")
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "fake codex/codekurve fixtures are POSIX shebang scripts",
+    )
     def test_integration_with_fake_codex(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
