@@ -533,6 +533,25 @@ fn walk_expressions(node: Node, scope: &str, ctx: &mut CsCtx) {
                 Some(TARGET_TYPED_NEW_REASON.to_string()),
             );
         }
+        // `obj.Member` read anywhere it isn't itself the callee of an
+        // `invocation_expression` (that case is already `Calls` above) —
+        // catches EF Core's dominant access pattern, `_context.Entities.
+        // Where(...)`, where the inner `member_access_expression` names the
+        // `DbSet<T>` property. Deferred like `Calls`/`Constructs` so a
+        // same-file property/field wins over the project-wide fallback.
+        "member_access_expression" if !is_invoked_callee(node) => {
+            if let Some(target_name) = node
+                .child_by_field_name("name")
+                .and_then(|n| cs_simple_type_name(n, ctx.source))
+            {
+                ctx.pending.push(PendingRel {
+                    source_key: scope.to_string(),
+                    kind: RelationshipKind::Reads,
+                    target_name,
+                    span: span_of(node),
+                });
+            }
+        }
         _ => {}
     }
     let mut cursor = node.walk();
@@ -724,6 +743,17 @@ fn collect_attributes(node: Node, source_key: &str, ctx: &mut CsCtx) {
             );
         }
     }
+}
+
+/// True when `node` (a `member_access_expression`) is the `function` of its
+/// parent `invocation_expression` — i.e. it's the callee of a call (`.Where(
+/// ...)`), already covered by the `Calls` edge, not a plain member read.
+fn is_invoked_callee(node: Node) -> bool {
+    node.parent().is_some_and(|p| {
+        p.kind() == "invocation_expression"
+            && p.child_by_field_name("function")
+                .is_some_and(|f| f.id() == node.id())
+    })
 }
 
 /// The callee name of an `invocation_expression` (design "C# Node-Kind
@@ -1248,6 +1278,50 @@ public class Widget {
         assert_eq!(
             unresolved_construct.reason.as_deref(),
             Some(TARGET_TYPED_NEW_REASON)
+        );
+    }
+
+    /// EF Core's dominant access pattern — `_context.Entities.Where(...)` —
+    /// emits a `Reads` edge for the inner `member_access_expression`
+    /// (`_context.Entities`, resolving to the same-file `Entities` field)
+    /// without also emitting one for the outer `.Where(...)` callee, which
+    /// stays a plain `Calls` edge (`Where` itself is unresolved — no
+    /// same-file method by that name).
+    #[test]
+    fn linq_member_access_on_a_field_emits_reads_not_a_second_call_target() {
+        let source = r#"
+public class Repo {
+    private DbSet<Entity> Entities;
+    public void Query() {
+        var found = _context.Entities.Where(x => x.Id == 1).FirstOrDefault();
+    }
+}
+"#;
+        let analysis = analyze(source, "src/test.cs").unwrap();
+        let entities = find(&analysis.symbols, "Entities");
+
+        // The lambda body's `x.Id` is also a plain member read (unresolved —
+        // `x` isn't a same-file symbol), which is fine: a noisy low-value
+        // extra hit beats silently missing the `Entities` access.
+        let entities_read = analysis
+            .relationships
+            .iter()
+            .find(|r| {
+                r.kind == RelationshipKind::Reads
+                    && r.target == EdgeTarget::Local(entities.local_key.clone())
+            })
+            .expect("_context.Entities resolves to a Reads edge on the same-file field");
+        assert_eq!(entities_read.confidence, Confidence::Exact);
+
+        let call_targets: Vec<&EdgeTarget> = analysis
+            .relationships
+            .iter()
+            .filter(|r| r.kind == RelationshipKind::Calls)
+            .map(|r| &r.target)
+            .collect();
+        assert!(
+            call_targets.contains(&&EdgeTarget::Unresolved("Where".to_string())),
+            "`.Where(...)` still emits a Calls edge: {call_targets:?}"
         );
     }
 

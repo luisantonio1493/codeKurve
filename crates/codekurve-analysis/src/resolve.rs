@@ -416,7 +416,8 @@ fn resolve_one(
         | RelationshipKind::Constructs
         | RelationshipKind::Inherits
         | RelationshipKind::Implements
-        | RelationshipKind::References => resolve_by_name(
+        | RelationshipKind::References
+        | RelationshipKind::Reads => resolve_by_name(
             source_language,
             &rel,
             &text,
@@ -443,8 +444,8 @@ fn resolve_one(
             unresolved,
             report,
         ),
-        // `Defines`/`Overrides`/`UsesType`/`Reads`/`Writes` aren't produced
-        // by `extract::analyze` yet — nothing to resolve, pass through
+        // `Defines`/`Overrides`/`UsesType`/`Writes` aren't produced by
+        // `extract::analyze` yet — nothing to resolve, pass through
         // unchanged.
         _ => new_rels.push(rel),
     }
@@ -1258,6 +1259,107 @@ mod tests {
                         qualified_name: "src/base.cs::Acme.IBillable".to_string()
                     }
                 && edge.confidence == Confidence::High));
+    }
+
+    /// EF Core's dominant access pattern, reported as a `find_references`
+    /// recall gap: `_context.HealthCareEntity.Where(...)` in a controller
+    /// file, with `HealthCareEntity` declared as a `DbSet<HealthCareEntity>`
+    /// property on a `DbContext` subclass in another file (property name
+    /// equal to the entity's own name — the common EF Core convention).
+    /// `_context`'s member access resolves by name project-wide to both the
+    /// `DbSet<T>` property AND the entity class itself sharing that name, so
+    /// `find_references(HealthCareEntity)` now sees the controller as a
+    /// (heuristic, low-confidence) consumer instead of missing it entirely.
+    #[test]
+    fn csharp_linq_dbset_access_resolves_reads_edge_to_the_entity_class() {
+        let mut files = vec![
+            csharp(
+                "src/Entity.cs",
+                "public class HealthCareEntity { public int Id; }",
+            ),
+            csharp(
+                "src/Context.cs",
+                "public class AppContext : DbContext { public DbSet<HealthCareEntity> HealthCareEntity { get; set; } }",
+            ),
+            csharp(
+                "src/Controller.cs",
+                "public class Controller { void Find() { var x = _context.HealthCareEntity.Where(i => i.Id == 1).FirstOrDefault(); } }",
+            ),
+        ];
+
+        resolve(&mut files, &TsconfigAliases::new());
+        let edges = &files[2].relationships;
+        assert!(
+            edges.iter().any(|edge| edge.kind == RelationshipKind::Reads
+                && edge.target
+                    == EdgeTarget::Global {
+                        file: "src/Entity.cs".to_string(),
+                        qualified_name: "src/Entity.cs::HealthCareEntity".to_string()
+                    }),
+            "expected a Reads edge to the entity class among: {edges:?}"
+        );
+    }
+
+    /// Same gap, but the DbSet property name does NOT match the entity's
+    /// own name (`DbSet<Invoice> Invoices` — arguably the more common EF
+    /// Core convention, plural property / singular entity). By-name lookup
+    /// alone can't bridge `Reads("Invoices")` straight to class `Invoice`;
+    /// it resolves to the `Invoices` property, which now carries its own
+    /// `PersistsTo` edge to `Invoice` (frameworks/dotnet.rs), so the BFS
+    /// traversal `find_references`/`analyze_impact` already run (depth 10)
+    /// reaches the entity two hops out: Method -Reads-> Property
+    /// -PersistsTo-> Invoice.
+    #[test]
+    fn csharp_linq_dbset_access_chains_through_the_property_when_names_differ() {
+        let mut files = vec![
+            csharp("src/Invoice.cs", "public class Invoice { public int Id; }"),
+            csharp(
+                "src/Context.cs",
+                "public class AppContext : DbContext { public DbSet<Invoice> Invoices { get; set; } }",
+            ),
+            csharp(
+                "src/Controller.cs",
+                "public class Controller { void Find() { var x = _context.Invoices.Where(i => i.Id == 1).FirstOrDefault(); } }",
+            ),
+        ];
+
+        resolve(&mut files, &TsconfigAliases::new());
+        let reads_target = files[2]
+            .relationships
+            .iter()
+            .find(|edge| edge.kind == RelationshipKind::Reads)
+            .expect("_context.Invoices resolves to a Reads edge")
+            .target
+            .clone();
+        let EdgeTarget::Global { file, qualified_name } = reads_target else {
+            panic!("expected a Global Reads target");
+        };
+        assert_eq!(file, "src/Context.cs");
+
+        let context_analysis = files
+            .iter()
+            .find(|f| f.symbols.iter().any(|s| s.qualified_name == qualified_name))
+            .unwrap();
+        let property_local_key = context_analysis
+            .symbols
+            .iter()
+            .find(|s| s.qualified_name == qualified_name)
+            .unwrap()
+            .local_key
+            .clone();
+        assert!(
+            context_analysis.relationships.iter().any(|edge| {
+                edge.kind == RelationshipKind::PersistsTo
+                    && edge.source_local_key == property_local_key
+                    && matches!(
+                        &edge.target,
+                        EdgeTarget::Global { qualified_name, .. }
+                            if qualified_name == "src/Invoice.cs::Invoice"
+                    )
+            }),
+            "the Invoices property itself must carry a PersistsTo edge resolved to Invoice: {:?}",
+            context_analysis.relationships
+        );
     }
 
     #[test]

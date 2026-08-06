@@ -532,6 +532,7 @@ fn recognize_dbcontext(class: Node, source: &[u8], analysis: &mut FileAnalysis) 
                         name_node,
                         type_node,
                         span_of(member),
+                        SymbolKind::Property,
                         source,
                         analysis,
                     );
@@ -557,6 +558,7 @@ fn recognize_dbcontext(class: Node, source: &[u8], analysis: &mut FileAnalysis) 
                         name_node,
                         type_node,
                         span_of(declarator),
+                        SymbolKind::Field,
                         source,
                         analysis,
                     );
@@ -595,6 +597,7 @@ fn recognize_dbset_member(
     name_node: Node,
     type_node: Node,
     span: SourceSpan,
+    member_kind: SymbolKind,
     source: &[u8],
     analysis: &mut FileAnalysis,
 ) {
@@ -619,6 +622,22 @@ fn recognize_dbset_member(
         Confidence::High,
         Some(format!("dbset:{prop_name}")),
     );
+    // Also sourced from the DbSet member itself (not just its declaring
+    // class): a `Reads` edge onto `_context.<AnyPropName>` resolves by name
+    // to this property/field regardless of whether <AnyPropName> matches
+    // the entity's own name (e.g. `DbSet<Invoice> Invoices`) — this second
+    // edge is what lets that chain one more BFS hop to reach the entity.
+    if let Some(member_local_key) = find_local_key(analysis, span, member_kind) {
+        push_heuristic_unresolved(
+            analysis,
+            &member_local_key,
+            RelationshipKind::PersistsTo,
+            &type_args[0],
+            span,
+            Confidence::High,
+            Some(format!("dbset:{prop_name}")),
+        );
+    }
 }
 
 // --- shared call/type parsing helpers ---------------------------------------
@@ -1591,7 +1610,7 @@ app.UseSomethingCustom();
     // --- task 6.10: EF Core bound ------------------------------------------
 
     #[test]
-    fn dbset_in_a_dbcontext_subclass_produces_one_persists_to_edge() {
+    fn dbset_in_a_dbcontext_subclass_produces_a_persists_to_edge_from_class_and_member() {
         let source = r#"
 public class AppDbContext : DbContext
 {
@@ -1600,13 +1619,17 @@ public class AppDbContext : DbContext
 "#;
         let analysis = analyze(source);
         let edges = call_driven_rel(&analysis, RelationshipKind::PersistsTo);
-        assert_eq!(edges.len(), 1);
-        assert_eq!(
-            edges[0].target,
-            EdgeTarget::Unresolved("Invoice".to_string())
-        );
-        assert_eq!(edges[0].reason.as_deref(), Some("dbset:Invoices"));
-        assert_eq!(edges[0].confidence, Confidence::High);
+        // One edge from the declaring class (existing behavior) plus one
+        // from the `Invoices` property itself — the second is what lets a
+        // `Reads` edge onto `_context.Invoices` (property name != entity
+        // name) still chain to the entity one more BFS hop.
+        assert_eq!(edges.len(), 2);
+        for edge in &edges {
+            assert_eq!(edge.target, EdgeTarget::Unresolved("Invoice".to_string()));
+            assert_eq!(edge.reason.as_deref(), Some("dbset:Invoices"));
+            assert_eq!(edge.confidence, Confidence::High);
+        }
+        assert_ne!(edges[0].source_local_key, edges[1].source_local_key);
     }
 
     #[test]
@@ -1637,9 +1660,12 @@ public class AppDbContext : DbContext
         let edges = call_driven_rel(&analysis, RelationshipKind::PersistsTo);
         // Exactly the one `DbSet<Invoice>` member — every other generic
         // shape (`List<T>`, `Task<T>`, `IQueryable<T>`, `Dictionary<A,B>`)
-        // is left alone, per D11's exact bound.
-        assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].reason.as_deref(), Some("dbset:Invoices"));
+        // is left alone, per D11's exact bound. Two edges for that one
+        // member: class-sourced and property-sourced.
+        assert_eq!(edges.len(), 2);
+        for edge in &edges {
+            assert_eq!(edge.reason.as_deref(), Some("dbset:Invoices"));
+        }
     }
 
     // --- task 6.12 -------------------------------------------------------------

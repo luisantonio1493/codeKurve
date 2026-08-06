@@ -105,8 +105,9 @@ fn controller_variant_produces_expected_framework_edge_counts_and_roles() {
         counts.get(&RelationshipKind::RegisteredAs).copied(),
         Some(3)
     );
-    // DbSet<Invoice> in AppDbContext -> one PersistsTo.
-    assert_eq!(counts.get(&RelationshipKind::PersistsTo).copied(), Some(1));
+    // DbSet<Invoice> in AppDbContext -> one PersistsTo from the class, one
+    // more from the `DbSet<Invoice>` property itself.
+    assert_eq!(counts.get(&RelationshipKind::PersistsTo).copied(), Some(2));
     assert_registered_as_target(&analyses, "AppDbContext");
     assert_unresolved_registration(&analyses, "Controllers");
 
@@ -141,7 +142,7 @@ fn minimal_api_variant_matches_the_controller_variants_shape() {
         counts.get(&RelationshipKind::RegisteredAs).copied(),
         Some(3)
     );
-    assert_eq!(counts.get(&RelationshipKind::PersistsTo).copied(), Some(1));
+    assert_eq!(counts.get(&RelationshipKind::PersistsTo).copied(), Some(2));
     assert_registered_as_target(&analyses, "AppDbContext");
     assert_unresolved_registration(&analyses, "OpenApi");
 
