@@ -24,7 +24,7 @@ use crate::extract::{find_child, span_of};
 use crate::ir::{EdgeTarget, ExtractedRelationship, ExtractedSymbol, FileAnalysis};
 use crate::languages::{
     analyzer_for, push_unresolved_edge, resolve_pending, LanguageAnalyzer, PendingRel,
-    BASE_LIST_REASON,
+    BASE_LIST_REASON, PROPERTY_TYPE_REASON,
 };
 
 /// design "C# Node-Kind Mapping": `implicit_object_creation_expression` (the
@@ -469,6 +469,11 @@ fn handle_member(node: Node, container_key: Option<&str>, ctx: &mut CsCtx) {
         partial_ordinal,
         roles: Vec::new(),
     });
+    if kind == SymbolKind::Property {
+        if let Some(type_node) = node.child_by_field_name("type") {
+            emit_property_type_edge(type_node, &local_key, ctx);
+        }
+    }
     collect_attributes(node, &local_key, ctx);
     collect_member_body(node, &local_key, ctx);
 }
@@ -568,6 +573,7 @@ fn handle_field_decl(node: Node, container_key: Option<&str>, ctx: &mut CsCtx) {
     let Some(var_decl) = find_child(node, "variable_declaration") else {
         return;
     };
+    let type_node = var_decl.child_by_field_name("type");
     let mut cursor = var_decl.walk();
     for declarator in var_decl.named_children(&mut cursor) {
         if declarator.kind() != "variable_declarator" {
@@ -612,6 +618,9 @@ fn handle_field_decl(node: Node, container_key: Option<&str>, ctx: &mut CsCtx) {
             partial_ordinal: None,
             roles: Vec::new(),
         });
+        if let Some(type_node) = type_node {
+            emit_property_type_edge(type_node, &local_key, ctx);
+        }
         // design "field_declaration ... attribute_list (attached to every
         // declarator)": the single `attribute_list` on `field_declaration`
         // (not on the declarator) applies to each declared name.
@@ -803,6 +812,110 @@ fn cs_simple_type_name(node: Node, source: &[u8]) -> Option<String> {
                 .map(str::to_string)
         }
         _ => node.utf8_text(source).ok().map(str::to_string),
+    }
+}
+
+/// Generic wrappers whose own name is never the interesting reference for a
+/// nav-property — the sole type argument is (`ICollection<Child>` should
+/// point at `Child`, not `ICollection`). Not exhaustive (no `Dictionary`,
+/// two type args have no single "the" entity) — EF Core's collection
+/// nav-properties are overwhelmingly one of these.
+const COLLECTION_WRAPPERS: &[&str] = &[
+    "ICollection",
+    "IList",
+    "IEnumerable",
+    "IReadOnlyCollection",
+    "IReadOnlyList",
+    "List",
+    "HashSet",
+    "ISet",
+    "Collection",
+    "ObservableCollection",
+    "Queue",
+    "Stack",
+];
+
+/// BCL scalar types a property/field is routinely declared as — never a
+/// project symbol, so extracting them would only pad `unresolved_references`
+/// with noise.
+const BUILTIN_SCALAR_TYPES: &[&str] = &[
+    "string",
+    "bool",
+    "byte",
+    "sbyte",
+    "char",
+    "decimal",
+    "double",
+    "float",
+    "int",
+    "uint",
+    "long",
+    "ulong",
+    "short",
+    "ushort",
+    "object",
+    "dynamic",
+    "void",
+    "nint",
+    "nuint",
+    "DateTime",
+    "DateTimeOffset",
+    "DateOnly",
+    "TimeOnly",
+    "TimeSpan",
+    "Guid",
+];
+
+/// A property/field declared type's entity name, for nav-property `UsesType`
+/// edges — `int`/`string`/… and bare generic wrappers are filtered out
+/// (`cs_simple_type_name` has no opinion on either, it just takes the
+/// outermost name). Unwraps `int?` (`nullable_type`) and `Child[]`
+/// (`array_type`) to their inner type, and `ICollection<Child>`/`List<Child>`
+/// (`COLLECTION_WRAPPERS`) to their sole type argument — anything else
+/// (`Dictionary<K, V>`, tuples, pointers) is skipped rather than guessed.
+fn cs_entity_type_name(node: Node, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "predefined_type" => None,
+        "nullable_type" | "array_type" => {
+            cs_entity_type_name(node.child_by_field_name("type")?, source)
+        }
+        "generic_name" => {
+            let mut cursor = node.walk();
+            let ident = node
+                .named_children(&mut cursor)
+                .find(|c| c.kind() == "identifier")?;
+            let outer = ident.utf8_text(source).ok()?;
+            if COLLECTION_WRAPPERS.contains(&outer) {
+                let args = find_child(node, "type_argument_list")?;
+                let mut arg_cursor = args.walk();
+                let first_arg = args.named_children(&mut arg_cursor).next()?;
+                return cs_entity_type_name(first_arg, source);
+            }
+            Some(outer.to_string())
+        }
+        "identifier" => {
+            let name = node.utf8_text(source).ok()?;
+            (!BUILTIN_SCALAR_TYPES.contains(&name)).then(|| name.to_string())
+        }
+        "qualified_name" => {
+            cs_entity_type_name(node.child_by_field_name("name")?, source)
+        }
+        _ => None,
+    }
+}
+
+/// Emits the `UsesType`/`PROPERTY_TYPE_REASON` edge for one property/field
+/// declared type, if `cs_entity_type_name` found an entity-shaped name.
+fn emit_property_type_edge(type_node: Node, source_key: &str, ctx: &mut CsCtx) {
+    if let Some(name) = cs_entity_type_name(type_node, ctx.source) {
+        push_unresolved_edge(
+            &mut ctx.out_rels,
+            source_key,
+            RelationshipKind::UsesType,
+            &name,
+            span_of(type_node),
+            Some(PROPERTY_TYPE_REASON.to_string()),
+        );
     }
 }
 
@@ -1225,6 +1338,45 @@ public class Widget {
         assert!(targets.contains(&"BillingDocument".to_string()));
         assert!(targets.contains(&"IBillable".to_string()));
         assert!(targets.contains(&"IAuditable".to_string()));
+    }
+
+    /// Nav-property support: a scalar nav-property (`HealthCareEntity`), a
+    /// collection nav-property (`ICollection<ClaimHeader>` — unwraps to the
+    /// type argument), a nullable scalar field (`int?` — unwraps and is then
+    /// filtered as a builtin), and a plain builtin property (`string`) all
+    /// declared on the same class. Only the two entity-shaped types should
+    /// produce a `PROPERTY_TYPE_REASON`-tagged `UsesType` edge.
+    #[test]
+    fn property_and_field_declared_types_emit_nav_property_edges() {
+        let source = r#"
+public class HealthCareGroupAssociation {
+    public HealthCareEntity HealthCareEntity { get; set; }
+    public ICollection<ClaimHeader> ClaimHeaders { get; set; }
+    public string Name { get; set; }
+    private int? _count;
+}
+"#;
+        let rels = relationships(source);
+        let nav_edges: Vec<&ExtractedRelationship> = rels
+            .iter()
+            .filter(|r| {
+                r.kind == RelationshipKind::UsesType
+                    && r.reason.as_deref() == Some(PROPERTY_TYPE_REASON)
+            })
+            .collect();
+        let targets: Vec<String> = nav_edges
+            .iter()
+            .map(|r| match &r.target {
+                EdgeTarget::Unresolved(name) => name.clone(),
+                other => panic!("expected Unresolved target, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(targets.len(), 2, "expected exactly 2 nav-property edges: {targets:?}");
+        assert!(targets.contains(&"HealthCareEntity".to_string()));
+        assert!(targets.contains(&"ClaimHeader".to_string()));
+        for edge in &nav_edges {
+            assert_eq!(edge.confidence, Confidence::Unresolved);
+        }
     }
 
     /// Task 4.8: direct invocation resolves to a same-file `Calls` edge;

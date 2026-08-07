@@ -288,6 +288,7 @@ pub fn relationship_row(r: &StoredRelationship) -> serde_json::Value {
         "start_column": r.start_column,
         "confidence": r.confidence,
         "provenance": r.provenance,
+        "reason": r.reason,
     })
 }
 

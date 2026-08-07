@@ -798,6 +798,12 @@ pub struct StoredRelationship {
     /// row needs a `path`) — additive column, existing CLI JSON printing
     /// (`relationship_json`) selects fields by name and is unaffected.
     pub source_relative_path: String,
+    /// Why this edge was classified the way it was (e.g. `PROPERTY_TYPE_REASON`
+    /// distinguishing a nav-property's declared type from a call-site usage,
+    /// or `BASE_LIST_REASON` for an inheritance entry) — `None` for the
+    /// common case (a real call/construct/read), same additive shape as
+    /// `source_relative_path` above.
+    pub reason: Option<String>,
 }
 
 /// A bare-name match for CLI ambiguity handling (§27.4): a bare-name query
@@ -920,7 +926,7 @@ fn query_relationships(
     let sql = format!(
         "SELECT r.source_symbol_id, src.qualified_name, r.target_symbol_id, tgt.qualified_name,
                 r.target_external, r.kind, r.provenance, r.confidence, r.start_line, r.start_column,
-                src_file.relative_path
+                src_file.relative_path, r.reason
          FROM relationships r
          JOIN symbols src ON src.id = r.source_symbol_id
          JOIN files src_file ON src_file.id = src.file_id
@@ -1037,6 +1043,7 @@ fn map_relationship(row: &Row) -> rusqlite::Result<StoredRelationship> {
         start_line: row.get::<_, Option<i64>>(8)?.map(|v| v as u32),
         start_column: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
         source_relative_path: row.get(10)?,
+        reason: row.get(11)?,
     })
 }
 
@@ -1180,7 +1187,7 @@ pub fn routes(
     let mut stmt = conn.prepare(
         "SELECT r.source_symbol_id, src.qualified_name, r.target_symbol_id, tgt.qualified_name,
                 r.target_external, r.kind, r.provenance, r.confidence, r.start_line, r.start_column,
-                src_file.relative_path
+                src_file.relative_path, r.reason
          FROM relationships r
          JOIN symbols src ON src.id = r.source_symbol_id
          JOIN files src_file ON src_file.id = src.file_id

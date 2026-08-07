@@ -72,6 +72,12 @@ pub(crate) fn kind_matches(
 /// `Inherits`/`Implements` from the resolved candidate's own `SymbolKind`).
 pub(crate) const BASE_LIST_REASON: &str = "c# base list entry";
 
+/// Reason text for a C# property/field declared type (nav-property support —
+/// same `Unresolved` + reason-tagged shape as `BASE_LIST_REASON`, resolved
+/// through `resolve_base_entry` too since both name a `Class`/`Struct`/
+/// `Interface` the declaring type references, never a call-site usage).
+pub(crate) const PROPERTY_TYPE_REASON: &str = "c# property/field declared type";
+
 /// A heritage/call/construct target discovered while walking, deferred until
 /// the whole file's symbols are known (both may be forward references).
 pub(crate) struct PendingRel {

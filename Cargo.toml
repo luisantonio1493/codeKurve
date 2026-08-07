@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.2.8"
+version = "0.2.9"
 edition = "2021"
 license = "MIT"
 # rust-version intentionally unpinned — MSRV deferred (see CODEKURVE_MASTER_PLAN.md §13).

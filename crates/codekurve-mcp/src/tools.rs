@@ -73,6 +73,14 @@ pub struct GetSymbolInput {
 pub struct RelationshipInput {
     pub symbol_id: Option<String>,
     pub symbol_name: Option<String>,
+    /// Filter by resolution confidence (`exact`/`high`/`medium`/`low`/
+    /// `unresolved`, floor inclusive). Caveat: the heuristic by-name resolver
+    /// tags most real hits `low` whenever a name collides with another
+    /// project symbol of the same name — common in larger codebases (e.g. a
+    /// property name reused across sibling classes). `medium`/`high` can
+    /// come back empty even when `low`/unfiltered has real results; prefer
+    /// leaving this unset for consumer-discovery and triaging by `reason`/
+    /// `provenance` instead of filtering confidence away.
     pub min_confidence: Option<String>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
@@ -98,6 +106,13 @@ pub struct TracePathInput {
     pub symbol_id: Option<String>,
     pub symbol_name: Option<String>,
     pub to: String,
+    /// Filter by resolution confidence (`exact`/`high`/`medium`/`low`/
+    /// `unresolved`, floor inclusive). Caveat: the heuristic by-name resolver
+    /// tags most real hits `low` whenever a name collides with another
+    /// project symbol of the same name — common in larger codebases (e.g. a
+    /// property name reused across sibling classes). `medium`/`high` can
+    /// come back empty even when `low`/unfiltered has real results; prefer
+    /// leaving this unset and triaging by `reason`/`provenance` instead.
     pub min_confidence: Option<String>,
     pub depth: Option<u32>,
 }
@@ -109,6 +124,14 @@ pub struct TracePathInput {
 pub struct AnalyzeImpactInput {
     pub symbol_id: Option<String>,
     pub symbol_name: Option<String>,
+    /// Filter by resolution confidence (`exact`/`high`/`medium`/`low`/
+    /// `unresolved`, floor inclusive). Caveat: the heuristic by-name resolver
+    /// tags most real hits `low` whenever a name collides with another
+    /// project symbol of the same name — common in larger codebases (e.g. a
+    /// property name reused across sibling classes). `medium`/`high` can
+    /// come back empty even when `low`/unfiltered has real results; prefer
+    /// leaving this unset for consumer-discovery and triaging by `reason`/
+    /// `provenance` instead of filtering confidence away.
     pub min_confidence: Option<String>,
     pub depth: Option<u32>,
 }

@@ -18,7 +18,9 @@ use std::collections::{HashMap, HashSet};
 use codekurve_core::{Confidence, LanguageId, Provenance, RelationshipKind, SymbolKind};
 
 use crate::ir::{EdgeTarget, ExtractedRelationship, FileAnalysis, UnresolvedReference};
-use crate::languages::{analyzer_for, kind_matches, same_resolution_domain, BASE_LIST_REASON};
+use crate::languages::{
+    analyzer_for, kind_matches, same_resolution_domain, BASE_LIST_REASON, PROPERTY_TYPE_REASON,
+};
 
 /// Minimal `tsconfig.json` `compilerOptions.paths` alias map: prefix (with a
 /// single trailing `*`) -> replacement prefix. Deliberately narrow scope
@@ -401,7 +403,12 @@ fn resolve_one(
             unresolved,
             report,
         ),
-        RelationshipKind::UsesType if rel.reason.as_deref() == Some(BASE_LIST_REASON) => {
+        RelationshipKind::UsesType
+            if matches!(
+                rel.reason.as_deref(),
+                Some(BASE_LIST_REASON) | Some(PROPERTY_TYPE_REASON)
+            ) =>
+        {
             resolve_base_entry(
                 source_language,
                 &rel,
