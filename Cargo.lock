@@ -197,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "codekurve"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "codekurve-analysis",
  "codekurve-core",
@@ -210,7 +210,7 @@ dependencies = [
 
 [[package]]
 name = "codekurve-analysis"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "codekurve-core",
  "codekurve-store",
@@ -223,7 +223,7 @@ dependencies = [
 
 [[package]]
 name = "codekurve-bin"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "assert_cmd",
  "codekurve",
@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "codekurve-core"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "serde",
  "thiserror",
@@ -248,7 +248,7 @@ dependencies = [
 
 [[package]]
 name = "codekurve-mcp"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "assert_cmd",
  "codekurve",
@@ -263,7 +263,7 @@ dependencies = [
 
 [[package]]
 name = "codekurve-store"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "blake3",
  "codekurve-core",
@@ -274,7 +274,7 @@ dependencies = [
 
 [[package]]
 name = "codekurve-tui"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "codekurve",
  "codekurve-core",
