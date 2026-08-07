@@ -313,10 +313,17 @@ fn all_read_tools_return_the_28_3_envelope() {
     );
     let envelope = envelope_of(&result);
     assert_envelope_shape(&envelope);
-    let rows = envelope["result"].as_array().unwrap();
+    let rows = envelope["result"]["rows"].as_array().unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(envelope["total"], 2);
     assert_eq!(envelope["truncated"], false);
+    // The fixed anchor (getEligibility, what every caller row points at)
+    // lives once at `result.anchor` — never repeated per row (§ token-cost:
+    // it used to be 3 fields x every row, same value each time).
+    assert_eq!(
+        envelope["result"]["anchor"]["qualified_name"],
+        "src/a.ts::getEligibility"
+    );
     for field in ["path", "start_line", "confidence", "provenance"] {
         assert!(
             rows[0].get(field).is_some(),
@@ -324,6 +331,11 @@ fn all_read_tools_return_the_28_3_envelope() {
             rows[0]
         );
     }
+    assert!(
+        rows[0].get("target_qualified_name").is_none(),
+        "caller row should not repeat the anchor: {}",
+        rows[0]
+    );
 
     // find_callers: `unused` has zero callers (small/empty case).
     let result = session.call(
@@ -331,7 +343,8 @@ fn all_read_tools_return_the_28_3_envelope() {
         serde_json::json!({"symbol_name": "src/a.ts::unused"}),
     );
     let envelope = envelope_of(&result);
-    assert_eq!(envelope["result"].as_array().unwrap().len(), 0);
+    assert_eq!(envelope["result"]["rows"].as_array().unwrap().len(), 0);
+    assert_eq!(envelope["result"]["anchor"], serde_json::Value::Null);
     assert_eq!(envelope["total"], 0);
     assert_eq!(envelope["truncated"], false);
 
@@ -342,7 +355,14 @@ fn all_read_tools_return_the_28_3_envelope() {
     );
     let envelope = envelope_of(&result);
     assert_envelope_shape(&envelope);
-    assert_eq!(envelope["result"].as_array().unwrap().len(), 1);
+    assert_eq!(envelope["result"]["rows"].as_array().unwrap().len(), 1);
+    // Anchor-is-source here (callees points FROM callLocal) — no `external`
+    // field, the anchor is always a project symbol.
+    assert_eq!(
+        envelope["result"]["anchor"]["qualified_name"],
+        "src/a.ts::callLocal"
+    );
+    assert!(envelope["result"]["anchor"].get("external").is_none());
 
     // find_references: same underlying rows as find_callers here (no
     // non-call references in the fixture).
@@ -352,7 +372,7 @@ fn all_read_tools_return_the_28_3_envelope() {
     );
     let envelope = envelope_of(&result);
     assert_envelope_shape(&envelope);
-    assert_eq!(envelope["result"].as_array().unwrap().len(), 2);
+    assert_eq!(envelope["result"]["rows"].as_array().unwrap().len(), 2);
 
     // find_implementations: fixture has no interfaces/classes -> empty, not
     // an error.
@@ -362,7 +382,7 @@ fn all_read_tools_return_the_28_3_envelope() {
     );
     let envelope = envelope_of(&result);
     assert_envelope_shape(&envelope);
-    assert_eq!(envelope["result"].as_array().unwrap().len(), 0);
+    assert_eq!(envelope["result"]["rows"].as_array().unwrap().len(), 0);
 
     // find_unresolved: the row `find_callers`/`find_references` can never
     // return, because the analyzer refused to guess an edge for it — the
@@ -526,7 +546,7 @@ fn capped_result_is_marked_truncated() {
         serde_json::json!({"symbol_name": "src/a.ts::getEligibility", "limit": 1}),
     );
     let envelope = envelope_of(&result);
-    let rows = envelope["result"].as_array().unwrap();
+    let rows = envelope["result"]["rows"].as_array().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(envelope["total"], 2);
     assert!(envelope["total"].as_u64().unwrap() > rows.len() as u64);

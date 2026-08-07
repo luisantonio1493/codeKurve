@@ -587,12 +587,21 @@ impl CodeKurve {
             .map_err(|e| McpError::internal_error(e.message, None))?;
         let warnings = session.warnings();
         let project = session.config().project.name.clone();
-        let rows: Vec<_> = page.rows.iter().map(query::relationship_row).collect();
+        let anchor_is_target = query::relationship_anchor_is_target(kind);
+        let anchor = page
+            .rows
+            .first()
+            .map(|r| query::relationship_anchor(r, anchor_is_target));
+        let rows: Vec<_> = page
+            .rows
+            .iter()
+            .map(|r| query::relationship_row_compact(r, anchor_is_target))
+            .collect();
         drop(session);
 
         let envelope = query::envelope(
             &project,
-            serde_json::Value::Array(rows),
+            serde_json::json!({ "anchor": anchor, "rows": rows }),
             warnings,
             page.truncated,
             Some(page.total),
