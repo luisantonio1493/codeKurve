@@ -90,7 +90,10 @@ pub(crate) const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// happened to touch every file. `None` (never indexed, or migrated from a
 /// schema before this column existed) counts as changed too — one honest
 /// full reindex either way.
-pub(crate) fn analyzer_version_changed(conn: &Connection, project_id: &str) -> Result<bool, String> {
+pub(crate) fn analyzer_version_changed(
+    conn: &Connection,
+    project_id: &str,
+) -> Result<bool, String> {
     let stored = repo::analyzer_version(conn, project_id).map_err(|e| e.to_string())?;
     Ok(stored.as_deref() != Some(ANALYZER_VERSION))
 }

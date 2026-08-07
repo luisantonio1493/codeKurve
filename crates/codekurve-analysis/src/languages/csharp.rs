@@ -897,9 +897,7 @@ fn cs_entity_type_name(node: Node, source: &[u8]) -> Option<String> {
             let name = node.utf8_text(source).ok()?;
             (!BUILTIN_SCALAR_TYPES.contains(&name)).then(|| name.to_string())
         }
-        "qualified_name" => {
-            cs_entity_type_name(node.child_by_field_name("name")?, source)
-        }
+        "qualified_name" => cs_entity_type_name(node.child_by_field_name("name")?, source),
         _ => None,
     }
 }
@@ -1371,7 +1369,11 @@ public class HealthCareGroupAssociation {
                 other => panic!("expected Unresolved target, got {other:?}"),
             })
             .collect();
-        assert_eq!(targets.len(), 2, "expected exactly 2 nav-property edges: {targets:?}");
+        assert_eq!(
+            targets.len(),
+            2,
+            "expected exactly 2 nav-property edges: {targets:?}"
+        );
         assert!(targets.contains(&"HealthCareEntity".to_string()));
         assert!(targets.contains(&"ClaimHeader".to_string()));
         for edge in &nav_edges {

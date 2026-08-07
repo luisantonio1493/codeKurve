@@ -771,7 +771,13 @@ fn resolve_property_type(
         }
         many => {
             for candidate in many {
-                push_typed_as(new_rels, rel, candidate, Provenance::Heuristic, Confidence::Low);
+                push_typed_as(
+                    new_rels,
+                    rel,
+                    candidate,
+                    Provenance::Heuristic,
+                    Confidence::Low,
+                );
                 report.resolved += 1;
             }
         }
@@ -1217,10 +1223,9 @@ mod tests {
                 qualified_name: "src/HealthCareEntity.cs::HealthCareEntity".to_string(),
             }
         );
-        assert!(files[0]
-            .relationships
-            .iter()
-            .all(|r| r.kind != RelationshipKind::Inherits && r.kind != RelationshipKind::Implements));
+        assert!(files[0].relationships.iter().all(
+            |r| r.kind != RelationshipKind::Inherits && r.kind != RelationshipKind::Implements
+        ));
     }
 
     /// A same-file-unresolved `Calls` edge resolves to the single cross-file
@@ -1462,7 +1467,11 @@ mod tests {
             .expect("_context.Invoices resolves to a Reads edge")
             .target
             .clone();
-        let EdgeTarget::Global { file, qualified_name } = reads_target else {
+        let EdgeTarget::Global {
+            file,
+            qualified_name,
+        } = reads_target
+        else {
             panic!("expected a Global Reads target");
         };
         assert_eq!(file, "src/Context.cs");

@@ -566,7 +566,15 @@ mod tests {
         // A raw directory path, exactly what a macOS FSEvents batch can
         // hand `watch::relative_paths` — not `src/a.ts` itself.
         let filter: HashSet<String> = ["src".to_string()].into_iter().collect();
-        let changes = detect(&conn, &project, root, &discovery_opts(), Some(&filter), false).unwrap();
+        let changes = detect(
+            &conn,
+            &project,
+            root,
+            &discovery_opts(),
+            Some(&filter),
+            false,
+        )
+        .unwrap();
 
         assert_eq!(
             changes,
