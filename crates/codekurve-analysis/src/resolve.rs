@@ -403,13 +403,24 @@ fn resolve_one(
             unresolved,
             report,
         ),
-        RelationshipKind::UsesType
-            if matches!(
-                rel.reason.as_deref(),
-                Some(BASE_LIST_REASON) | Some(PROPERTY_TYPE_REASON)
-            ) =>
-        {
+        RelationshipKind::UsesType if rel.reason.as_deref() == Some(BASE_LIST_REASON) => {
             resolve_base_entry(
+                source_language,
+                &rel,
+                &text,
+                table,
+                new_rels,
+                unresolved,
+                report,
+            )
+        }
+        // A property/field's declared type is never an inheritance edge —
+        // unlike `resolve_base_entry`, this never reclassifies to
+        // `Inherits`/`Implements` and keeps `UsesType` + `PROPERTY_TYPE_REASON`
+        // on the resolved edge too, so a nav-property stays distinguishable
+        // from both a base-list entry and a call-site usage.
+        RelationshipKind::UsesType if rel.reason.as_deref() == Some(PROPERTY_TYPE_REASON) => {
+            resolve_property_type(
                 source_language,
                 &rel,
                 &text,
@@ -714,6 +725,77 @@ fn push_classified_base(
         provenance,
         confidence,
         reason: None,
+    });
+}
+
+/// Same by-name/kind-filter shape as `resolve_base_entry` (Class/Struct/
+/// Interface candidates only), but never reclassifies the edge kind —
+/// a nav-property's declared type stays `UsesType`, and `reason` is carried
+/// through so `PROPERTY_TYPE_REASON` survives resolution instead of being
+/// dropped like `push_classified_base` drops it.
+fn resolve_property_type(
+    source_language: LanguageId,
+    rel: &ExtractedRelationship,
+    text: &str,
+    table: &SymbolTable,
+    new_rels: &mut Vec<ExtractedRelationship>,
+    unresolved: &mut Vec<UnresolvedReference>,
+    report: &mut ResolutionReport,
+) {
+    let matches: Vec<&ProjectSymbol> = table
+        .by_name
+        .get(text)
+        .into_iter()
+        .flatten()
+        .filter(|ps| {
+            same_resolution_domain(source_language, ps.language)
+                && matches!(
+                    ps.kind,
+                    SymbolKind::Class | SymbolKind::Struct | SymbolKind::Interface
+                )
+        })
+        .collect();
+
+    match matches.as_slice() {
+        [] => {
+            unresolved.push(unresolved_ref(
+                rel,
+                text,
+                "declared type not found in project",
+            ));
+            report.unresolved += 1;
+        }
+        [only] => {
+            push_typed_as(new_rels, rel, only, Provenance::Resolved, Confidence::High);
+            report.resolved += 1;
+        }
+        many => {
+            for candidate in many {
+                push_typed_as(new_rels, rel, candidate, Provenance::Heuristic, Confidence::Low);
+                report.resolved += 1;
+            }
+        }
+    }
+}
+
+fn push_typed_as(
+    new_rels: &mut Vec<ExtractedRelationship>,
+    rel: &ExtractedRelationship,
+    candidate: &ProjectSymbol,
+    provenance: Provenance,
+    confidence: Confidence,
+) {
+    new_rels.push(ExtractedRelationship {
+        source_local_key: rel.source_local_key.clone(),
+        target: EdgeTarget::Global {
+            file: candidate.file.clone(),
+            qualified_name: candidate.qualified_name.clone(),
+        },
+        kind: RelationshipKind::UsesType,
+        span: rel.span,
+        provenance,
+        confidence,
+        reason: rel.reason.clone(),
     });
 }
 
@@ -1097,6 +1179,48 @@ mod tests {
             files[0].relationships.first().unwrap().target,
             EdgeTarget::External("zod".to_string())
         );
+    }
+
+    /// A cross-file nav-property (`PROPERTY_TYPE_REASON`) resolves through
+    /// `resolve_property_type`, never `resolve_base_entry` — the resolved
+    /// edge must stay `UsesType` (not get reclassified to `Inherits` the way
+    /// a base-list entry would) and must keep its `reason` so a consumer can
+    /// still tell it apart from a call-site usage after resolution.
+    #[test]
+    fn cross_file_nav_property_resolves_to_uses_type_not_inherits() {
+        let mut files = vec![
+            csharp(
+                "src/ClaimHeader.cs",
+                "public class ClaimHeader { public HealthCareEntity HealthCareEntity { get; set; } }\n",
+            ),
+            csharp(
+                "src/HealthCareEntity.cs",
+                "public class HealthCareEntity {}\n",
+            ),
+        ];
+
+        let report = resolve(&mut files, &TsconfigAliases::new());
+        assert_eq!(report.unresolved, 0);
+
+        let nav_edge = files[0]
+            .relationships
+            .iter()
+            .find(|r| r.kind == RelationshipKind::UsesType)
+            .expect("expected a resolved UsesType edge, not reclassified to Inherits/Implements");
+        assert_eq!(nav_edge.reason.as_deref(), Some(PROPERTY_TYPE_REASON));
+        assert_eq!(nav_edge.confidence, Confidence::High);
+        assert_eq!(nav_edge.provenance, Provenance::Resolved);
+        assert_eq!(
+            nav_edge.target,
+            EdgeTarget::Global {
+                file: "src/HealthCareEntity.cs".to_string(),
+                qualified_name: "src/HealthCareEntity.cs::HealthCareEntity".to_string(),
+            }
+        );
+        assert!(files[0]
+            .relationships
+            .iter()
+            .all(|r| r.kind != RelationshipKind::Inherits && r.kind != RelationshipKind::Implements));
     }
 
     /// A same-file-unresolved `Calls` edge resolves to the single cross-file
