@@ -5,6 +5,8 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-24
+
 ### Fixed
 
 - `codekurve index` failed on ordinary real projects with `UNIQUE constraint
@@ -76,6 +78,8 @@ All notable changes to this project are documented here. Format follows
   (`gh attestation verify`).
 - Every GitHub Action in CI and Release is pinned to a commit SHA, and
   workflow tokens are read-only except the release `publish` job.
+
+## 0.2.11 and earlier (history not split by version)
 
 ### Added
 
