@@ -97,6 +97,9 @@ fn analyze(source: &str, relative_path: &str) -> Result<FileAnalysis> {
     let tree = parser
         .parse(source, None)
         .ok_or_else(|| Error::Parse("parser returned no tree".to_string()))?;
+    if super::syntax_depth_exceeds(&tree, super::MAX_SYNTAX_DEPTH) {
+        return Ok(super::too_deep(LanguageId::CSharp, relative_path));
+    }
 
     let mut ctx = CsCtx {
         source: source.as_bytes(),

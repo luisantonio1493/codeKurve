@@ -95,6 +95,9 @@ fn analyze(source: &str, language: LanguageId, relative_path: &str) -> Result<Fi
     let tree = parser
         .parse(source, None)
         .ok_or_else(|| Error::Parse("parser returned no tree".to_string()))?;
+    if super::syntax_depth_exceeds(&tree, super::MAX_SYNTAX_DEPTH) {
+        return Ok(super::too_deep(language, relative_path));
+    }
 
     let mut ctx = CollectCtx {
         source: source.as_bytes(),

@@ -48,6 +48,16 @@ All notable changes to this project are documented here. Format follows
 
 ### Security
 
+- A deeply nested source file could abort `codekurve index`, `watch` or the
+  MCP server with an uncatchable stack overflow: ~20 KB of nested `[` in a
+  `.ts` file killed `index`, and 5,000 levels killed the MCP server during
+  `codekurve_reindex` (its 2 MiB blocking-pool stack). Extraction now runs
+  on a dedicated thread with a 256 MiB stack reservation, and files nested
+  deeper than 10,000 levels are skipped with a warning (indexed empty, not
+  retried until they change). Cost: the extra depth walk adds ~6 % to cold
+  index time (3.59 s -> 3.81 s on 10k files). `SECURITY_MODEL.md` no longer claims parse
+  timeouts, memory budgets or redacted structured logs, none of which exist.
+
 - `install.sh` and `install.ps1` (and so `codekurve update`) now verify the
   downloaded binary against the release's `SHA256SUMS` and refuse to install
   on a mismatch or a missing entry. Before this they installed whatever the

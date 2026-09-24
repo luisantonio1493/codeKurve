@@ -172,3 +172,11 @@ Archivo: `crates/codekurve-mcp/src/tools.rs`, `server.rs`, `lib.rs`.
 - P1 MCP: test en `crates/codekurve-mcp/tests/` que lance `reindex` y en paralelo `project_status`
   y compruebe que el segundo responde; test de que tras un pánico simulado el servidor sigue.
 - P2 queries: `python3 scripts/bench.py --tier large` antes/después.
+
+## Hallazgo posterior — ✅ HECHO: archivo muy anidado tumbaba el indexador
+
+Los extractores del AST son recursivos sin límite. Reproducido: un `.ts` de ~20 KB (10k `[`)
+abortaba `codekurve index`, y 5k niveles mataban el servidor MCP en `codekurve_reindex`. Arreglo:
+análisis en un hilo con pila de 256 MiB reservada por lote, más un límite de 10k niveles (el
+archivo se indexa vacío con un aviso). `SECURITY_MODEL.md` corregido: prometía timeouts,
+presupuestos de memoria y logs con redacción que no existían.

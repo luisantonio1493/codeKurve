@@ -16,8 +16,63 @@ use codekurve_core::{
     Confidence, LanguageId, Provenance, RelationshipKind, SourceSpan, SymbolKind,
 };
 
+use tree_sitter::Tree;
+
 use crate::extract::NO_SAME_FILE_MATCH_REASON;
-use crate::ir::{EdgeTarget, ExtractedRelationship, ExtractedSymbol, FileAnalysis};
+use crate::ir::{
+    EdgeTarget, ExtractedRelationship, ExtractedSymbol, FileAnalysis, TOO_DEEP_DIAGNOSTIC,
+};
+
+/// Deepest syntax tree the extractors will walk. They recurse once per tree
+/// level, and a stack overflow aborts the process (it cannot be caught), so
+/// a crafted file (10k nested `[` is ~20 KB) could kill `index`, `watch` or
+/// the MCP server. Deeper files are skipped with a diagnostic instead.
+///
+/// Real code rarely passes a few hundred levels, but long operator chains
+/// (`a + b + c + ...`, one level per term) in generated code can, so the
+/// limit is generous and extraction runs on [`crate::extract::on_analysis_stack`],
+/// which is sized for it. Measured on a 2 MiB stack: TypeScript overflowed
+/// at ~500 levels in debug and ~2,000 in release (C#: ~1,500 / ~6,000).
+pub const MAX_SYNTAX_DEPTH: usize = 10_000;
+
+/// Whether `tree` is more than `limit` levels deep. Iterative (a cursor, no
+/// recursion), so it is safe on any stack however deep the tree is.
+pub(crate) fn syntax_depth_exceeds(tree: &Tree, limit: usize) -> bool {
+    let mut cursor = tree.walk();
+    let mut depth = 0usize;
+    loop {
+        if depth > limit {
+            return true;
+        }
+        if cursor.goto_first_child() {
+            depth += 1;
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return false;
+            }
+            depth -= 1;
+        }
+    }
+}
+
+/// The empty analysis an analyzer returns for a file past
+/// [`MAX_SYNTAX_DEPTH`]: `Ok`, not `Err`, because an `Err` fails the whole
+/// incremental batch and would fail it again on every later batch.
+pub(crate) fn too_deep(language: LanguageId, relative_path: &str) -> FileAnalysis {
+    FileAnalysis {
+        file: relative_path.to_string(),
+        language,
+        symbols: Vec::new(),
+        relationships: Vec::new(),
+        unresolved: Vec::new(),
+        diagnostics: vec![format!("{TOO_DEEP_DIAGNOSTIC} {MAX_SYNTAX_DEPTH} levels")],
+    }
+}
 
 /// What every language analyzer must provide to plug into `extract::analyze`
 /// dispatch and `resolve.rs`'s kind-compatibility check. Three methods,
@@ -266,5 +321,40 @@ mod tests {
         assert!(!same_resolution_domain(CSharp, TypeScript));
         assert!(!same_resolution_domain(TypeScript, CSharp));
         assert!(!same_resolution_domain(CSharp, JavaScript));
+    }
+
+    fn reference_depth(node: tree_sitter::Node) -> usize {
+        let mut cursor = node.walk();
+        node.children(&mut cursor)
+            .map(|child| 1 + reference_depth(child))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// `syntax_depth_exceeds(tree, limit)` is true exactly when the tree is
+    /// deeper than `limit`, matching a straightforward recursive depth on
+    /// trees small enough for recursion to be safe.
+    #[test]
+    fn syntax_depth_exceeds_matches_recursive_depth_at_the_boundary() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .unwrap();
+        for source in [
+            "",
+            "let a = 1;",
+            "function f() { if (a) { return [[1, [2]], g(h(3))]; } }",
+            &format!("const x = {}{};", "[".repeat(60), "]".repeat(60)),
+        ] {
+            let tree = parser.parse(source, None).unwrap();
+            let depth = reference_depth(tree.root_node());
+            assert!(!syntax_depth_exceeds(&tree, depth), "{source:?} at {depth}");
+            if depth > 0 {
+                assert!(
+                    syntax_depth_exceeds(&tree, depth - 1),
+                    "{source:?} at {depth}"
+                );
+            }
+        }
     }
 }

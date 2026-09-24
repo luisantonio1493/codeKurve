@@ -14,9 +14,28 @@ sensitive generated artifacts (plan §29.1).
 
 Never execute analyzed code, package-manager scripts, or repository
 config; never shell out to `npm`/`dotnet`/`cargo`; canonicalize paths;
-symlinks off by default; max file size and total file count; timeouts and
-cancellation; memory budgets; **no network**; structured logs with content
-redaction; dependency audit and SBOM; release checksums (plan §29.2).
+symlinks off by default; **no network**; dependency audit and SBOM; release
+checksums (plan §29.2).
+
+Resource limits, as implemented:
+
+- **Input size**: `index.max_file_size_bytes` (default 2 MiB per file) and
+  `index.max_total_files` (hard failure when exceeded); `[ignore] patterns`
+  plus `.gitignore`.
+- **Syntax depth**: extractors recurse per syntax-tree level, and a stack
+  overflow aborts the process, so a crafted file could kill `index`,
+  `watch` or the MCP server (~20 KB of nested `[` did). Files deeper than
+  `MAX_SYNTAX_DEPTH` (10,000 levels) are skipped with a warning, and
+  extraction runs on a thread with a 256 MiB stack reservation sized for
+  that limit (`codekurve_analysis::extract::on_analysis_stack`).
+- **Graph queries**: every traversal is capped by depth, node, edge and
+  time (5 s) budgets and reports truncation.
+
+Not implemented, so not claimed: a parse timeout (tree-sitter parses of
+files within the size cap finish in seconds even when pathological, e.g.
+~2.5 s for 1M nesting levels), an explicit memory budget, and structured
+logging with content redaction (output is plain text; nothing logs file
+contents).
 
 ## No-network
 

@@ -233,3 +233,40 @@ fn calling_reindex_while_disabled_fails_as_unknown_tool() {
     );
     session.finish();
 }
+
+/// `codekurve_reindex` runs on tokio's blocking pool (2 MiB stacks). A file
+/// nested a few thousand levels deep, still under the depth limit so it is
+/// really analyzed, used to overflow that stack and abort the whole server.
+#[test]
+fn reindex_of_a_deeply_nested_file_keeps_the_server_alive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    seed_project(root);
+    enable_reindex(root);
+    let depth = 5_000;
+    std::fs::write(
+        root.join("src").join("deep.ts"),
+        format!(
+            "export const x = {}{};\nexport function afterDeep() {{}}\n",
+            "[".repeat(depth),
+            "]".repeat(depth)
+        ),
+    )
+    .unwrap();
+
+    let mut session = McpSession::start(root);
+    let result = session.call("codekurve_reindex", serde_json::json!({}));
+    assert_eq!(
+        result["result"]["isError"], false,
+        "reindex should succeed: {result}"
+    );
+
+    // Still answering, and the deep file was indexed, not skipped.
+    let result = session.call(
+        "codekurve_search_symbols",
+        serde_json::json!({"query": "afterDeep"}),
+    );
+    let text = result["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("src/deep.ts"), "{text}");
+    session.finish();
+}

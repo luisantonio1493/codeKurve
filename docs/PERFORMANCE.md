@@ -86,6 +86,16 @@ flat across tiers. Three causes, all fixed:
 Caveat: the synthetic graph is sparse (~4 edges per file). Real projects are
 denser, which made "before" worse, not "after": lookups stay indexed.
 
+## Cost of the syntax-depth guard (measured 2026-09-24)
+
+Every file's syntax tree is walked once more (iteratively) to reject trees
+deeper than `MAX_SYNTAX_DEPTH` before the recursive extractors run (see
+`docs/SECURITY_MODEL.md`). Interleaved A/B on the large tier, same Linux
+container as the query table, 6 cold runs each: 3.59 s median before,
+3.81 s after (+6 %). Accepted: the alternative was a process abort on a
+crafted file. Skipping the check for small files was rejected because tree
+depth is not safely bounded by file size.
+
 ## Budgets (targets, plan §33)
 
 | Fixture | Size | Cold index | Notes |

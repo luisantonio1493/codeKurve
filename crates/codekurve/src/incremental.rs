@@ -197,9 +197,21 @@ pub fn apply_batch(
     ctx: &IndexContext,
     changes: &[FileChange],
 ) -> Result<BatchOutcome, String> {
-    let outcome = apply_changes(conn, ctx, changes)?;
+    let outcome = extract::on_analysis_stack(|| apply_changes(conn, ctx, changes))?;
     refresh_planner_stats(conn);
     Ok(outcome)
+}
+
+/// Stderr, not stdout: this also runs inside the MCP server, whose stdout
+/// carries only JSON-RPC.
+fn warn_if_skipped(analysis: &FileAnalysis) {
+    if analysis.skipped_too_deep() {
+        eprintln!(
+            "warning: {} not indexed: {}",
+            analysis.file,
+            analysis.diagnostics.join("; ")
+        );
+    }
 }
 
 /// [`db::refresh_planner_stats`], best effort: statistics only steer query
@@ -271,6 +283,7 @@ fn apply_via_full_reindex(
         let Ok(analysis) = extract::analyze(&source, file.language, &file.relative_path) else {
             continue;
         };
+        warn_if_skipped(&analysis);
         let meta = fs::metadata(&file.absolute_path).map_err(|e| e.to_string())?;
         file_meta.push(FileMeta {
             language: file.language,
@@ -329,6 +342,7 @@ fn apply_incremental_changes(
         let source = fs::read_to_string(&file.absolute_path).map_err(|e| e.to_string())?;
         let analysis = extract::analyze(&source, file.language, &file.relative_path)
             .map_err(|e| e.to_string())?;
+        warn_if_skipped(&analysis);
         let meta = fs::metadata(&file.absolute_path).map_err(|e| e.to_string())?;
         file_meta.push(FileMeta {
             language: file.language,

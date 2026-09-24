@@ -21,10 +21,42 @@ use crate::languages::analyzer_for;
 /// analyzer returns — this is the single entry point every caller already
 /// routes through, and the only place holding both the source text and the
 /// finished per-file symbol list.
+///
+/// A file deeper than [`crate::languages::MAX_SYNTAX_DEPTH`] comes back
+/// empty with a diagnostic ([`FileAnalysis::skipped_too_deep`]) and skips
+/// framework recognition, which would re-parse and walk it recursively.
+/// Below that limit extraction still recurses per tree level: run it on
+/// [`on_analysis_stack`].
 pub fn analyze(source: &str, language: LanguageId, relative_path: &str) -> Result<FileAnalysis> {
     let mut analysis = analyzer_for(language).analyze(source, relative_path)?;
-    crate::frameworks::recognize(source, language, &mut analysis);
+    if !analysis.skipped_too_deep() {
+        crate::frameworks::recognize(source, language, &mut analysis);
+    }
     Ok(analysis)
+}
+
+/// Stack reserved for [`on_analysis_stack`]. A reservation, not an
+/// allocation: pages are only committed as recursion actually touches them.
+/// Sized so a tree right at [`crate::languages::MAX_SYNTAX_DEPTH`] fits with
+/// margin even in a debug build (~4 KiB per level measured for TypeScript).
+pub const ANALYSIS_STACK_BYTES: usize = 256 << 20;
+
+/// Runs `work` (a batch of [`analyze`] calls and whatever follows them) on a
+/// dedicated thread with an [`ANALYSIS_STACK_BYTES`] stack, and returns its
+/// result. Callers' own stacks vary: 8 MiB on the main thread, 2 MiB on
+/// tokio's blocking pool where the MCP server reindexes, which a few hundred
+/// nested levels already overflowed. One thread per batch, not per file.
+/// A panic in `work` is re-raised on the caller's thread.
+pub fn on_analysis_stack<T: Send>(work: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("codekurve-analysis".to_string())
+            .stack_size(ANALYSIS_STACK_BYTES)
+            .spawn_scoped(scope, work)
+            .expect("spawn the analysis thread")
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
 }
 
 /// Reason text for a deferred (`PendingRel`) target with zero same-file

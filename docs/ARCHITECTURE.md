@@ -39,10 +39,14 @@ codekurve-core ─────> (nothing internal)
 
 ## Concurrency
 
-- **Indexing** runs on the calling thread: discovery, parsing and resolution
-  are sequential, then one transaction writes the batch. This is fast enough
-  for the budgets in `docs/PERFORMANCE.md` (10k files in ~3.4 s), so parsing
-  has not been parallelized.
+- **Indexing** runs one batch at a time on a dedicated analysis thread
+  (`extract::on_analysis_stack`, one per batch, 256 MiB stack reservation):
+  the extractors recurse per syntax-tree level, and callers' stacks go down
+  to tokio's 2 MiB. Within a batch, discovery, parsing and resolution are
+  sequential, then one transaction writes it. This is fast enough for the
+  budgets in `docs/PERFORMANCE.md` (10k files in ~3.4 s), so parsing has not
+  been parallelized. Files deeper than `languages::MAX_SYNTAX_DEPTH` are
+  skipped with a warning.
 - **Single writer** (ADR 0008): SQLite in WAL mode; each batch is one
   transaction. The watcher applies batches one at a time on its own thread.
 - **MCP server**: a current-thread tokio runtime reads JSON-RPC over stdio.
