@@ -33,4 +33,7 @@ pub enum Error {
         "project exceeds index.max_total_files ({limit}); raise the limit in .codekurve/config.toml or narrow index.languages / ignore.patterns"
     )]
     TooManyFiles { limit: usize },
+
+    #[error("invalid ignore.patterns entry {pattern:?}: {reason}")]
+    InvalidIgnorePattern { pattern: String, reason: String },
 }

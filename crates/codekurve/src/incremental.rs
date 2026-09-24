@@ -444,6 +444,7 @@ mod tests {
             follow_symlinks: false,
             max_file_size_bytes: 2_097_152,
             max_total_files: 0,
+            exclude_patterns: Vec::new(),
             languages: vec![LanguageId::TypeScript],
         }
     }

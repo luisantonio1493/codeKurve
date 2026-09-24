@@ -5,6 +5,16 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Apply `[ignore] patterns` during discovery. The patterns were parsed from
+  `.codekurve/config.toml` but never used, so the default exclusions
+  (`node_modules`, `dist`, `build`, `*.min.js`, `.env`, `secrets.*`, keys)
+  only took effect when `.gitignore` also listed them. Files an existing index
+  already holds that now match a pattern are removed on the next `index`. A
+  pattern starting with `!` is rejected with a clear error instead of being
+  silently ignored.
+
 ### Added
 
 - Initialize Rust workspace (5 crates)

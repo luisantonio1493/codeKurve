@@ -1165,6 +1165,7 @@ fn discovery_options(config: &Config) -> DiscoveryOptions {
         follow_symlinks: config.index.follow_symlinks,
         max_file_size_bytes: config.index.max_file_size_bytes,
         max_total_files: config.index.max_total_files,
+        exclude_patterns: config.ignore.patterns.clone(),
         languages,
     }
 }

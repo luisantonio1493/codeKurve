@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use codekurve_core::LanguageId;
+use ignore::overrides::{Override, OverrideBuilder};
 use ignore::WalkBuilder;
 
 /// A source file selected by discovery.
@@ -28,6 +29,10 @@ pub struct DiscoveryOptions {
     /// Hard cap on discovered file count; `0` disables the check (Phase 6,
     /// design "max_total_files enforcement point").
     pub max_total_files: usize,
+    /// `[ignore] patterns`: gitignore-style globs, matched against the path
+    /// relative to `root`, whose matches are never indexed — applied on top
+    /// of (not instead of) `.gitignore` (§15.1, §29.3).
+    pub exclude_patterns: Vec<String>,
     /// Languages to include. Empty means "all supported".
     pub languages: Vec<LanguageId>,
 }
@@ -59,7 +64,8 @@ pub fn discover(
         // Honor `.gitignore` even when the root is not a git repository (§15.1).
         .require_git(false)
         .follow_links(options.follow_symlinks)
-        .max_filesize(Some(options.max_file_size_bytes));
+        .max_filesize(Some(options.max_file_size_bytes))
+        .overrides(exclude_overrides(root, &options.exclude_patterns)?);
 
     let mut files = Vec::new();
     for entry in builder.build().flatten() {
@@ -99,6 +105,43 @@ pub fn discover(
     Ok(files)
 }
 
+/// Compile `[ignore] patterns` into an exclude-only override set. Every
+/// pattern becomes a `!glob` override (an ignore); no whitelist globs are
+/// ever added, since a single whitelist entry would flip the override set
+/// into "ignore everything else". A pattern ending in `/**` also excludes
+/// the directory itself, so the walk prunes it (e.g. `node_modules`)
+/// instead of descending just to reject every file inside.
+fn exclude_overrides(root: &Path, patterns: &[String]) -> Result<Override, codekurve_core::Error> {
+    let invalid = |pattern: &str, reason: String| codekurve_core::Error::InvalidIgnorePattern {
+        pattern: pattern.to_string(),
+        reason,
+    };
+    let mut builder = OverrideBuilder::new(root);
+    for pattern in patterns {
+        let trimmed = pattern.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('!') {
+            return Err(invalid(
+                pattern,
+                "patterns are exclusions; re-including with `!` is not supported".to_string(),
+            ));
+        }
+        builder
+            .add(&format!("!{trimmed}"))
+            .map_err(|e| invalid(pattern, e.to_string()))?;
+        if let Some(dir) = trimmed.strip_suffix("/**") {
+            if !dir.is_empty() {
+                builder
+                    .add(&format!("!{dir}"))
+                    .map_err(|e| invalid(pattern, e.to_string()))?;
+            }
+        }
+    }
+    builder.build().map_err(|e| invalid("", e.to_string()))
+}
+
 /// Build a `/`-separated path relative to `root`, or `None` if `path` is not
 /// under `root`.
 fn relative_slash_path(root: &Path, path: &Path) -> Option<String> {
@@ -123,6 +166,7 @@ mod tests {
             follow_symlinks: false,
             max_file_size_bytes: 2_097_152,
             max_total_files: 0,
+            exclude_patterns: Vec::new(),
             languages: vec![LanguageId::TypeScript, LanguageId::JavaScript],
         }
     }
@@ -203,6 +247,62 @@ mod tests {
         assert!(matches!(
             err,
             codekurve_core::Error::TooManyFiles { limit: 2 }
+        ));
+    }
+
+    /// `[ignore] patterns` apply even with no `.gitignore` and no git repo:
+    /// the default sensitive/vendored patterns keep `node_modules`, `dist`,
+    /// minified bundles and `secrets.*` out of the index.
+    #[test]
+    fn exclude_patterns_apply_without_gitignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("a.ts"), "").unwrap();
+        fs::write(root.join("secrets.ts"), "").unwrap();
+        fs::write(root.join("app.min.js"), "").unwrap();
+        for dir in ["node_modules/pkg", "dist", "src/build"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            fs::write(root.join(dir).join("x.ts"), "").unwrap();
+        }
+
+        let mut opts = options();
+        opts.exclude_patterns = codekurve_core::config::Config::default().ignore.patterns;
+        let found: Vec<String> = discover(root, &opts)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.relative_path)
+            .collect();
+
+        assert_eq!(found, vec!["a.ts".to_string()]);
+    }
+
+    #[test]
+    fn custom_exclude_pattern_is_respected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("generated")).unwrap();
+        fs::write(root.join("generated").join("api.ts"), "").unwrap();
+        fs::write(root.join("a.ts"), "").unwrap();
+        fs::write(root.join("a.spec.ts"), "").unwrap();
+
+        let mut opts = options();
+        opts.exclude_patterns = vec!["generated/**".to_string(), "*.spec.ts".to_string()];
+        let found = discover(root, &opts).unwrap();
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].relative_path, "a.ts");
+    }
+
+    #[test]
+    fn negated_exclude_pattern_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut opts = options();
+        opts.exclude_patterns = vec!["!keep.ts".to_string()];
+        let err = discover(tmp.path(), &opts).unwrap_err();
+
+        assert!(matches!(
+            err,
+            codekurve_core::Error::InvalidIgnorePattern { .. }
         ));
     }
 
