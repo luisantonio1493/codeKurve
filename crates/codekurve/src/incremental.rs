@@ -76,12 +76,12 @@ pub fn detect(
     opts: &DiscoveryOptions,
     filter: Option<&HashSet<String>>,
     force_full: bool,
-) -> Result<Vec<FileChange>, String> {
-    let discovered = discovery::discover(root, opts).map_err(|e| e.to_string())?;
+) -> Result<Vec<FileChange>, DetectError> {
+    let discovered = discovery::discover(root, opts).map_err(DetectError::Discovery)?;
     let stored = if force_full {
         HashMap::new()
     } else {
-        repo::file_snapshot(conn, project_id).map_err(|e| e.to_string())?
+        repo::file_snapshot(conn, project_id).map_err(|e| DetectError::Other(e.to_string()))?
     };
 
     let mut changes = Vec::new();
@@ -104,7 +104,7 @@ pub fn detect(
             continue;
         };
         let size = meta.len();
-        let mtime = mtime_ns(&meta)?;
+        let mtime = mtime_ns(&meta).map_err(DetectError::Other)?;
         if size == prior.size_bytes && Some(mtime) == prior.modified_ns {
             continue; // fast path: unchanged
         }
@@ -131,6 +131,40 @@ pub fn detect(
     }
 
     Ok(changes)
+}
+
+/// Why [`detect`] failed.
+#[derive(Debug)]
+pub enum DetectError {
+    /// Discovery rejected the project as configured: more files than
+    /// `index.max_total_files`, or an invalid `[ignore] patterns` entry.
+    /// Retrying cannot help until the project or its config changes, so the
+    /// watcher stops on it instead of failing again on every batch.
+    Discovery(codekurve_core::Error),
+    /// Anything else (reading stored state, stat-ing a file): may be
+    /// transient.
+    Other(String),
+}
+
+impl std::fmt::Display for DetectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DetectError::Discovery(e) => e.fmt(f),
+            DetectError::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<DetectError> for String {
+    fn from(e: DetectError) -> Self {
+        e.to_string()
+    }
+}
+
+impl From<DetectError> for commands::CommandError {
+    fn from(e: DetectError) -> Self {
+        e.to_string().into()
+    }
 }
 
 /// Task 7.6: `relative_path` matches `filter` if it's an exact entry, or a

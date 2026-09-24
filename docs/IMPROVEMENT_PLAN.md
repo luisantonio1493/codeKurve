@@ -123,7 +123,10 @@ Archivo: `crates/codekurve-mcp/src/tools.rs`, `server.rs`, `lib.rs`.
 
 ## P2 — Arquitectura y mantenibilidad
 
-- **Modelo de errores inconsistente:** core/store usan `thiserror`; el crate `codekurve` usa
+- ◐ *(Parcial: `incremental::DetectError` elimina el `contains("max_total_files")` del watcher,
+  con test de la clasificación. El resto de firmas `String` se deja: migrarlas en bloque es un
+  refactor grande sin fallo concreto detrás; mejor tiparlas cuando se toque cada módulo.)*
+  **Modelo de errores inconsistente:** core/store usan `thiserror`; el crate `codekurve` usa
   `Result<_, String>` (~50 firmas en `commands.rs`, `install.rs`, `incremental.rs`, `watch.rs`,
   `update.rs`) y se detectan errores por texto: `watch.rs:124` `e.contains("max_total_files")`.
   Introducir un `enum AppError` con `thiserror` en `crates/codekurve/src/` y migrar

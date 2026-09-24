@@ -102,12 +102,15 @@ fn reconcile(setup: &mut IndexSetup) -> Result<(), String> {
 /// One debounced batch: `detect` restricted to the flushed paths, then
 /// `apply_batch`. Most errors are logged, not fatal — the watcher keeps
 /// running so the next batch (or `pending_files` staying nonzero) can
-/// recover. `max_total_files` is the one exception (Phase 6, design risk
+/// recover. A discovery error ([`incremental::DetectError::Discovery`],
+/// e.g. `max_total_files` exceeded) is the exception (Phase 6, design risk
 /// #4): a project that has genuinely grown past the configured cap will
 /// hit the exact same error on every future batch too, so silently
 /// logging-and-continuing forever would leave the index falling further
 /// behind with no clear signal — this stops the watcher instead, matching
-/// startup [`reconcile`]'s fatal behavior for the same condition.
+/// startup [`reconcile`]'s fatal behavior for the same condition. Matched by
+/// type: the old `e.contains("max_total_files")` broke silently if the
+/// message was ever reworded.
 fn apply_flush(setup: &mut IndexSetup, paths: &HashSet<PathBuf>) -> Result<(), String> {
     let filter = relative_paths(&setup.root, paths);
     if filter.is_empty() {
@@ -122,7 +125,7 @@ fn apply_flush(setup: &mut IndexSetup, paths: &HashSet<PathBuf>) -> Result<(), S
         false,
     ) {
         Ok(changes) => changes,
-        Err(e) if e.contains("max_total_files") => return Err(e),
+        Err(e @ incremental::DetectError::Discovery(_)) => return Err(e.into()),
         Err(e) => {
             eprintln!("error: {e}");
             return Ok(());
@@ -355,5 +358,43 @@ mod tests {
             1,
             "loop must stop after the first fatal flush, not keep retrying"
         );
+    }
+
+    /// The classification itself, on a real project: a batch that pushes
+    /// the project past `max_total_files` mid-watch is fatal (the watcher
+    /// stops), while an ordinary change is applied and keeps it running.
+    #[test]
+    fn apply_flush_stops_only_on_discovery_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        codekurve_core::project::init(root).unwrap();
+        let config_path = root.join(".codekurve").join("config.toml");
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        let config: String = config
+            .lines()
+            .map(|line| {
+                if line.starts_with("max_total_files") {
+                    "max_total_files = 2".to_string()
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&config_path, config).unwrap();
+        std::fs::write(root.join("a.ts"), "export function a() {}\n").unwrap();
+        std::fs::write(root.join("b.ts"), "export function b() {}\n").unwrap();
+
+        let mut setup = commands::setup_index(root).unwrap();
+        reconcile(&mut setup).unwrap();
+
+        std::fs::write(root.join("a.ts"), "export function a2() {}\n").unwrap();
+        let changed = HashSet::from([setup.root.join("a.ts")]);
+        apply_flush(&mut setup, &changed).expect("an ordinary change keeps the watcher running");
+
+        std::fs::write(root.join("c.ts"), "export function c() {}\n").unwrap();
+        let grown = HashSet::from([setup.root.join("c.ts")]);
+        let err = apply_flush(&mut setup, &grown).expect_err("growing past the cap must stop it");
+        assert!(err.contains("max_total_files (2)"), "{err}");
     }
 }
