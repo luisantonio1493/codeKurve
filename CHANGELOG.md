@@ -15,6 +15,17 @@ All notable changes to this project are documented here. Format follows
   pattern starting with `!` is rejected with a clear error instead of being
   silently ignored.
 
+### Security
+
+- `install.sh` and `install.ps1` (and so `codekurve update`) now verify the
+  downloaded binary against the release's `SHA256SUMS` and refuse to install
+  on a mismatch or a missing entry. Before this they installed whatever the
+  download returned.
+- Release workflow signs SLSA build provenance for every released file
+  (`gh attestation verify`).
+- Every GitHub Action in CI and Release is pinned to a commit SHA, and
+  workflow tokens are read-only except the release `publish` job.
+
 ### Added
 
 - Initialize Rust workspace (5 crates)

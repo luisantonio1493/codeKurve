@@ -114,10 +114,20 @@ supersede either. ADR 0005 keeps its Status; both it and
     fetches nothing else;
   - nothing automatic ever reaches this code path.
 
-  Not implemented, and therefore not claimed: signature verification, checksum
-  verification of the fetched script, binary notarization, or pinning.
-  `install.sh` downloads release binaries over HTTPS without verifying the
-  published `SHA256SUMS`; closing that gap is a separate change to the script.
+  - *(added 2026-09-24)* both install scripts verify the downloaded binary
+    against the release's `SHA256SUMS` and refuse to install on a mismatch,
+    a missing entry, or (POSIX) no hashing tool;
+  - *(added 2026-09-24)* the release workflow signs SLSA build provenance
+    for every file in `SHA256SUMS` (`gh attestation verify`), for releases
+    cut after v0.2.11.
+
+  Not implemented, and therefore not claimed: verification of the fetched
+  *script* itself (it still comes unverified from `main`), binary signing or
+  notarization, or pinning `update` to a script version. The binary checksum
+  catches corrupted or swapped downloads; it does not stop an attacker who
+  controls the release, because `SHA256SUMS` sits beside the binary it
+  vouches for. The installer does not check attestations (that needs `gh`);
+  that remains a manual step.
 - Dependency review keeps flagging any network-capable crate as an ADR-0005
   violation. This ADR grants no exemption for one.
 - Reviewers must keep the subprocess confined to `update.rs`. A second spawn

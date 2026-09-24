@@ -65,5 +65,21 @@ No auto-update. Dependency and license audit runs in CI via `cargo-deny`
 and `cargo-about` (`.github/workflows/ci.yml`, `deny.toml`, `about.toml`).
 Tagged releases build a CycloneDX SBOM, a NOTICE report, and a `SHA256SUMS`
 checksum file covering every platform binary
-(`.github/workflows/release.yml`); artifacts stay inside CI workflow storage
-— no public publish step, no binary signing or notarization, in this phase.
+(`.github/workflows/release.yml`), and publish them as a public GitHub
+Release (`gh release create`, `publish` job).
+
+- **Checksum verification**: `install.sh` and `install.ps1` (and therefore
+  `codekurve update`) download `SHA256SUMS` from the same release and refuse
+  to install a binary whose SHA-256 does not match. This detects corrupted,
+  truncated, or swapped downloads. It does **not** detect a compromised
+  release, since whoever can replace the binary can replace `SHA256SUMS` too.
+- **Build provenance**: releases after v0.2.11 carry a signed SLSA provenance
+  attestation for every file in `SHA256SUMS`, tying it to this repository's
+  release workflow and tag. Verify manually with
+  `gh attestation verify <file> --repo luisantonio1493/codeKurve`; the
+  installers do not check it.
+- **CI supply chain**: every third-party GitHub Action is pinned to a commit
+  SHA; workflow tokens are read-only except the `publish` job, which gets
+  `contents`/`id-token`/`attestations` write.
+- Not in place: binary code signing or notarization, verification of the
+  install script itself (it is fetched from `main`).

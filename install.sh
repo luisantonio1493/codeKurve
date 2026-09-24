@@ -63,13 +63,51 @@ fi
 # Release tags are vX.Y.Z; accept a bare X.Y.Z in CODEKURVE_VERSION too.
 case "$version" in v*) ;; *) version="v$version" ;; esac
 
-# 3. Download the raw binary directly to its final destination.
-url="https://github.com/$REPO/releases/download/$version/$asset"
+# SHA-256 of a file, lowercase hex. Linux ships `sha256sum`, macOS ships
+# `shasum`; `openssl` is the last resort. No tool -> refuse to install rather
+# than skip the check.
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 -r "$1" | awk '{print $1}'
+  else
+    echo "codekurve: need sha256sum, shasum or openssl to verify the download." >&2
+    return 1
+  fi
+}
+
+# 3. Download the raw binary next to its final destination, verify it against
+# the release's SHA256SUMS, and only then move it into place. A mismatch or a
+# missing checksum aborts: nothing is installed. This catches a corrupted or
+# truncated download or a swapped CDN response. It does NOT protect against
+# someone who can edit the GitHub release itself (they could replace
+# SHA256SUMS too); for provenance see docs/SECURITY_MODEL.md.
+base="https://github.com/$REPO/releases/download/$version"
+url="$base/$asset"
 echo "Installing codekurve $version ($asset)..."
 mkdir -p "$BIN_DIR"
 tmp="$(mktemp "$BIN_DIR/.codekurve.XXXXXX")"
 trap 'rm -f "$tmp"' EXIT
 curl -fsSL "$url" -o "$tmp" || { echo "codekurve: download failed: $url" >&2; exit 1; }
+
+sums="$(curl -fsSL "$base/SHA256SUMS")" \
+  || { echo "codekurve: could not download $base/SHA256SUMS; refusing to install unverified binary." >&2; exit 1; }
+# `sha256sum` lines are "<hash>  <name>" (or "<hash> *<name>" in binary mode).
+expected="$(printf '%s\n' "$sums" | awk -v a="$asset" '$2 == a || $2 == "*" a { print tolower($1); exit }')"
+[ -n "$expected" ] \
+  || { echo "codekurve: SHA256SUMS for $version has no entry for $asset; refusing to install." >&2; exit 1; }
+actual="$(sha256_of "$tmp")" || exit 1
+if [ "$actual" != "$expected" ]; then
+  echo "codekurve: checksum mismatch for $asset ($version); refusing to install." >&2
+  echo "  expected $expected" >&2
+  echo "  actual   $actual" >&2
+  exit 1
+fi
+echo "Verified   SHA-256 $actual"
+
 chmod +x "$tmp"
 mv "$tmp" "$DEST"
 trap - EXIT

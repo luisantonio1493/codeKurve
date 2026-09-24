@@ -49,17 +49,47 @@ if (-not $version) {
 if (-not $version) { throw "codekurve: could not resolve latest version; set CODEKURVE_VERSION." }
 if ($version -notmatch '^v') { $version = "v$version" }
 
-# 3. Download the raw binary directly to its final destination.
-$url = "https://github.com/$repo/releases/download/$version/$asset"
+# 3. Download the raw binary next to its final destination, verify it against
+# the release's SHA256SUMS, and only then move it into place. A mismatch or a
+# missing checksum aborts: nothing is installed. This catches a corrupted or
+# truncated download or a swapped CDN response. It does NOT protect against
+# someone who can edit the GitHub release itself (they could replace
+# SHA256SUMS too); for provenance see docs/SECURITY_MODEL.md.
+$base = "https://github.com/$repo/releases/download/$version"
+$url = "$base/$asset"
 Write-Host "Installing codekurve $version ($asset)..."
 New-Item -ItemType Directory -Force -Path $binDir | Out-Null
 $tmp = Join-Path $binDir ("codekurve.tmp." + [guid]::NewGuid().ToString())
+$sumsTmp = "$tmp.SHA256SUMS"
 try {
-  Invoke-WebRequest -Uri $url -OutFile $tmp
+  Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $tmp
 } catch {
   Remove-Item -Force -ErrorAction SilentlyContinue $tmp
   throw "codekurve: download failed: $url`n$_"
 }
+try {
+  # To a file, not `.Content`: GitHub serves release assets as
+  # application/octet-stream, which Windows PowerShell 5.1 returns as bytes.
+  Invoke-WebRequest -UseBasicParsing -Uri "$base/SHA256SUMS" -OutFile $sumsTmp
+  $expected = $null
+  foreach ($line in (Get-Content -LiteralPath $sumsTmp)) {
+    # "<hash>  <name>" (or "<hash> *<name>" in binary mode).
+    $parts = $line.Trim() -split '\s+', 2
+    if ($parts.Count -eq 2 -and $parts[1].TrimStart('*') -eq $asset) { $expected = $parts[0]; break }
+  }
+  if (-not $expected) { throw "SHA256SUMS for $version has no entry for $asset" }
+  $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $tmp).Hash.ToLowerInvariant()
+  # PowerShell's -ne is case-insensitive, so upper/lower hex compare equal.
+  if ($actual -ne $expected) {
+    throw "checksum mismatch for $asset ($version): expected $expected, actual $actual"
+  }
+} catch {
+  Remove-Item -Force -ErrorAction SilentlyContinue $tmp
+  throw "codekurve: $_; refusing to install."
+} finally {
+  Remove-Item -Force -ErrorAction SilentlyContinue $sumsTmp
+}
+Write-Host "Verified   SHA-256 $actual"
 try {
   Move-Item -Force $tmp $dest
 } catch {

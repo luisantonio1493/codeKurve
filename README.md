@@ -63,6 +63,10 @@ This installs the `codekurve` binary to `%USERPROFILE%\.cargo\bin`, which
 command to upgrade.
 
 Both scripts install the latest release binary and add it to your PATH.
+Before installing, they verify the binary against the release's
+`SHA256SUMS` and refuse to install on a mismatch. Releases after v0.2.11 also
+carry signed build provenance you can check with
+`gh attestation verify <file> --repo luisantonio1493/codeKurve`.
 Re-run the same command to upgrade.
 
 Or, once installed, upgrade from the CLI:

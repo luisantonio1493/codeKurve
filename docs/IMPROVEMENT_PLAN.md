@@ -45,7 +45,7 @@ Cambio:
 7. Subir `ANALYZER_VERSION`/config hash si hace falta para forzar reindex en índices existentes
    (revisar `repo::config_hash` — si el hash del config ya cubre esto, no hace falta nada).
 
-## P1 — Seguridad de la cadena de distribución
+## P1 — Seguridad de la cadena de distribución — ✅ HECHO (salvo lo indicado)
 
 **1a. El instalador no verifica checksums.** `release.yml` publica `SHA256SUMS`, pero
 `install.sh:72` e `install.ps1:58` descargan el binario y lo ejecutan sin verificarlo.
@@ -56,7 +56,17 @@ es decir, ejecuta el script de la rama `main` (mutable) y no uno fijado a la ver
 - Valorar (opcional, más trabajo): attestations de GitHub (`actions/attest-build-provenance`)
   para que el usuario pueda verificar con `gh attestation verify`.
 
-**1b. Actions sin fijar por SHA.** Solo `cargo-deny-action` está fijado. `actions/checkout@v4`,
+  **Estado:** verificación de checksum hecha en ambos scripts (probada contra el release v0.2.11
+  real: caso correcto, checksum que no coincide, entrada ausente, sin herramienta de hash y los
+  fallbacks `shasum`/`openssl`; `install.ps1` ejecutado con pwsh 7.4). Attestations añadidas al job
+  `publish` (sin probar hasta el próximo tag). **No se cambia** que `update` use el script de
+  `main`: fijarlo a la versión instalada impediría que los arreglos del instalador lleguen a los
+  usuarios, y un tag no es más inmutable que `main` para quien controle el repo. La protección
+  real contra un release comprometido son las attestations, no esto.
+
+**1b. Actions sin fijar por SHA.** *(Hecho: fijadas a la última versión de su misma mayor, v4; el
+comentario del pin de `cargo-deny-action` decía `v2.1.1` pero el SHA es el de la etiqueta
+flotante `v2`: corregido el comentario, no el SHA.)* Solo `cargo-deny-action` está fijado. `actions/checkout@v4`,
 `dtolnay/rust-toolchain@stable`, `upload/download-artifact@v4` en `ci.yml` y `release.yml`
 (que tiene permiso `contents: write`) → fijar a SHA con comentario de versión.
 En `ci.yml` declarar `permissions: contents: read` explícito.
@@ -129,7 +139,7 @@ Archivo: `crates/codekurve-mcp/src/tools.rs`, `server.rs`, `lib.rs`.
 ## Orden de ejecución propuesto
 
 1. ~~P0 `ignore.patterns`~~ — hecho (`discovery.rs` + `tests/ignore_patterns.rs`).
-2. P1 checksums del instalador + fijar Actions + corregir SECURITY_MODEL.md (1 PR).
+2. ~~P1 checksums del instalador + fijar Actions + corregir SECURITY_MODEL.md~~ — hecho.
 3. P1 MCP `spawn_blocking` + helper de lock (1 PR).
 4. Benchmark de latencia de queries → decidir P2 adjacency perezosa.
 5. P2 snippet con hash, `AppError`, docs de arquitectura.

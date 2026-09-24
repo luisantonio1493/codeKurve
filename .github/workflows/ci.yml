@@ -9,6 +9,11 @@ on:
     branches: ["**"]
   pull_request:
 
+# Read-only token: nothing in CI writes to the repository. Artifact upload
+# uses its own runtime token and needs no `contents` scope.
+permissions:
+  contents: read
+
 jobs:
   checks:
     strategy:
@@ -17,10 +22,11 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: cargo fmt
@@ -53,14 +59,16 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: cargo-deny (advisories, licenses, bans, sources)
-        uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2.1.1
+        uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # floating `v2` tag at pin time (not the v2.1.1 commit)
         with:
           command: check advisories licenses bans sources
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: stable
 
       - name: install cargo-about
         run: cargo install cargo-about --locked --features cli
@@ -68,7 +76,7 @@ jobs:
       - name: generate third-party NOTICE report
         run: cargo about generate about.hbs > NOTICE-3rdparty.md
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: license-report
           path: NOTICE-3rdparty.md
