@@ -1,6 +1,9 @@
-//! Bounded graph traversal over `relationships` edges: `load_adjacency`
-//! builds an in-memory `HashMap` from one SQL query, then `bfs` is a
-//! hand-rolled breadth-first search — no petgraph (design §50.1). `trace`
+//! Bounded graph traversal over `relationships` edges: `bfs` is a
+//! hand-rolled breadth-first search — no petgraph (design §50.1) — that asks
+//! a [`Neighbors`] source for each visited node's edges. Production uses
+//! [`LazyAdjacency`] (one indexed lookup per visited node, so cost follows
+//! the caps, not the project size); [`load_adjacency`] builds the same graph
+//! eagerly and is kept as the reference the lazy source is tested against. `trace`
 //! (a target is given) finds the shortest path within a depth/node/edge/time
 //! budget; `impact` (no target) explores everything reachable within the
 //! same budget. Every cap that fires sets `truncated` + a reason — nothing
@@ -27,6 +30,65 @@ pub struct Edge {
     pub provenance: String,
 }
 
+/// Where [`bfs`] gets a node's outgoing edges (incoming, for a reverse walk).
+/// Edges must come back in `relationships` row order: that order decides
+/// which of several equal-length paths BFS reports.
+pub trait Neighbors {
+    fn neighbors(&mut self, node: &str) -> Result<Vec<Edge>>;
+}
+
+impl Neighbors for &HashMap<String, Vec<Edge>> {
+    fn neighbors(&mut self, node: &str) -> Result<Vec<Edge>> {
+        Ok(self.get(node).cloned().unwrap_or_default())
+    }
+}
+
+/// Fetches edges on demand, one prepared-statement lookup per visited node.
+/// A bounded BFS visits at most `max_nodes` nodes, so this costs the same on
+/// a 100-file project as on a 100k-file one, where [`load_adjacency`] reads
+/// every relationship in the project first (~50 ms per call on 10k files).
+///
+/// No `project_id` filter: symbol ids hash their file id, which hashes the
+/// project id, so an id never matches another project's rows. Leaving it out
+/// also leaves `(source_symbol_id, kind)`/`(target_symbol_id, kind)` as the
+/// only usable index, even on a database without planner statistics.
+pub struct LazyAdjacency<'conn> {
+    stmt: rusqlite::Statement<'conn>,
+}
+
+impl<'conn> LazyAdjacency<'conn> {
+    /// `reverse = false` walks source -> target (`trace`); `true` walks
+    /// target -> source (`impact`). Same edge set as [`load_adjacency`].
+    pub fn new(conn: &'conn Connection, reverse: bool) -> Result<Self> {
+        let sql = if reverse {
+            "SELECT source_symbol_id, kind, confidence, provenance
+             FROM relationships WHERE target_symbol_id = ?1 ORDER BY rowid"
+        } else {
+            "SELECT target_symbol_id, kind, confidence, provenance
+             FROM relationships
+             WHERE source_symbol_id = ?1 AND target_symbol_id IS NOT NULL
+             ORDER BY rowid"
+        };
+        Ok(Self {
+            stmt: conn.prepare(sql)?,
+        })
+    }
+}
+
+impl Neighbors for LazyAdjacency<'_> {
+    fn neighbors(&mut self, node: &str) -> Result<Vec<Edge>> {
+        let rows = self.stmt.query_map(params![node], |row| {
+            Ok(Edge {
+                neighbor_symbol_id: row.get(0)?,
+                kind: row.get(1)?,
+                confidence: row.get(2)?,
+                provenance: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+}
+
 /// Load every in-project relationship edge as an adjacency list. Edges with
 /// no `target_symbol_id` (external/unresolved targets) are dead ends — not
 /// traversable — and excluded. `reverse = false` keys by source (walk
@@ -40,7 +102,8 @@ pub fn load_adjacency(
     let mut stmt = conn.prepare(
         "SELECT source_symbol_id, target_symbol_id, kind, confidence, provenance
          FROM relationships
-         WHERE project_id = ?1 AND target_symbol_id IS NOT NULL",
+         WHERE project_id = ?1 AND target_symbol_id IS NOT NULL
+         ORDER BY rowid",
     )?;
     let rows = stmt.query_map(params![project_id], |row| {
         Ok((
@@ -112,19 +175,19 @@ pub struct BfsOutcome {
     pub truncated_reason: Option<TruncationReason>,
 }
 
-/// Bounded BFS over `adjacency` (as built by `load_adjacency`). `target`
+/// Bounded BFS over `adjacency` (see [`Neighbors`]). `target`
 /// requests a shortest path (`trace`, returns early once found); `None`
 /// explores everything reachable up to the caps (`impact`).
 /// `allowed_kinds`/`min_confidence`, when given, filter which edges may be
 /// followed at all (§26.4/§27.2).
 pub fn bfs(
-    adjacency: &HashMap<String, Vec<Edge>>,
+    mut adjacency: impl Neighbors,
     start: &str,
     target: Option<&str>,
     caps: &BfsCaps,
     allowed_kinds: Option<&[RelationshipKind]>,
     min_confidence: Option<Confidence>,
-) -> BfsOutcome {
+) -> Result<BfsOutcome> {
     let started_at = Instant::now();
     let mut visited: HashSet<String> = HashSet::new();
     let mut queue: VecDeque<String> = VecDeque::new();
@@ -146,26 +209,24 @@ pub fn bfs(
     });
 
     if target == Some(start) {
-        return BfsOutcome {
+        return Ok(BfsOutcome {
             reached,
             path: Some(Vec::new()),
             truncated: false,
             truncated_reason: None,
-        };
+        });
     }
 
     'bfs: while let Some(node) = queue.pop_front() {
         let depth = depths[&node];
+        let edges = adjacency.neighbors(&node)?;
         if depth >= caps.max_depth {
-            if adjacency.get(&node).is_some_and(|e| !e.is_empty()) {
+            if !edges.is_empty() {
                 depth_capped = true;
             }
             continue;
         }
-        let Some(edges) = adjacency.get(&node) else {
-            continue;
-        };
-        for edge in edges {
+        for edge in &edges {
             if started_at.elapsed() > caps.max_duration {
                 truncated_reason = Some(TruncationReason::MaxDuration);
                 break 'bfs;
@@ -210,12 +271,12 @@ pub fn bfs(
 
             if Some(edge.neighbor_symbol_id.as_str()) == target {
                 let path = reconstruct_path(&predecessor, start, &edge.neighbor_symbol_id);
-                return BfsOutcome {
+                return Ok(BfsOutcome {
                     reached,
                     path: Some(path),
                     truncated: false,
                     truncated_reason: None,
-                };
+                });
             }
 
             queue.push_back(edge.neighbor_symbol_id.clone());
@@ -226,12 +287,12 @@ pub fn bfs(
         truncated_reason = Some(TruncationReason::MaxDepth);
     }
 
-    BfsOutcome {
+    Ok(BfsOutcome {
         reached,
         path: None,
         truncated: truncated_reason.is_some(),
         truncated_reason,
-    }
+    })
 }
 
 /// Walk `predecessor` back from `target` to `start`, collecting edges in
@@ -292,7 +353,7 @@ mod tests {
             vec![edge("b", RelationshipKind::Calls, Confidence::Exact)],
         );
 
-        let outcome = bfs(&adjacency, "a", Some("b"), &caps(5), None, None);
+        let outcome = bfs(&adjacency, "a", Some("b"), &caps(5), None, None).unwrap();
         let path = outcome.path.expect("path should be found within depth 5");
         assert_eq!(path.len(), 2);
         assert!(!outcome.truncated);
@@ -312,7 +373,7 @@ mod tests {
             );
         }
 
-        let outcome = bfs(&adjacency, "a", Some("b"), &caps(3), None, None);
+        let outcome = bfs(&adjacency, "a", Some("b"), &caps(3), None, None).unwrap();
         assert!(outcome.path.is_none());
         assert!(outcome.truncated);
         assert_eq!(outcome.truncated_reason, Some(TruncationReason::MaxDepth));
@@ -339,7 +400,7 @@ mod tests {
             max_edges: 100,
             max_duration: Duration::from_secs(5),
         };
-        let outcome = bfs(&adjacency, "root", None, &tight_caps, None, None);
+        let outcome = bfs(&adjacency, "root", None, &tight_caps, None, None).unwrap();
         assert!(outcome.truncated);
         assert_eq!(outcome.truncated_reason, Some(TruncationReason::MaxNodes));
         assert!(!outcome.reached.is_empty());
@@ -363,7 +424,8 @@ mod tests {
             &caps(5),
             None,
             Some(Confidence::High),
-        );
+        )
+        .unwrap();
         assert!(outcome.path.is_none());
         // No cap fired — the target is just unreachable under the filter,
         // not truncated.
@@ -442,5 +504,103 @@ mod tests {
 
         let reverse = load_adjacency(&conn, &project, true).unwrap();
         assert_eq!(reverse[&b_id][0].neighbor_symbol_id, a_id);
+    }
+
+    /// `LazyAdjacency` must be a drop-in for `load_adjacency`: identical
+    /// `BfsOutcome`s (reached order, paths, truncation) in both directions,
+    /// across generous and tight caps, kind-mixed nodes, confidence filters
+    /// and dangling external targets.
+    #[test]
+    fn lazy_adjacency_matches_eager_adjacency() {
+        const N: usize = 60;
+        let mut conn = db::open_in_memory().unwrap();
+        let project = repo::upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        let files = vec![repo::FileInput {
+            relative_path: "src/graph.ts".to_string(),
+            language: "typescript".to_string(),
+            content_hash: "test-hash".to_string(),
+            modified_ns: 0,
+            size_bytes: 10,
+            symbols: (0..N)
+                .map(|n| symbol(&format!("s{n}"), SymbolKind::Function))
+                .collect(),
+        }];
+        repo::reindex(&mut conn, &project, &files, &[], &[]).unwrap();
+        let ids: Vec<String> = (0..N)
+            .map(|n| {
+                conn.query_row(
+                    "SELECT id FROM symbols WHERE name = ?1",
+                    params![format!("s{n}")],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            })
+            .collect();
+        let file_id: String = conn
+            .query_row("SELECT id FROM files LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+
+        let kinds = [
+            RelationshipKind::Calls,
+            RelationshipKind::References,
+            RelationshipKind::Implements,
+        ];
+        let confidences = [Confidence::Exact, Confidence::High, Confidence::Low];
+        let mut relationships = Vec::new();
+        for n in 0..N {
+            for (step, salt) in [(7, 3), (13, 5), (29, 11)] {
+                let pick = (n * step + salt) % 3;
+                relationships.push(repo::RelationshipInput {
+                    source_symbol_id: ids[n].clone(),
+                    // Every 9th edge points outside the project: not walkable.
+                    target_symbol_id: (n % 9 != 0).then(|| ids[(n * step + salt) % N].clone()),
+                    target_external: (n % 9 == 0).then(|| "External".to_string()),
+                    kind: kinds[pick],
+                    provenance: codekurve_core::Provenance::Extracted,
+                    confidence: confidences[(pick + n) % 3],
+                    source_file_id: file_id.clone(),
+                    start_line: Some(n as u32),
+                    start_column: Some(step as u32),
+                    reason: None,
+                });
+            }
+        }
+        repo::reindex(&mut conn, &project, &files, &relationships, &[]).unwrap();
+
+        let cap_sets = [
+            caps(10),
+            caps(2),
+            BfsCaps {
+                max_depth: 10,
+                max_nodes: 5,
+                max_edges: 1000,
+                max_duration: Duration::from_secs(5),
+            },
+            BfsCaps {
+                max_depth: 10,
+                max_nodes: 1000,
+                max_edges: 7,
+                max_duration: Duration::from_secs(5),
+            },
+        ];
+        let mut compared = 0;
+        for reverse in [false, true] {
+            let eager = load_adjacency(&conn, &project, reverse).unwrap();
+            for start in [0, 1, 17, 42] {
+                for target in [None, Some(ids[(start + 31) % N].as_str())] {
+                    for cap in &cap_sets {
+                        for min in [None, Some(Confidence::High)] {
+                            let expected =
+                                bfs(&eager, &ids[start], target, cap, None, min).unwrap();
+                            let lazy = LazyAdjacency::new(&conn, reverse).unwrap();
+                            let actual = bfs(lazy, &ids[start], target, cap, None, min).unwrap();
+                            assert_eq!(actual, expected, "reverse={reverse} start={start}");
+                            compared += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(compared, 2 * 4 * 2 * 4 * 2);
     }
 }

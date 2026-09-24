@@ -125,6 +125,9 @@ pub fn index(root: &Path) -> Result<(), String> {
             repo::set_analyzer_version(&setup.conn, &setup.project_id, ANALYZER_VERSION)
                 .map_err(|e| e.to_string())?;
         }
+        // Also reached by an index built before planner statistics existed:
+        // a no-change `index` run is enough to give it statistics.
+        crate::incremental::refresh_planner_stats(&setup.conn);
         println!("index up to date, no changes detected");
         return Ok(());
     }

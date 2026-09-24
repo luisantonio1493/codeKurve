@@ -24,6 +24,20 @@ All notable changes to this project are documented here. Format follows
   any other message, pings and cancellations included. They now run on
   tokio's blocking pool. Tool calls are still serialized on the one session.
 
+- Query latency no longer grows with project size: on a 10,000-file
+  project MCP `search_symbols`/`find_callers` went from ~50-60 ms to under
+  1 ms, `trace_path`/`analyze_impact` from ~100 ms to ~1 ms. Index writes now
+  keep SQLite planner statistics current (none were ever collected, so
+  lookups scanned whole tables); the stale warning on every tool call reads
+  one row instead of counting four tables; and `trace`/`impact`/`export`
+  fetch edges per visited node instead of loading the whole graph. Existing
+  indexes pick up statistics on the next `codekurve index`, changes or not.
+  Measured with the new `scripts/bench_queries.py`; see
+  `docs/PERFORMANCE.md`.
+- Traversal visits a node's edges in stored row order. Before, the order
+  depended on the SQLite query plan, so among equal-length paths the one
+  `trace` reported could differ between databases.
+
 ### Security
 
 - `install.sh` and `install.ps1` (and so `codekurve update`) now verify the

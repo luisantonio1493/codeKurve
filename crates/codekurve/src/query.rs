@@ -122,10 +122,9 @@ impl Session {
 /// this the same way `Session::warnings` does internally, instead of a
 /// second copy of the pending-files check.
 pub(crate) fn pending_warning(conn: &Connection, project_id: &str) -> Vec<String> {
-    match repo::index_status(conn, project_id) {
-        Ok(status) if status.pending_files > 0 => vec![format!(
-            "index is stale ({} pending file(s)); run `codekurve index`",
-            status.pending_files
+    match repo::pending_files(conn, project_id) {
+        Ok(pending) if pending > 0 => vec![format!(
+            "index is stale ({pending} pending file(s)); run `codekurve index`"
         )],
         _ => Vec::new(),
     }
@@ -205,17 +204,11 @@ pub fn trace(
     let target = commands::resolve_symbol(conn, project_id, None, Some(to))?;
     let min_confidence = commands::parse_confidence(args.min_confidence)?;
 
-    let adjacency = traverse::load_adjacency(conn, project_id, false)
-        .map_err(|e| CommandError::from(e.to_string()))?;
+    let adjacency =
+        traverse::LazyAdjacency::new(conn, false).map_err(|e| CommandError::from(e.to_string()))?;
     let caps = commands::bfs_caps(args.depth);
-    Ok(traverse::bfs(
-        &adjacency,
-        &from,
-        Some(&target),
-        &caps,
-        None,
-        min_confidence,
-    ))
+    traverse::bfs(adjacency, &from, Some(&target), &caps, None, min_confidence)
+        .map_err(|e| CommandError::from(e.to_string()))
 }
 
 /// Extracted from `commands::impact`: bounded reverse BFS (§26.5) —
@@ -226,17 +219,11 @@ pub fn impact(s: &Session, args: &QueryArgs) -> Result<traverse::BfsOutcome, Com
     let symbol_id = commands::resolve_symbol(conn, project_id, args.symbol_id, args.symbol_name)?;
     let min_confidence = commands::parse_confidence(args.min_confidence)?;
 
-    let adjacency = traverse::load_adjacency(conn, project_id, true)
-        .map_err(|e| CommandError::from(e.to_string()))?;
+    let adjacency =
+        traverse::LazyAdjacency::new(conn, true).map_err(|e| CommandError::from(e.to_string()))?;
     let caps = commands::bfs_caps(args.depth);
-    Ok(traverse::bfs(
-        &adjacency,
-        &symbol_id,
-        None,
-        &caps,
-        None,
-        min_confidence,
-    ))
+    traverse::bfs(adjacency, &symbol_id, None, &caps, None, min_confidence)
+        .map_err(|e| CommandError::from(e.to_string()))
 }
 
 /// One §28.3 row (path, line range, confidence, provenance) for a

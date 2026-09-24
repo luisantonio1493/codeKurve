@@ -13,8 +13,8 @@ use codekurve_analysis::extract;
 use codekurve_analysis::ir::{EdgeTarget, FileAnalysis};
 use codekurve_analysis::resolve::{self, TsconfigAliases};
 use codekurve_core::LanguageId;
-use codekurve_store::repo;
 use codekurve_store::Connection;
+use codekurve_store::{db, repo};
 
 use crate::commands::{self, FileMeta};
 
@@ -155,7 +155,27 @@ fn filter_matches(filter: &HashSet<String>, relative_path: &str) -> bool {
 /// back to the existing full [`repo::reindex`]; otherwise parses+resolves
 /// `B ∪ D` with zero DB writes, then applies everything in one T2
 /// transaction.
+///
+/// Every successful call, even an empty batch, then refreshes the query
+/// planner's statistics ([`db::refresh_planner_stats`]).
 pub fn apply_batch(
+    conn: &mut Connection,
+    ctx: &IndexContext,
+    changes: &[FileChange],
+) -> Result<BatchOutcome, String> {
+    let outcome = apply_changes(conn, ctx, changes)?;
+    refresh_planner_stats(conn);
+    Ok(outcome)
+}
+
+/// [`db::refresh_planner_stats`], best effort: statistics only steer query
+/// plans, so a failure here must not turn an index write that already
+/// committed into a reported error.
+pub(crate) fn refresh_planner_stats(conn: &Connection) {
+    let _ = db::refresh_planner_stats(conn);
+}
+
+fn apply_changes(
     conn: &mut Connection,
     ctx: &IndexContext,
     changes: &[FileChange],
@@ -431,7 +451,6 @@ fn mtime_ns(meta: &fs::Metadata) -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codekurve_store::db;
     use codekurve_store::repo::{upsert_project, FileInput};
     use std::fs as std_fs;
     use std::time::SystemTime;

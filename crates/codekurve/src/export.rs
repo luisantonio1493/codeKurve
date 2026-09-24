@@ -120,16 +120,12 @@ fn build(session: &Session, args: &QueryArgs) -> Result<Graph, CommandError> {
 
     let mut outcomes = Vec::new();
     for reverse in [false, true] {
-        let adjacency = traverse::load_adjacency(conn, project_id, reverse)
+        let adjacency = traverse::LazyAdjacency::new(conn, reverse)
             .map_err(|e| CommandError::from(e.to_string()))?;
-        outcomes.push(traverse::bfs(
-            &adjacency,
-            &focus,
-            None,
-            &caps,
-            None,
-            min_confidence,
-        ));
+        outcomes.push(
+            traverse::bfs(adjacency, &focus, None, &caps, None, min_confidence)
+                .map_err(|e| CommandError::from(e.to_string()))?,
+        );
     }
     merge(session, &focus, &outcomes[0], &outcomes[1])
 }

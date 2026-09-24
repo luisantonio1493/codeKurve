@@ -95,7 +95,7 @@ Archivo: `crates/codekurve-mcp/src/tools.rs`, `server.rs`, `lib.rs`.
   reabrir la `Session` desde disco. Tests: `server::tests` (ambos fallan con la versión
   anterior). Las llamadas siguen serializadas sobre la única conexión SQLite; es intencionado.
 
-## P2 — Eficiencia de consultas
+## P2 — Eficiencia de consultas — ✅ HECHO (lo de `load_adjacency`; ver abajo)
 
 - **`load_adjacency` carga el grafo entero en cada `trace`/`impact`**
   (`crates/codekurve-store/src/traverse.rs:35`): lee todas las relaciones del proyecto y aloca
@@ -106,6 +106,12 @@ Archivo: `crates/codekurve-mcp/src/tools.rs`, `server.rs`, `lib.rs`.
   existen índices en `relationships(project_id, source_symbol_id)` y `(project_id,
   target_symbol_id)` en `migrations.rs` (crear migración si falta).
   **Primero medir** (añadir tier de latencia a `scripts/bench.py`) y solo cambiar si se nota.
+
+  **Resultado de medir (`scripts/bench_queries.py`):** `load_adjacency` no era lo peor. En el tier
+  large *todas* las tools tardaban 44-107 ms y crecían con el proyecto: (1) la base nunca tenía
+  estadísticas (`ANALYZE`), así que SQLite elegía índices malos (`search` recorría 53k símbolos);
+  (2) cada tool calculaba 4 `COUNT(*)` para leer `pending_files`; (3) `load_adjacency`. Arreglados
+  los tres: todas < ~1 ms p95 e independientes del tamaño. Detalle en `docs/PERFORMANCE.md`.
 - **Parsing secuencial.** No hay paralelismo (`rayon`/threads) en `incremental.rs`/`commands.rs`.
   Dado que ya se cumplen los presupuestos, es **mejora opcional**, no prioridad: paralelizar
   solo `extract::analyze` con `rayon` y mantener un único escritor SQLite (ADR 0008).
@@ -148,7 +154,7 @@ Archivo: `crates/codekurve-mcp/src/tools.rs`, `server.rs`, `lib.rs`.
 1. ~~P0 `ignore.patterns`~~ — hecho (`discovery.rs` + `tests/ignore_patterns.rs`).
 2. ~~P1 checksums del instalador + fijar Actions + corregir SECURITY_MODEL.md~~ — hecho.
 3. ~~P1 MCP `spawn_blocking` + helper de lock~~ — hecho.
-4. Benchmark de latencia de queries → decidir P2 adjacency perezosa.
+4. ~~Benchmark de latencia de queries → decidir P2 adjacency perezosa~~ — hecho.
 5. P2 snippet con hash, `AppError`, docs de arquitectura.
 6. Resto (split de `repo.rs`, tracing, rayon, CI cache) oportunistamente.
 
