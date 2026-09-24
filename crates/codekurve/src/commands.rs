@@ -624,7 +624,10 @@ pub fn symbol(root: &Path, name: &str) -> Result<(), String> {
             hit.span.end_line,
             hit.span.end_column
         );
-        println!("  --- snippet {} ---", snippet(&root, hit));
+        println!(
+            "  --- snippet {} ---",
+            snippet(&conn, &project_id, &root, hit)
+        );
     }
     Ok(())
 }
@@ -1173,14 +1176,18 @@ fn discovery_options(config: &Config) -> DiscoveryOptions {
     }
 }
 
-fn snippet(root: &Path, symbol: &StoredSymbol) -> String {
+fn snippet(conn: &Connection, project_id: &str, root: &Path, symbol: &StoredSymbol) -> String {
     let path = root.join(&symbol.relative_path);
     let Ok(bytes) = fs::read(&path) else {
         return "(unavailable: file not found) ---".to_string();
     };
-    // ponytail: bounds check is the Phase 1 staleness signal; hash-based
-    // staleness (§25) arrives with file hashing in Phase 3.
-    if symbol.span.end_byte > bytes.len() {
+    // The bounds check alone missed an edit that kept the file long enough:
+    // the stored byte span then sliced unrelated text and called it live.
+    let changed = repo::indexed_content_hash(conn, project_id, &symbol.relative_path)
+        .ok()
+        .flatten()
+        .is_some_and(|hash| hash != repo::content_hash(&bytes));
+    if changed || symbol.span.end_byte > bytes.len() {
         return "(stale: file changed since index; run `codekurve index`) ---".to_string();
     }
     match std::str::from_utf8(&bytes[symbol.span.start_byte..symbol.span.end_byte]) {

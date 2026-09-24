@@ -486,11 +486,18 @@ pub struct SourceSlice {
 /// freshness metadata shows pending files (`Session::warnings()` non-empty
 /// for an `Indexed` session) — folded into `stale` even when the read itself
 /// succeeds, per confirmed decision 4.
+///
+/// `indexed_hash` is the file's content hash at index time
+/// ([`indexed_file_hash`]). If the file on disk no longer matches it, the
+/// stored span describes older content: slicing it would hand back the
+/// wrong lines as if they were current, so no source is returned
+/// (`file_changed`). `None` skips the check.
 pub fn source_slice(
     path: &Path,
     span: &SourceSpan,
     ctx_lines: u32,
     index_pending: bool,
+    indexed_hash: Option<&str>,
 ) -> SourceSlice {
     let Ok(bytes) = std::fs::read(path) else {
         return SourceSlice {
@@ -499,6 +506,13 @@ pub fn source_slice(
             reason: Some("file_missing"),
         };
     };
+    if indexed_hash.is_some_and(|hash| hash != repo::content_hash(&bytes)) {
+        return SourceSlice {
+            source: None,
+            stale: true,
+            reason: Some("file_changed"),
+        };
+    }
     if span.end_byte > bytes.len() {
         return SourceSlice {
             source: None,
@@ -526,6 +540,16 @@ pub fn source_slice(
         stale: index_pending,
         reason: None,
     }
+}
+
+/// The stored content hash of an indexed file, for [`source_slice`]'s drift
+/// check. `None` when the session is not indexed or the lookup fails, which
+/// just skips that check.
+pub fn indexed_file_hash(s: &Session, relative_path: &str) -> Option<String> {
+    let (conn, project_id) = s.indexed().ok()?;
+    repo::indexed_content_hash(conn, project_id, relative_path)
+        .ok()
+        .flatten()
 }
 
 /// `codekurve status`'s data, plus the degraded (`NotIndexed`) shape a

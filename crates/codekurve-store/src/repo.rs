@@ -1413,6 +1413,26 @@ pub fn dependents_by_unresolved_target(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// The `content_hash` a file had when it was last indexed; `None` if the
+/// file is not indexed or no hash was stored. Readers of live source compare
+/// it with [`content_hash`] of the current bytes: a mismatch means the stored
+/// spans no longer describe the file, even though the file may still be
+/// long enough to slice.
+pub fn indexed_content_hash(
+    conn: &Connection,
+    project_id: &str,
+    relative_path: &str,
+) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT content_hash FROM files WHERE project_id = ?1 AND relative_path = ?2",
+            params![project_id, relative_path],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
 /// Stable BLAKE3 content hash of the config text.
 pub fn config_hash(config_text: &str) -> String {
     blake3::hash(config_text.as_bytes()).to_hex().to_string()

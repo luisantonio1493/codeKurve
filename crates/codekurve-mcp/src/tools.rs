@@ -287,7 +287,14 @@ impl CodeKurve {
                 // here means index_pending > 0, the exact bit source_slice
                 // needs, without a second `repo::index_status` round-trip.
                 let index_pending = !warnings.is_empty();
-                let slice = query::source_slice(&path, &sym.span, ctx_lines, index_pending);
+                let indexed_hash = query::indexed_file_hash(session, &sym.relative_path);
+                let slice = query::source_slice(
+                    &path,
+                    &sym.span,
+                    ctx_lines,
+                    index_pending,
+                    indexed_hash.as_deref(),
+                );
                 (slice.source, slice.stale, slice.reason)
             } else {
                 (None, false, None)

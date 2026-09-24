@@ -593,6 +593,52 @@ fn stale_warning_reflects_pending_files() {
     session.finish();
 }
 
+/// A file edited after indexing, without a reindex (no watcher running),
+/// still slices in range, so the old bounds check served the wrong lines as
+/// live with `stale: false`. The content-hash check flags it and returns no
+/// source rather than misleading text.
+#[test]
+fn get_symbol_flags_file_changed_since_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    seed_project(root);
+
+    let mut session = McpSession::start(root);
+    let result = session.call(
+        "codekurve_search_symbols",
+        serde_json::json!({"query": "getEligibility"}),
+    );
+    let symbol_id = envelope_of(&result)["result"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Shift every line down: the indexed span is still inside the file, but
+    // now points at the wrong text.
+    std::fs::write(
+        root.join("src").join("a.ts"),
+        format!("// a new header line\n// and another\n{A_TS}"),
+    )
+    .unwrap();
+
+    let result = session.call("codekurve_get_symbol", serde_json::json!({"id": symbol_id}));
+    let envelope = envelope_of(&result);
+    assert_eq!(envelope["result"]["stale"], true);
+    assert_eq!(envelope["result"]["stale_reason"], "file_changed");
+    assert!(envelope["result"]["source"].is_null());
+
+    // Restoring the indexed content makes it live again.
+    std::fs::write(root.join("src").join("a.ts"), A_TS).unwrap();
+    let result = session.call("codekurve_get_symbol", serde_json::json!({"id": symbol_id}));
+    let envelope = envelope_of(&result);
+    assert_eq!(envelope["result"]["stale"], false);
+    assert!(envelope["result"]["source"]
+        .as_str()
+        .unwrap()
+        .contains("getEligibility"));
+    session.finish();
+}
+
 /// Task 6.5: `NotIndexed` session (config present, no `codekurve index` run
 /// yet) — query tools answer degraded (never a hard MCP protocol error) with
 /// a warning, and never trigger an index run themselves.

@@ -115,7 +115,8 @@ Archivo: `crates/codekurve-mcp/src/tools.rs`, `server.rs`, `lib.rs`.
 - **Parsing secuencial.** No hay paralelismo (`rayon`/threads) en `incremental.rs`/`commands.rs`.
   Dado que ya se cumplen los presupuestos, es **mejora opcional**, no prioridad: paralelizar
   solo `extract::analyze` con `rayon` y mantener un único escritor SQLite (ADR 0008).
-- **Snippet posiblemente obsoleto marcado como "(live)"** (`commands.rs:1171 snippet()`):
+- ✅ *(Hecho: también afectaba a MCP `get_symbol`, que devolvía líneas desplazadas con
+  `stale: false` pese a que la spec lo prohíbe.)* **Snippet posiblemente obsoleto marcado como "(live)"** (`commands.rs:1171 snippet()`):
   solo se comprueba que el span quepa en el archivo; si cambió pero sigue siendo largo, se
   devuelve texto incorrecto como "live". Comparar `content_hash` del archivo con el almacenado
   (ya existe `repo::content_hash`) antes de servirlo.

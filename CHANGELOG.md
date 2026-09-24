@@ -24,6 +24,14 @@ All notable changes to this project are documented here. Format follows
   any other message, pings and cancellations included. They now run on
   tokio's blocking pool. Tool calls are still serialized on the one session.
 
+- MCP `get_symbol` and CLI `symbol` served stale source as current when a
+  file was edited after indexing but stayed long enough to slice (the only
+  check was the span's byte bounds): `get_symbol` returned shifted lines with
+  `stale: false`, `symbol` printed them as `(live)`. Both now compare the
+  file's content hash with the one stored at index time; a mismatch returns
+  no source with `stale_reason: "file_changed"` (`(stale: …)` in the CLI).
+  The MCP spec already required this ("get_symbol Reads Live Source and
+  Flags Drift").
 - Query latency no longer grows with project size: on a 10,000-file
   project MCP `search_symbols`/`find_callers` went from ~50-60 ms to under
   1 ms, `trace_path`/`analyze_impact` from ~100 ms to ~1 ms. Index writes now
