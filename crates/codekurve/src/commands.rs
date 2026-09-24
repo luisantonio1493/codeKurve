@@ -636,24 +636,10 @@ pub fn symbol(root: &Path, name: &str) -> Result<(), String> {
 pub fn doctor(root: &Path) -> Result<(), String> {
     let mut ok = true;
 
-    let probe = db::open_in_memory().map_err(|e| e.to_string())?;
-    let fts5 = db::has_fts5(&probe);
-    report("sqlite", true, "available (bundled)");
-    report("fts5", fts5, if fts5 { "available" } else { "MISSING" });
-    ok &= fts5;
-
-    let version =
-        codekurve_store::migrations::current_version(&probe).map_err(|e| e.to_string())?;
-    let schema_ok = version == codekurve_store::migrations::SCHEMA_VERSION;
-    report(
-        "schema",
-        schema_ok,
-        &format!(
-            "version {version} (expected {})",
-            codekurve_store::migrations::SCHEMA_VERSION
-        ),
-    );
-    ok &= schema_ok;
+    for check in query::engine_checks() {
+        report(check.name, check.ok, &check.detail);
+        ok &= check.ok;
+    }
 
     match root.canonicalize() {
         Ok(root) => {

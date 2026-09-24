@@ -128,14 +128,14 @@ Archivo: `crates/codekurve-mcp/src/tools.rs`, `server.rs`, `lib.rs`.
   `update.rs`) y se detectan errores por texto: `watch.rs:124` `e.contains("max_total_files")`.
   Introducir un `enum AppError` con `thiserror` en `crates/codekurve/src/` y migrar
   incrementalmente, empezando por `incremental`/`watch` (quitar el `contains`).
-- **Lógica duplicada:** `query::doctor` y `commands::doctor` tienen implementaciones separadas
+- ✅ *(Hecho: sonda común `query::engine_checks`.)* **Lógica duplicada:** `query::doctor` y `commands::doctor` tienen implementaciones separadas
   (`query.rs:649` lo documenta). Extraer las comprobaciones comunes.
 - **`repo.rs` (2.9k líneas, ~1.5k de código):** dividir en submódulos `store/repo/{write,
   relationships, search, lookup}.rs` sin cambiar la API pública. Solo mecánico; hacerlo cuando
   se toque ese archivo, no como tarea aislada.
 - **`commands.rs` mezcla lógica y salida por consola** (`println!`). Mover formateo a la capa
   bin/CLI a medida que se refactorice; no urgente.
-- **Docs obsoletas:** `docs/ARCHITECTURE.md` sigue diciendo "Phase 0 reality: crates vacíos",
+- ✅ *(Hecho.)* **Docs obsoletas:** `docs/ARCHITECTURE.md` sigue diciendo "Phase 0 reality: crates vacíos",
   "clap no introducido", y el grafo de dependencias no coincide (mcp y tui dependen del crate
   `codekurve`, no de core/store). Reescribir esa sección.
 - **Observabilidad:** no hay `tracing`; el watcher usa `println!/eprintln!`. Añadir `tracing` +

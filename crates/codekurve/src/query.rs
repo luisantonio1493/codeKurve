@@ -654,64 +654,14 @@ pub struct DoctorReport {
     pub ok: bool,
 }
 
-/// New data function backing the future `codekurve_doctor` MCP tool (PR4+):
-/// same sqlite/fts5/schema probe `commands::doctor` runs, plus the session's
-/// own resolved root/config/index state (never re-reads the config file —
-/// `Session::open` already did). `commands::doctor` keeps its own
-/// independent implementation unchanged (it must keep reporting partial
-/// results even when `root` itself fails to canonicalize, which a
-/// `Session`-gated version — fatal on bad root — could never do).
+/// Backs the `codekurve_doctor` MCP tool: the shared [`engine_checks`] probe
+/// plus the session's own resolved root/config/index state (never re-reads
+/// the config file — `Session::open` already did). `commands::doctor` keeps
+/// its own root/config half (it must keep reporting partial results even
+/// when `root` itself fails to canonicalize, which a `Session`-gated
+/// version — fatal on bad root — could never do).
 pub fn doctor(s: &Session) -> DoctorReport {
-    let mut checks = Vec::new();
-    let mut ok = true;
-
-    match db::open_in_memory() {
-        Ok(probe) => {
-            checks.push(DoctorCheck {
-                name: "sqlite",
-                ok: true,
-                detail: "available (bundled)".to_string(),
-            });
-            let fts5 = db::has_fts5(&probe);
-            checks.push(DoctorCheck {
-                name: "fts5",
-                ok: fts5,
-                detail: if fts5 { "available" } else { "MISSING" }.to_string(),
-            });
-            ok &= fts5;
-
-            match migrations::current_version(&probe) {
-                Ok(version) => {
-                    let schema_ok = version == migrations::SCHEMA_VERSION;
-                    checks.push(DoctorCheck {
-                        name: "schema",
-                        ok: schema_ok,
-                        detail: format!(
-                            "version {version} (expected {})",
-                            migrations::SCHEMA_VERSION
-                        ),
-                    });
-                    ok &= schema_ok;
-                }
-                Err(e) => {
-                    checks.push(DoctorCheck {
-                        name: "schema",
-                        ok: false,
-                        detail: e.to_string(),
-                    });
-                    ok = false;
-                }
-            }
-        }
-        Err(e) => {
-            checks.push(DoctorCheck {
-                name: "sqlite",
-                ok: false,
-                detail: e.to_string(),
-            });
-            ok = false;
-        }
-    }
+    let mut checks = engine_checks();
 
     checks.push(DoctorCheck {
         name: "project root",
@@ -730,10 +680,56 @@ pub fn doctor(s: &Session) -> DoctorReport {
             ok: false,
             detail: reason.clone(),
         });
-        ok = false;
     }
 
+    let ok = checks.iter().all(|c| c.ok);
     DoctorReport { checks, ok }
+}
+
+/// The engine probe both `doctor`s run (this one and `commands::doctor`):
+/// SQLite, FTS5 and the migrated schema version, checked on a fresh
+/// in-memory database. A failing probe is reported as a failed check, never
+/// returned as an error, so the rest of the report still prints.
+pub(crate) fn engine_checks() -> Vec<DoctorCheck> {
+    let probe = match db::open_in_memory() {
+        Ok(probe) => probe,
+        Err(e) => {
+            return vec![DoctorCheck {
+                name: "sqlite",
+                ok: false,
+                detail: e.to_string(),
+            }]
+        }
+    };
+    let fts5 = db::has_fts5(&probe);
+    let schema = match migrations::current_version(&probe) {
+        Ok(version) => DoctorCheck {
+            name: "schema",
+            ok: version == migrations::SCHEMA_VERSION,
+            detail: format!(
+                "version {version} (expected {})",
+                migrations::SCHEMA_VERSION
+            ),
+        },
+        Err(e) => DoctorCheck {
+            name: "schema",
+            ok: false,
+            detail: e.to_string(),
+        },
+    };
+    vec![
+        DoctorCheck {
+            name: "sqlite",
+            ok: true,
+            detail: "available (bundled)".to_string(),
+        },
+        DoctorCheck {
+            name: "fts5",
+            ok: fts5,
+            detail: if fts5 { "available" } else { "MISSING" }.to_string(),
+        },
+        schema,
+    ]
 }
 
 /// Backing function for `codekurve_reindex` (design "reindex Gated Off by

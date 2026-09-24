@@ -2,51 +2,83 @@
 
 ## Components and data flow
 
-CLI and the MCP `stdio` server sit on top of shared application services
-(project lifecycle, indexing, queries, diagnostics), which in turn drive
-discovery/analysis, the query engine, and the SQLite store (plan §10).
-
-## Crate boundaries and dependency direction (§11.2)
+The CLI, the MCP `stdio` server and the TUI sit on top of one application
+crate (`codekurve`) that owns project lifecycle, indexing, queries and
+diagnostics. It drives discovery/analysis (`codekurve-analysis`) and the
+SQLite store (`codekurve-store`) (plan §10).
 
 ```text
-codekurve (bin) ──> core, analysis, store, mcp   (composition root)
-codekurve-mcp ─────> core, store
-codekurve-analysis ─> core
-codekurve-store ───> core
-codekurve-core ────> (nothing internal)
+discover (ignore rules, [ignore] patterns, size/count caps)
+  -> extract (tree-sitter, per file) -> resolve (cross-file, confidence)
+  -> store (one SQLite transaction per batch) -> refresh planner statistics
+query: CLI / MCP / TUI -> codekurve::query -> store (indexed lookups, lazy BFS)
 ```
 
-`codekurve-core` is the dependency sink: domain types only (`Project`,
-`Symbol`, `Relationship`, `Confidence`, `Provenance`, ...), never depends on
-CLI, SQLite, or MCP. `codekurve` (the bin) holds no parsing logic or complex
-SQL. Full crate responsibilities: plan §11.2.
+## Crate graph (as built)
 
-**Phase 0 reality**: all crates are empty skeletons and currently declare no
-internal dependencies (avoids unused-dependency clippy noise). The graph
-above is the documented target, enforced as each crate gains real code.
+```text
+codekurve-bin ──> codekurve, codekurve-mcp, codekurve-tui, codekurve-core
+codekurve-mcp ──> codekurve                  (+ rmcp, tokio)
+codekurve-tui ──> codekurve, codekurve-core  (+ ratatui, crossterm)
+codekurve ──────> codekurve-analysis, codekurve-store, codekurve-core
+codekurve-analysis ─> codekurve-core         (+ tree-sitter, ignore)
+codekurve-store ────> codekurve-core         (+ rusqlite bundled, blake3)
+codekurve-core ─────> (nothing internal)
+```
 
-## Concurrency (target shape, not yet implemented)
+- `codekurve-core` is the dependency sink: domain types only (`Symbol`,
+  `Relationship`, `Confidence`, `Provenance`, config, errors). It never
+  depends on SQLite, MCP or the CLI.
+- `codekurve` (the application crate) is the only crate the front ends call.
+  `codekurve-mcp` and `codekurve-tui` go through `codekurve::query`, never
+  through the store directly, so all three front ends share one query layer.
+- `codekurve-bin` holds only argument parsing and dispatch. Arguments are
+  parsed by hand (`crates/codekurve-bin/src/cli.rs`); `clap` has not been
+  needed yet.
+- `tokio` is confined to `codekurve-mcp`; every other crate is synchronous.
 
-Main runtime handles CLI/MCP lifecycle, cancellation, and watcher
-coordination; a worker pool handles hashing and parsing; SQLite writes are
-serialized through a single writer. Full model: plan §49.
+## Concurrency
+
+- **Indexing** runs on the calling thread: discovery, parsing and resolution
+  are sequential, then one transaction writes the batch. This is fast enough
+  for the budgets in `docs/PERFORMANCE.md` (10k files in ~3.4 s), so parsing
+  has not been parallelized.
+- **Single writer** (ADR 0008): SQLite in WAL mode; each batch is one
+  transaction. The watcher applies batches one at a time on its own thread.
+- **MCP server**: a current-thread tokio runtime reads JSON-RPC over stdio.
+  Tool bodies are synchronous SQLite work, so each runs on tokio's blocking
+  pool (`CodeKurve::blocking`) to keep the runtime thread free for other
+  messages, pings and cancellations. Calls are serialized on one `Session`
+  (one connection) behind a mutex; a panicking tool returns an error and the
+  session is reopened from disk.
+
+## Query performance
+
+- Index writes refresh SQLite planner statistics
+  (`codekurve_store::db::refresh_planner_stats`). Without them SQLite treats
+  `project_id` as selective, which it is not (one project per database), and
+  picks full-project scans.
+- `trace`, `impact` and `export` walk the graph with a bounded BFS that
+  fetches each visited node's edges on demand (`traverse::LazyAdjacency`), so
+  their cost follows the BFS caps, not the project size.
+- Measured with `scripts/bench_queries.py`; results in
+  `docs/PERFORMANCE.md`.
+
+## Errors
+
+`codekurve-core` and `codekurve-store` use typed `thiserror` enums. The
+application crate still passes most errors as `String` (and `CommandError`
+with an exit code at the command boundary); moving it to a typed error is a
+tracked follow-up in `docs/IMPROVEMENT_PLAN.md`.
 
 ## No-network policy
 
-The application must not depend on an HTTP client or any network I/O.
-Adding a network-capable crate requires an ADR (plan §29.4).
+The application does not depend on an HTTP client or any network I/O.
+Adding a network-capable crate requires an ADR (plan §29.4). The one scoped
+exception is `codekurve update` / `uninstall --binary`, which spawn the
+install script (ADR 0012, `docs/SECURITY_MODEL.md`).
 
-## Deferred decisions (Phase 0)
+## Not yet introduced
 
-- **Tracing infrastructure**: not introduced yet. `codekurve version`
-  currently uses plain `println!` to stdout, no `tracing` subscriber. The
-  observability plan (plan §30) calls for `tracing`; it enters once a
-  command has real work to instrument, not for a single hardcoded print.
-- **Full `CK_*` error model**: not introduced yet. Phase 0 has no fallible
-  path (`version` cannot fail), so only a naming *convention* is assumed
-  for future error codes; the concrete model lands with the first
-  fallible command (plan §31).
-- **`clap`**: not introduced yet. A single `version` subcommand does not
-  justify a parser; args are hand-matched via `std::env::args()`. `clap`
-  enters at plan §46 slice 13 once real subcommands (`init`, `index`)
-  exist.
+- **`tracing`**: output is plain `println!`/`eprintln!`; the MCP crate is
+  compiler-restricted to stderr so stdout stays pure JSON-RPC.
