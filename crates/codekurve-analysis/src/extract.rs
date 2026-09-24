@@ -32,7 +32,53 @@ pub fn analyze(source: &str, language: LanguageId, relative_path: &str) -> Resul
     if !analysis.skipped_too_deep() {
         crate::frameworks::recognize(source, language, &mut analysis);
     }
+    disambiguate_duplicate_keys(&mut analysis);
     Ok(analysis)
+}
+
+/// First ordinal handed to a duplicate by [`disambiguate_duplicate_keys`];
+/// far above any C# `partial` fragment ordinal, so the two never meet.
+const DUPLICATE_ORDINAL_BASE: u32 = 1 << 20;
+
+/// Makes every symbol's storage key unique within its file. The key hashes
+/// (kind, qualified name, signature, `partial_ordinal`), and ordinary code
+/// produces exact duplicates of that tuple: TypeScript interfaces of one
+/// name in different `namespace`s or merged declarations, same-named classes
+/// in two test callbacks, C# explicit interface implementations
+/// (`Descriptor` and `IMessage.Descriptor` in generated gRPC code), a
+/// generic and non-generic interface of one name. A single duplicate hit the
+/// `UNIQUE(project_id, symbol_key)` constraint and failed the whole index:
+/// v0.2.11 could not index `dotnet/eShop`, `zod` or `effect`.
+///
+/// The first occurrence keeps its key (existing indexes keep their ids);
+/// each later one gets the next free ordinal from
+/// [`DUPLICATE_ORDINAL_BASE`], in source order. This only keeps the index
+/// writable: the qualified names stay ambiguous until the analyzers qualify
+/// them (namespace, generic arity, explicit interface).
+fn disambiguate_duplicate_keys(analysis: &mut FileAnalysis) {
+    let mut seen = std::collections::HashSet::new();
+    let mut next = DUPLICATE_ORDINAL_BASE;
+    for symbol in &mut analysis.symbols {
+        let key = |ordinal: Option<u32>| {
+            (
+                symbol.kind,
+                symbol.qualified_name.clone(),
+                symbol.signature_fingerprint.clone(),
+                ordinal,
+            )
+        };
+        if seen.insert(key(symbol.partial_ordinal)) {
+            continue;
+        }
+        loop {
+            let candidate = Some(next);
+            next += 1;
+            if seen.insert(key(candidate)) {
+                symbol.partial_ordinal = candidate;
+                break;
+            }
+        }
+    }
 }
 
 /// Stack reserved for [`on_analysis_stack`]. A reservation, not an

@@ -7,6 +7,16 @@ All notable changes to this project are documented here. Format follows
 
 ### Fixed
 
+- `codekurve index` failed on ordinary real projects with `UNIQUE constraint
+  failed: symbols.project_id, symbols.symbol_key` and indexed nothing:
+  v0.2.11 could not index `dotnet/eShop`, `zod` or `effect`. Common constructs
+  give two symbols in one file the same key: TypeScript interfaces of one name
+  in different `namespace`s or merged declarations, same-named classes in two
+  callbacks, C# explicit interface implementations (generated gRPC code), a
+  generic and non-generic interface of one name. Later duplicates now get a
+  distinct key; the first keeps its old one, so existing symbol ids do not
+  change. Their qualified names are still identical (namespace, generic arity
+  and explicit interface are not yet part of them).
 - Apply `[ignore] patterns` during discovery. The patterns were parsed from
   `.codekurve/config.toml` but never used, so the default exclusions
   (`node_modules`, `dist`, `build`, `*.min.js`, `.env`, `secrets.*`, keys)

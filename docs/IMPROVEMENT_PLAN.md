@@ -180,3 +180,18 @@ abortaba `codekurve index`, y 5k niveles mataban el servidor MCP en `codekurve_r
 análisis en un hilo con pila de 256 MiB reservada por lote, más un límite de 10k niveles (el
 archivo se indexa vacío con un aviso). `SECURITY_MODEL.md` corregido: prometía timeouts,
 presupuestos de memoria y logs con redacción que no existían.
+
+## Hallazgo de la prueba con proyectos reales — ✅ HECHO (robustez) / pendiente (precisión)
+
+Indexar `dotnet/eShop`, `zod` y `effect` fallaba entero con `UNIQUE constraint failed:
+symbols.symbol_key`, también en la v0.2.11 publicada: construcciones habituales dan la misma
+clave a dos símbolos de un archivo (interfaces homónimas en distintos `namespace` TS, fusión de
+declaraciones, implementación explícita de interfaz C#, interfaz genérica y no genérica con el
+mismo nombre). Arreglo: `extract::disambiguate_duplicate_keys` da un ordinal a la 2ª y siguientes
+apariciones.
+
+**Pendiente (precisión):** los nombres cualificados siguen siendo iguales para esos símbolos, así que
+`search`/`callers` los muestran como ambiguos. Incluir namespace TS, aridad genérica e interfaz
+explícita en el `qualified_name` cambia ids y nombres para los usuarios: conviene hacerlo en un
+release propio.
+
