@@ -8,7 +8,6 @@ mod server;
 mod tools;
 
 use std::path::Path;
-use std::sync::Mutex;
 
 use codekurve::query::Session;
 use rmcp::ServiceExt;
@@ -38,10 +37,7 @@ pub fn run(root: &Path) -> Result<(), String> {
         .build()
         .map_err(|e| e.to_string())?
         .block_on(async {
-            let handler = CodeKurve {
-                session: Mutex::new(session),
-                allow_reindex,
-            };
+            let handler = CodeKurve::new(session, allow_reindex);
             let service = handler
                 .serve(rmcp::transport::stdio())
                 .await

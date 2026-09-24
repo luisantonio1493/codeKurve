@@ -74,7 +74,7 @@ En `ci.yml` declarar `permissions: contents: read` explícito.
 **1c. Documentación desalineada con la realidad.** `docs/SECURITY_MODEL.md` dice "no public
 publish step", pero `release.yml:145` hace `gh release create`. Corregir junto con 1a.
 
-## P1 — Robustez del servidor MCP
+## P1 — Robustez del servidor MCP — ✅ HECHO
 
 Archivo: `crates/codekurve-mcp/src/tools.rs`, `server.rs`, `lib.rs`.
 - **Trabajo bloqueante en runtime `current_thread`.** Todas las tools son `fn` síncronas que
@@ -85,8 +85,15 @@ Archivo: `crates/codekurve-mcp/src/tools.rs`, `server.rs`, `lib.rs`.
 - **Mutex envenenado = servidor muerto.** `self.session.lock().unwrap()` en cada tool: si una
   tool entra en pánico, todas las llamadas siguientes también. Sustituir por un helper
   `lock_session()` que devuelva `McpError::internal_error` (o `into_inner()` tras el pánico).
-- `ProtocolVersion::V_2024_11_05` fijado: comprobar si rmcp 2.2 negocia versiones más nuevas;
-  si sí, anunciar la más reciente soportada.
+- ~~`ProtocolVersion::V_2024_11_05` fijado~~ — **descartado tras comprobarlo:** rmcp 2.2
+  (`negotiate_protocol_version`) devuelve la versión que pide el cliente si la conoce (hasta
+  `2025-11-25`); el valor del servidor solo es el fallback para versiones desconocidas.
+
+  **Estado:** helper `CodeKurve::blocking` (`server.rs`) usado por las 14 tools. Además del
+  bloqueo, resultó que un pánico dejaba al cliente **sin respuesta** (rmcp hace `tokio::spawn`
+  de cada petición y la tarea moría en silencio), no solo el mutex envenenado. Recuperación:
+  reabrir la `Session` desde disco. Tests: `server::tests` (ambos fallan con la versión
+  anterior). Las llamadas siguen serializadas sobre la única conexión SQLite; es intencionado.
 
 ## P2 — Eficiencia de consultas
 
@@ -140,7 +147,7 @@ Archivo: `crates/codekurve-mcp/src/tools.rs`, `server.rs`, `lib.rs`.
 
 1. ~~P0 `ignore.patterns`~~ — hecho (`discovery.rs` + `tests/ignore_patterns.rs`).
 2. ~~P1 checksums del instalador + fijar Actions + corregir SECURITY_MODEL.md~~ — hecho.
-3. P1 MCP `spawn_blocking` + helper de lock (1 PR).
+3. ~~P1 MCP `spawn_blocking` + helper de lock~~ — hecho.
 4. Benchmark de latencia de queries → decidir P2 adjacency perezosa.
 5. P2 snippet con hash, `AppError`, docs de arquitectura.
 6. Resto (split de `repo.rs`, tracing, rayon, CI cache) oportunistamente.

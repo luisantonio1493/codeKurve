@@ -15,6 +15,15 @@ All notable changes to this project are documented here. Format follows
   pattern starting with `!` is rejected with a clear error instead of being
   silently ignored.
 
+- MCP server: a tool that panicked never answered (the client waited
+  forever), and it poisoned the session lock, so every later tool call
+  panicked and never answered either. A panic now returns an `internal_error`
+  response, and the next call reopens the session from disk.
+- MCP server: tool bodies (SQLite queries, graph traversal, `reindex`) ran on
+  the server's only runtime thread, so a slow call stopped it from reading
+  any other message, pings and cancellations included. They now run on
+  tokio's blocking pool. Tool calls are still serialized on the one session.
+
 ### Security
 
 - `install.sh` and `install.ps1` (and so `codekurve update`) now verify the
