@@ -805,7 +805,7 @@ pub fn trace(args: &QueryArgs, to: &str) -> Result<(), CommandError> {
     } else {
         let (conn, project_id) = s.indexed()?;
         let target = resolve_symbol(conn, project_id, None, Some(to))?;
-        print_trace_result(conn, &outcome, &target);
+        print_trace_result(conn, project_id, &outcome, &target);
     }
     Ok(())
 }
@@ -833,8 +833,8 @@ pub fn impact(args: &QueryArgs) -> Result<(), CommandError> {
             outcome.truncated,
         );
     } else {
-        let (conn, _project_id) = s.indexed()?;
-        print_impact_result(conn, &outcome);
+        let (conn, project_id) = s.indexed()?;
+        print_impact_result(conn, project_id, &outcome);
     }
     Ok(())
 }
@@ -1083,8 +1083,8 @@ fn truncation_reason_str(r: traverse::TruncationReason) -> &'static str {
 /// A reached/traversed node's display label: `qualified_name path:line`,
 /// falling back to the bare id if the symbol row is somehow gone (e.g. a
 /// stale index) rather than failing the whole command over one lookup miss.
-fn describe_symbol(conn: &Connection, symbol_id: &str) -> String {
-    match repo::find_symbol_by_id(conn, symbol_id) {
+fn describe_symbol(conn: &Connection, project_id: &str, symbol_id: &str) -> String {
+    match repo::find_symbol_by_id(conn, project_id, symbol_id) {
         Ok(Some(sym)) => format!(
             "{} ({}:{})",
             sym.qualified_name, sym.relative_path, sym.span.start_line
@@ -1093,14 +1093,19 @@ fn describe_symbol(conn: &Connection, symbol_id: &str) -> String {
     }
 }
 
-fn print_trace_result(conn: &Connection, outcome: &traverse::BfsOutcome, target: &str) {
+fn print_trace_result(
+    conn: &Connection,
+    project_id: &str,
+    outcome: &traverse::BfsOutcome,
+    target: &str,
+) {
     match &outcome.path {
         Some(path) => {
             println!("path to {target} found ({} hop(s)):", path.len());
             for edge in path {
                 println!(
                     "  -> {} [{}, {}]",
-                    describe_symbol(conn, &edge.neighbor_symbol_id),
+                    describe_symbol(conn, project_id, &edge.neighbor_symbol_id),
                     edge.kind,
                     edge.confidence
                 );
@@ -1111,12 +1116,12 @@ fn print_trace_result(conn: &Connection, outcome: &traverse::BfsOutcome, target:
     print_truncation(outcome);
 }
 
-fn print_impact_result(conn: &Connection, outcome: &traverse::BfsOutcome) {
+fn print_impact_result(conn: &Connection, project_id: &str, outcome: &traverse::BfsOutcome) {
     println!("{} node(s) reached", outcome.reached.len());
     for r in &outcome.reached {
         println!(
             "  {} (depth {})",
-            describe_symbol(conn, &r.symbol_id),
+            describe_symbol(conn, project_id, &r.symbol_id),
             r.depth
         );
     }

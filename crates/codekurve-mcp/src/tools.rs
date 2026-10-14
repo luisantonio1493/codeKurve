@@ -143,7 +143,7 @@ impl CodeKurve {
         &self,
         Parameters(ProjectStatusInput {}): Parameters<ProjectStatusInput>,
     ) -> Result<CallToolResult, McpError> {
-        let session = self.session.lock().unwrap();
+        let session = self.lock_session();
         let data =
             query::status(&session).map_err(|e| McpError::internal_error(e.message, None))?;
         let warnings = session.warnings();
@@ -173,7 +173,7 @@ impl CodeKurve {
         &self,
         Parameters(input): Parameters<SearchSymbolsInput>,
     ) -> Result<CallToolResult, McpError> {
-        let session = self.session.lock().unwrap();
+        let session = self.lock_session();
         let search_input = SearchInput {
             query: &input.query,
             limit: input.limit,
@@ -225,7 +225,7 @@ impl CodeKurve {
         &self,
         Parameters(input): Parameters<FindRoutesInput>,
     ) -> Result<CallToolResult, McpError> {
-        let session = self.session.lock().unwrap();
+        let session = self.lock_session();
         let default_limit = session.config().queries.default_limit as usize;
         let max_limit = session.config().queries.max_limit as usize;
         // ponytail: a route row can carry a long framework path; keep one MCP
@@ -268,7 +268,7 @@ impl CodeKurve {
         &self,
         Parameters(input): Parameters<GetSymbolInput>,
     ) -> Result<CallToolResult, McpError> {
-        let session = self.session.lock().unwrap();
+        let session = self.lock_session();
         let ctx_lines = input.ctx_lines.unwrap_or(0);
         let include_source = input.include_source.unwrap_or(true);
         let detail = query::get_symbol(&session, &input.id, ctx_lines)
@@ -277,20 +277,33 @@ impl CodeKurve {
         let project = session.config().project.name.clone();
         let sym = &detail.symbol;
 
+        let mut source_truncated = false;
         let (source, stale, reason) = if include_source {
-            let path = session.root().join(&sym.relative_path);
             // Session::warnings() for an Indexed session is only ever the
             // pending-files wording (see query::pending_warning) — non-empty
             // here means index_pending > 0, the exact bit source_slice
             // needs, without a second `repo::index_status` round-trip.
             let index_pending = !warnings.is_empty();
-            let slice = query::source_slice(&path, &sym.span, ctx_lines, index_pending);
+            let config = session.config();
+            let limits = query::SliceLimits {
+                max_file_bytes: config.index.max_file_size_bytes,
+                max_snippet_bytes: config.queries.max_snippet_bytes as usize,
+            };
+            let slice = query::source_slice(
+                session.root(),
+                &sym.relative_path,
+                &sym.span,
+                ctx_lines,
+                index_pending,
+                &limits,
+            );
+            source_truncated = slice.truncated;
             (slice.source, slice.stale, slice.reason)
         } else {
             (None, false, None)
         };
 
-        let row = serde_json::json!({
+        let mut row = serde_json::json!({
             "id": sym.id,
             "name": sym.name,
             "qualified_name": sym.qualified_name,
@@ -308,6 +321,9 @@ impl CodeKurve {
             "stale": stale,
             "stale_reason": reason,
         });
+        if source_truncated {
+            row["source_truncated"] = serde_json::Value::Bool(true);
+        }
         drop(session);
 
         let envelope = query::envelope(&project, row, warnings, false, Some(1));
@@ -355,7 +371,7 @@ impl CodeKurve {
         &self,
         Parameters(input): Parameters<FindUnresolvedInput>,
     ) -> Result<CallToolResult, McpError> {
-        let session = self.session.lock().unwrap();
+        let session = self.lock_session();
         // Same bound the relationship tools apply — a real project holds
         // hundreds of unresolved rows, so this is never unbounded (§28.3).
         let default_limit = session.config().queries.default_limit as usize;
@@ -396,7 +412,7 @@ impl CodeKurve {
         &self,
         Parameters(input): Parameters<TracePathInput>,
     ) -> Result<CallToolResult, McpError> {
-        let session = self.session.lock().unwrap();
+        let session = self.lock_session();
         let args = QueryArgs {
             root: session.root(),
             symbol_id: input.symbol_id.as_deref(),
@@ -432,7 +448,7 @@ impl CodeKurve {
         &self,
         Parameters(input): Parameters<AnalyzeImpactInput>,
     ) -> Result<CallToolResult, McpError> {
-        let session = self.session.lock().unwrap();
+        let session = self.lock_session();
         let args = QueryArgs {
             root: session.root(),
             symbol_id: input.symbol_id.as_deref(),
@@ -467,7 +483,7 @@ impl CodeKurve {
         &self,
         Parameters(ProjectOverviewInput {}): Parameters<ProjectOverviewInput>,
     ) -> Result<CallToolResult, McpError> {
-        let session = self.session.lock().unwrap();
+        let session = self.lock_session();
         let data =
             query::overview(&session).map_err(|e| McpError::internal_error(e.message, None))?;
         let warnings = session.warnings();
@@ -499,7 +515,7 @@ impl CodeKurve {
         &self,
         Parameters(DoctorInput {}): Parameters<DoctorInput>,
     ) -> Result<CallToolResult, McpError> {
-        let session = self.session.lock().unwrap();
+        let session = self.lock_session();
         let report = query::doctor(&session);
         let warnings = session.warnings();
         let project = session.config().project.name.clone();
@@ -528,7 +544,7 @@ impl CodeKurve {
         &self,
         Parameters(ReindexInput {}): Parameters<ReindexInput>,
     ) -> Result<CallToolResult, McpError> {
-        let mut session = self.session.lock().unwrap();
+        let mut session = self.lock_session();
         let root = session.root().to_path_buf();
         let outcome =
             query::reindex(&root).map_err(|e| McpError::internal_error(e.message, None))?;
@@ -557,12 +573,20 @@ impl CodeKurve {
 /// relationship tools (task 5.4), kept as a plain method so it isn't itself
 /// advertised as a tool.
 impl CodeKurve {
+    /// Lock the shared session, recovering from a poisoned mutex: one panicked
+    /// tool call must not turn every later call into a panic too.
+    fn lock_session(&self) -> std::sync::MutexGuard<'_, query::Session> {
+        self.session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn relationship_result(
         &self,
         input: RelationshipInput,
         kind: RelKind,
     ) -> Result<CallToolResult, McpError> {
-        let session = self.session.lock().unwrap();
+        let session = self.lock_session();
         // ponytail: no MCP-specific cap config exists yet; reuse
         // `[queries] default_limit`/`max_limit`, the same bound `search`
         // already applies, rather than inventing a second knob.
@@ -609,5 +633,33 @@ impl CodeKurve {
         Ok(CallToolResult::success(vec![ContentBlock::text(
             envelope.to_string(),
         )]))
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn poisoned_session_lock_is_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        codekurve_core::project::init(dir.path()).unwrap();
+        let session = query::Session::open(dir.path()).unwrap();
+        let server = Arc::new(CodeKurve {
+            session: Mutex::new(session),
+            allow_reindex: false,
+        });
+
+        let poisoner = Arc::clone(&server);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.session.lock().unwrap();
+            panic!("poison the session lock");
+        })
+        .join();
+        assert!(server.session.is_poisoned());
+
+        let guard = server.lock_session();
+        assert_eq!(guard.root(), dir.path().canonicalize().unwrap());
     }
 }

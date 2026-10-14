@@ -1174,6 +1174,18 @@ fn push_partial_term(terms: &mut Vec<String>, current: &mut String) {
     }
 }
 
+/// Escape `LIKE` metacharacters so user text matches literally (pair with
+/// `ESCAPE '\'`).
+fn escape_like(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
 /// Framework route bindings, optionally narrowed by verb/path text.
 pub fn routes(
     conn: &Connection,
@@ -1182,7 +1194,7 @@ pub fn routes(
 ) -> Result<Vec<StoredRelationship>> {
     let pattern = format!(
         "%{}%",
-        route_query.unwrap_or("").replace('/', "").to_lowercase()
+        escape_like(&route_query.unwrap_or("").replace('/', "").to_lowercase())
     );
     let mut stmt = conn.prepare(
         "SELECT r.source_symbol_id, src.qualified_name, r.target_symbol_id, tgt.qualified_name,
@@ -1193,7 +1205,7 @@ pub fn routes(
          JOIN files src_file ON src_file.id = src.file_id
          LEFT JOIN symbols tgt ON tgt.id = r.target_symbol_id
          WHERE r.project_id = ? AND r.kind = 'handlesroute'
-           AND LOWER(REPLACE(COALESCE(r.target_external, ''), '/', '')) LIKE ?
+           AND LOWER(REPLACE(COALESCE(r.target_external, ''), '/', '')) LIKE ? ESCAPE '\\'
          ORDER BY r.target_external, src.qualified_name",
     )?;
     let rows = stmt.query_map([project_id, &pattern], map_relationship)?;
@@ -1229,17 +1241,24 @@ pub fn find_by_name(conn: &Connection, project_id: &str, name: &str) -> Result<V
 
 /// One symbol by its storage id (PR3, `get_symbol`'s data source): `None`
 /// when the id doesn't resolve, rather than an error — the caller decides
-/// whether that's a hard failure.
-pub fn find_symbol_by_id(conn: &Connection, id: &str) -> Result<Option<StoredSymbol>> {
+/// whether that's a hard failure. Scoped to `project_id`: an id from another
+/// project sharing the same database file does not resolve.
+pub fn find_symbol_by_id(
+    conn: &Connection,
+    project_id: &str,
+    id: &str,
+) -> Result<Option<StoredSymbol>> {
     let mut stmt = conn.prepare(
         "SELECT s.id, s.name, s.qualified_name, s.kind, s.language, f.relative_path,
                 s.start_byte, s.end_byte, s.start_line, s.start_column, s.end_line, s.end_column,
                 s.visibility, s.is_partial, s.is_record, s.roles
          FROM symbols s
          JOIN files f ON f.id = s.file_id
-         WHERE s.id = ?1",
+         WHERE s.id = ?1 AND s.project_id = ?2",
     )?;
-    Ok(stmt.query_row(params![id], map_stored).optional()?)
+    Ok(stmt
+        .query_row(params![id, project_id], map_stored)
+        .optional()?)
 }
 
 /// Per-language file counts for `project_overview` (PR3 store addition) —
@@ -1612,6 +1631,47 @@ mod tests {
         assert_eq!(hits[0].name, "MemberService");
         assert_eq!(hits[0].kind, "class");
         assert_eq!(hits[0].relative_path, "src/member.ts");
+    }
+
+    #[test]
+    fn route_query_treats_like_wildcards_literally() {
+        let (mut conn, pid, _interface, class, _function, _controller) = seed_graph();
+        let file_id: String = conn
+            .query_row("SELECT id FROM files LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let route = |path: &str| RelationshipInput {
+            source_symbol_id: class.clone(),
+            target_symbol_id: None,
+            target_external: Some(path.to_string()),
+            kind: RelationshipKind::HandlesRoute,
+            provenance: Provenance::Extracted,
+            confidence: Confidence::High,
+            source_file_id: file_id.clone(),
+            start_line: Some(1),
+            start_column: Some(0),
+            reason: None,
+        };
+        let relationships = vec![route("GET /a_b"), route("GET /axb"), route("GET /100%")];
+        reindex(&mut conn, &pid, &graph_files(), &relationships, &[]).unwrap();
+
+        let hits = |q: &str| routes(&conn, &pid, Some(q)).unwrap().len();
+        assert_eq!(hits("a_b"), 1, "`_` must not match any character");
+        assert_eq!(hits("%"), 1, "`%` must only match a literal percent sign");
+        assert_eq!(hits("a"), 2);
+    }
+
+    #[test]
+    fn find_symbol_by_id_is_scoped_to_the_project() {
+        let conn = seed();
+        let pid = project_id(&conn);
+        let id = search(&conn, &pid, "MemberService", 50).unwrap()[0]
+            .id
+            .clone();
+
+        assert!(find_symbol_by_id(&conn, &pid, &id).unwrap().is_some());
+        assert!(find_symbol_by_id(&conn, "other-project", &id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

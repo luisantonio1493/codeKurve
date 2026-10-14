@@ -246,8 +246,8 @@ pub fn impact(s: &Session, args: &QueryArgs) -> Result<traverse::BfsOutcome, Com
 /// the id, not the node's own file/span; fixture-sized result sets make this
 /// an acceptable cost rather than a second joined query.
 pub fn reached_row(s: &Session, r: &traverse::Reached) -> Result<serde_json::Value, CommandError> {
-    let (conn, _project_id) = s.indexed()?;
-    let sym = repo::find_symbol_by_id(conn, &r.symbol_id)
+    let (conn, project_id) = s.indexed()?;
+    let sym = repo::find_symbol_by_id(conn, project_id, &r.symbol_id)
         .map_err(|e| CommandError::from(e.to_string()))?;
     Ok(serde_json::json!({
         "symbol_id": r.symbol_id,
@@ -431,7 +431,11 @@ pub struct SearchInput<'a> {
 /// MCP client can chain a hit straight into [`get_symbol`].
 pub fn search(s: &Session, q: &SearchInput) -> Result<Page<StoredSymbol>, CommandError> {
     let (conn, project_id) = s.indexed()?;
-    let limit = q.limit.unwrap_or(s.config().queries.default_limit);
+    let queries = &s.config().queries;
+    let limit = q
+        .limit
+        .unwrap_or(queries.default_limit)
+        .min(queries.max_limit);
     let rows = repo::search(conn, project_id, q.query, limit)
         .map_err(|e| CommandError::from(e.to_string()))?;
     let total = rows.len();
@@ -476,8 +480,8 @@ pub struct SymbolDetail {
 /// same-named hits) — needs [`repo::find_symbol_by_id`] (PR3 store
 /// addition).
 pub fn get_symbol(s: &Session, id: &str, _ctx_lines: u32) -> Result<SymbolDetail, CommandError> {
-    let (conn, _project_id) = s.indexed()?;
-    let symbol = repo::find_symbol_by_id(conn, id)
+    let (conn, project_id) = s.indexed()?;
+    let symbol = repo::find_symbol_by_id(conn, project_id, id)
         .map_err(|e| CommandError::from(e.to_string()))?
         .ok_or_else(|| CommandError::from(format!("no symbol with id {id:?}")))?;
     Ok(SymbolDetail { symbol })
@@ -491,53 +495,112 @@ pub struct SourceSlice {
     pub source: Option<String>,
     pub stale: bool,
     pub reason: Option<&'static str>,
+    /// The snippet was cut to `SliceLimits::max_snippet_bytes`.
+    pub truncated: bool,
 }
 
-/// `path` is the file on disk (project root joined with the symbol's
-/// `relative_path`); `ctx_lines` extra lines of context on each side of the
-/// symbol's line span; `index_pending` is whether the project's stored
-/// freshness metadata shows pending files (`Session::warnings()` non-empty
-/// for an `Indexed` session) — folded into `stale` even when the read itself
-/// succeeds, per confirmed decision 4.
+/// Upper bound on `ctx_lines`, whatever the caller asks for.
+pub const MAX_CTX_LINES: u32 = 200;
+
+/// Read-boundary limits for [`source_slice`] (from `[queries]`/`[index]`).
+pub struct SliceLimits {
+    pub max_file_bytes: u64,
+    pub max_snippet_bytes: usize,
+}
+
+/// Resolve `relative_path` under `root`, refusing anything that could leave
+/// it: absolute paths, `..`, symlinked files and symlinked directories.
+/// Errors are the `SourceSlice::reason` wording.
+pub fn contained_path(root: &Path, relative_path: &str) -> Result<PathBuf, &'static str> {
+    use std::path::Component;
+
+    let rel = Path::new(relative_path);
+    if rel.is_absolute() || rel.components().any(|c| !matches!(c, Component::Normal(_))) {
+        return Err("path_outside_root");
+    }
+    let joined = root.join(rel);
+    let meta = std::fs::symlink_metadata(&joined).map_err(|_| "file_missing")?;
+    if meta.file_type().is_symlink() {
+        return Err("path_outside_root");
+    }
+    let canonical_root = root.canonicalize().map_err(|_| "file_missing")?;
+    let canonical = joined.canonicalize().map_err(|_| "file_missing")?;
+    if canonical.starts_with(&canonical_root) {
+        Ok(canonical)
+    } else {
+        Err("path_outside_root")
+    }
+}
+
+fn unreadable(reason: &'static str) -> SourceSlice {
+    SourceSlice {
+        source: None,
+        stale: true,
+        reason: Some(reason),
+        truncated: false,
+    }
+}
+
+/// Cut `text` to at most `max` bytes without splitting a character.
+fn truncate_at_char_boundary(text: &mut String, max: usize) -> bool {
+    if text.len() <= max {
+        return false;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    true
+}
+
+/// `relative_path` is the symbol's file under the project `root` (resolved
+/// with [`contained_path`]); `ctx_lines` extra lines of context on each side
+/// of the symbol's line span, capped at [`MAX_CTX_LINES`]; `index_pending` is
+/// whether the project's stored freshness metadata shows pending files
+/// (`Session::warnings()` non-empty for an `Indexed` session) — folded into
+/// `stale` even when the read itself succeeds, per confirmed decision 4.
 pub fn source_slice(
-    path: &Path,
+    root: &Path,
+    relative_path: &str,
     span: &SourceSpan,
     ctx_lines: u32,
     index_pending: bool,
+    limits: &SliceLimits,
 ) -> SourceSlice {
-    let Ok(bytes) = std::fs::read(path) else {
-        return SourceSlice {
-            source: None,
-            stale: true,
-            reason: Some("file_missing"),
-        };
+    let path = match contained_path(root, relative_path) {
+        Ok(path) => path,
+        Err(reason) => return unreadable(reason),
+    };
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.len() > limits.max_file_bytes => return unreadable("file_too_large"),
+        Ok(_) => {}
+        Err(_) => return unreadable("file_missing"),
+    }
+    let Ok(bytes) = std::fs::read(&path) else {
+        return unreadable("file_missing");
     };
     if span.end_byte > bytes.len() {
-        return SourceSlice {
-            source: None,
-            stale: true,
-            reason: Some("span_out_of_range"),
-        };
+        return unreadable("span_out_of_range");
     }
     let Ok(text) = std::str::from_utf8(&bytes) else {
-        return SourceSlice {
-            source: None,
-            stale: true,
-            reason: Some("non_utf8"),
-        };
+        return unreadable("non_utf8");
     };
+    let ctx_lines = ctx_lines.min(MAX_CTX_LINES) as usize;
     let lines: Vec<&str> = text.lines().collect();
-    let start = span.start_line.saturating_sub(ctx_lines as usize).max(1);
-    let end = (span.end_line + ctx_lines as usize).min(lines.len());
-    let snippet = if start >= 1 && start <= end && end <= lines.len() {
+    let start = span.start_line.saturating_sub(ctx_lines).max(1);
+    let end = (span.end_line + ctx_lines).min(lines.len());
+    let mut snippet = if start >= 1 && start <= end && end <= lines.len() {
         lines[(start - 1)..end].join("\n")
     } else {
         String::new()
     };
+    let truncated = truncate_at_char_boundary(&mut snippet, limits.max_snippet_bytes);
     SourceSlice {
         source: Some(snippet),
         stale: index_pending,
         reason: None,
+        truncated,
     }
 }
 
@@ -869,5 +932,125 @@ mod tests {
             via_session,
             vec!["index is stale (2 pending file(s)); run `codekurve index`".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod read_boundary_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn span(start_line: usize, end_line: usize, end_byte: usize) -> SourceSpan {
+        SourceSpan {
+            start_byte: 0,
+            end_byte,
+            start_line,
+            start_column: 0,
+            end_line,
+            end_column: 0,
+        }
+    }
+
+    fn limits() -> SliceLimits {
+        SliceLimits {
+            max_file_bytes: 1_000_000,
+            max_snippet_bytes: 12_000,
+        }
+    }
+
+    #[test]
+    fn reads_a_file_inside_the_root() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.ts"), "one\ntwo\n").unwrap();
+        let slice = source_slice(dir.path(), "a.ts", &span(2, 2, 3), 0, false, &limits());
+        assert_eq!(slice.source.as_deref(), Some("two"));
+        assert!(!slice.truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_leaving_the_root_is_not_served() {
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), "TOP SECRET").unwrap();
+        let root = tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), root.path().join("a.ts"))
+            .unwrap();
+        let slice = source_slice(root.path(), "a.ts", &span(1, 1, 1), 0, false, &limits());
+        assert_eq!(slice.source, None);
+        assert_eq!(slice.reason, Some("path_outside_root"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_directory_leaving_the_root_is_not_served() {
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.ts"), "TOP SECRET").unwrap();
+        let root = tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("dir")).unwrap();
+        let slice = source_slice(
+            root.path(),
+            "dir/secret.ts",
+            &span(1, 1, 1),
+            0,
+            false,
+            &limits(),
+        );
+        assert_eq!(slice.source, None);
+        assert_eq!(slice.reason, Some("path_outside_root"));
+    }
+
+    #[test]
+    fn parent_and_absolute_paths_are_rejected() {
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), "TOP SECRET").unwrap();
+        let root = tempdir().unwrap();
+        let abs = outside.path().join("secret");
+        for rel in ["../secret", abs.to_str().unwrap()] {
+            let slice = source_slice(root.path(), rel, &span(1, 1, 1), 0, false, &limits());
+            assert_eq!(slice.reason, Some("path_outside_root"), "{rel}");
+        }
+    }
+
+    #[test]
+    fn snippet_is_cut_on_a_char_boundary() {
+        let dir = tempdir().unwrap();
+        // 'é' is 2 bytes: a 5-byte cap would land inside the third one.
+        std::fs::write(dir.path().join("a.ts"), "ééééé\n").unwrap();
+        let limits = SliceLimits {
+            max_file_bytes: 1_000_000,
+            max_snippet_bytes: 5,
+        };
+        let slice = source_slice(dir.path(), "a.ts", &span(1, 1, 10), 0, false, &limits);
+        assert_eq!(slice.source.as_deref(), Some("éé"));
+        assert!(slice.truncated);
+    }
+
+    #[test]
+    fn oversized_file_is_not_read() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.ts"), "x".repeat(100)).unwrap();
+        let limits = SliceLimits {
+            max_file_bytes: 10,
+            max_snippet_bytes: 12_000,
+        };
+        let slice = source_slice(dir.path(), "a.ts", &span(1, 1, 1), 0, false, &limits);
+        assert_eq!(slice.reason, Some("file_too_large"));
+    }
+
+    #[test]
+    fn ctx_lines_is_capped() {
+        let dir = tempdir().unwrap();
+        let text: String = (1..=1000).map(|i| format!("l{i}\n")).collect();
+        std::fs::write(dir.path().join("a.ts"), &text).unwrap();
+        let slice = source_slice(
+            dir.path(),
+            "a.ts",
+            &span(500, 500, 1),
+            u32::MAX,
+            false,
+            &limits(),
+        );
+        let lines = slice.source.unwrap().lines().count();
+        assert_eq!(lines, 1 + 2 * MAX_CTX_LINES as usize);
     }
 }

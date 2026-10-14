@@ -13,8 +13,8 @@ Assumption: each finding is reproduced before fixing; non-reproducing ones are s
 ## Tasks
 T1 S1 SEC-2 ignore.patterns enforced in discovery — route: delegated (haiku) — DONE, RED/GREEN observed, commit: see git log 'enforce ignore.patterns'
 T2 S1 SEC-1 install backup/symlink-safe atomic writes — route: inline — DONE, RED/GREEN observed, commit: see git log 'symlink-safe'
-T3 S1 SEC-3+SEC-4+SEC-5 contained reads, project-scoped lookup, output limits — route: inline — pending
-T4 S1 SEC-7 + SEC-12 DONE (haiku writers; commits 'cap AST depth', 'owner-only'); SEC-10 poisoned lock + SEC-11 LIKE escape pending (tools.rs/repo.rs, do with T3)
+T3 S1 SEC-3+SEC-4+SEC-5 contained reads, project-scoped lookup, output limits — route: inline — DONE (tests written after the code; no RED observed), commit: 'contain source reads'
+T4 S1 SEC-7 + SEC-12 DONE (haiku writers; commits 'cap AST depth', 'owner-only'); SEC-10 poisoned lock (test after code, no RED) + SEC-11 LIKE escape (RED observed) DONE in the same commit as T3
 T5 S1 SEC-6+SEC-8+SEC-9 installer checksums, repo-config guard, CI hardening — route: inline — pending
 T6.. S2-S5 — pending (one task per ID group)
 
