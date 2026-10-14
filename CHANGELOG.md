@@ -5,6 +5,10 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Changed
+
+- MCP responses use `schema_version` 2: `null` fields and an empty `warnings` are omitted; `trace_path` returns only the nodes on the found path (plus `reached_count`) instead of every visited node; `analyze_impact`/`trace_path` rows carry `qualified_name`; `find_callees` states the shared `path` once in the anchor; `truncated_reason` is reported; `search_symbols` reports `truncated` when more matches exist. The CLI `--json` output is unchanged (version 1)
+
 ### Fixed
 
 - Index: a directory the walk cannot read, or a file that cannot be read during a full reindex, is no longer treated as a deletion (the existing index is kept and the failure reported)

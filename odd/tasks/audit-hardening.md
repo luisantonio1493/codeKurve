@@ -22,7 +22,8 @@ T8 S2 IDX-9 .tsx grammar (haiku writer, RED observed) — DONE
 T9 S2 IDX-1 walk/read failures never deletions; non-UTF-8 — inline, RED observed — DONE
 T10 S2 IDX-3/4/5 watcher order, rescan, bounded retry — inline, RED (compile) observed; IDX-3 ordering has no automated test — DONE
 T11 S2 IDX-10 touch refresh, IDX-2 fingerprint + alias order + force_full deletions (force_full test: RED not observed separately), IDX-6 stable read (test seam), IDX-7 inbound edges, IDX-8 module dependents — inline — DONE
-T12.. S3 token efficiency, S4 QRY-2..11, S5 PERF-1,3..8 — pending
+T12 S3 TOK-1,2,4(callees path),5,6 + schema_version 2 envelope — inline; tests written with the change (contract tests updated; new no-null guard in envelope_of) — DONE. Measured on real C# project: trace_path no-path 133579 -> 147 chars; find_callees -27%; impact +42% (names added). PENDING USER DECISION: lossy removal of redundant row fields (name/path/constant confidence+provenance) TOK-3/TOK-4, tool description trimming TOK-7, overview routes TOK-8
+T13.. S4 QRY-2..11, S5 PERF-1,3..8 — pending
 Verifier (independent, Phase 1): no blockers; advisories A1 follow_symlinks still indexes outside files, A2 depth-capped file skipped silently, A4 stray .bak before symlink refusal, A5 cargo install not --version pinned
 
 ## Log
