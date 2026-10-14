@@ -160,6 +160,57 @@ pub fn envelope(
     envelope
 }
 
+/// Remove `null` fields from a JSON object row (absent = none): every null is
+/// tokens an agent pays for and learns nothing from.
+pub fn prune_nulls(mut row: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = row.as_object_mut() {
+        object.retain(|_, value| !value.is_null());
+    }
+    row
+}
+
+/// [`prune_nulls`] all the way down: object fields that are `null` are
+/// dropped at every depth (array elements are kept as they are).
+pub fn prune_nulls_deep(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, v)| (k, prune_nulls_deep(v)))
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(prune_nulls_deep).collect())
+        }
+        other => other,
+    }
+}
+
+/// The MCP response envelope (`schema_version` 2): like [`envelope`] but
+/// `warnings` is omitted when empty and `total` when `None`. The CLI's
+/// `--json` keeps the version-1 [`envelope`].
+pub fn mcp_envelope(
+    project: &str,
+    result: serde_json::Value,
+    warnings: Vec<String>,
+    truncated: bool,
+    total: Option<usize>,
+) -> serde_json::Value {
+    let mut envelope = serde_json::json!({
+        "schema_version": 2,
+        "project": project,
+        "result": prune_nulls_deep(result),
+        "truncated": truncated,
+    });
+    if !warnings.is_empty() {
+        envelope["warnings"] = serde_json::json!(warnings);
+    }
+    if let Some(total) = total {
+        envelope["total"] = serde_json::json!(total);
+    }
+    envelope
+}
+
 /// Shared body of `references`/`callers`/`callees`/`implementations`:
 /// resolve the subject symbol, run the single indexed SELECT (§5a.1), then
 /// paginate. Extracted from `commands::relationship_command`.
@@ -248,8 +299,9 @@ pub fn reached_row(s: &Session, r: &traverse::Reached) -> Result<serde_json::Val
     let (conn, project_id) = s.indexed()?;
     let sym = repo::find_symbol_by_id(conn, project_id, &r.symbol_id)
         .map_err(|e| CommandError::from(e.to_string()))?;
-    Ok(serde_json::json!({
+    Ok(prune_nulls(serde_json::json!({
         "symbol_id": r.symbol_id,
+        "qualified_name": sym.as_ref().map(|sym| sym.qualified_name.clone()),
         "depth": r.depth,
         "path": sym.as_ref().map(|sym| sym.relative_path.clone()),
         "start_line": sym.as_ref().map(|sym| sym.span.start_line),
@@ -258,7 +310,7 @@ pub fn reached_row(s: &Session, r: &traverse::Reached) -> Result<serde_json::Val
         "provenance": r.via.as_ref().map(|e| e.provenance.clone()),
         "via_kind": r.via.as_ref().map(|e| e.kind.clone()),
         "predecessor": r.predecessor,
-    }))
+    })))
 }
 
 /// Every reached node as a §28.3 row (see [`reached_row`]), for `trace_path`/
@@ -268,6 +320,31 @@ pub fn bfs_rows(
     outcome: &traverse::BfsOutcome,
 ) -> Result<Vec<serde_json::Value>, CommandError> {
     outcome.reached.iter().map(|r| reached_row(s, r)).collect()
+}
+
+/// `trace_path`'s answer: only the nodes on the found path, start first, in
+/// order — not every node the search visited on the way.
+pub fn path_rows(
+    s: &Session,
+    outcome: &traverse::BfsOutcome,
+) -> Result<Vec<serde_json::Value>, CommandError> {
+    let Some(path) = &outcome.path else {
+        return Ok(Vec::new());
+    };
+    let by_id: std::collections::HashMap<&str, &traverse::Reached> = outcome
+        .reached
+        .iter()
+        .map(|r| (r.symbol_id.as_str(), r))
+        .collect();
+    let mut ids: Vec<&str> = Vec::with_capacity(path.len() + 1);
+    if let Some(start) = outcome.reached.first() {
+        ids.push(start.symbol_id.as_str());
+    }
+    ids.extend(path.iter().map(|edge| edge.neighbor_symbol_id.as_str()));
+    ids.iter()
+        .filter_map(|id| by_id.get(id))
+        .map(|r| reached_row(s, r))
+        .collect()
 }
 
 /// One §28.3 row (path, line range, confidence, provenance) for a
@@ -315,6 +392,8 @@ pub fn relationship_anchor(r: &StoredRelationship, anchor_is_target: bool) -> se
         serde_json::json!({
             "symbol_id": r.source_symbol_id,
             "qualified_name": r.source_qualified_name,
+            // Every row's `path` is this anchor's own file: said once here.
+            "path": r.source_relative_path,
         })
     }
 }
@@ -346,7 +425,6 @@ pub fn relationship_row_compact(
             "target_qualified_name": r.target_qualified_name,
             "target_external": r.target_external,
             "kind": r.kind,
-            "path": r.source_relative_path,
             "start_line": r.start_line,
             "start_column": r.start_column,
             "confidence": r.confidence,
@@ -435,13 +513,17 @@ pub fn search(s: &Session, q: &SearchInput) -> Result<Page<StoredSymbol>, Comman
         .limit
         .unwrap_or(queries.default_limit)
         .min(queries.max_limit);
-    let rows = repo::search(conn, project_id, q.query, limit)
+    // Ask for one extra row: its presence is how a full page is told apart
+    // from a page that merely hit the limit.
+    let mut rows = repo::search(conn, project_id, q.query, limit.saturating_add(1))
         .map_err(|e| CommandError::from(e.to_string()))?;
+    let truncated = rows.len() > limit as usize;
+    rows.truncate(limit as usize);
     let total = rows.len();
     Ok(Page {
         rows,
         total,
-        truncated: false,
+        truncated,
     })
 }
 

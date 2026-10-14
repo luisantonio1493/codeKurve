@@ -152,7 +152,19 @@ fn envelope_of(call_result: &serde_json::Value) -> serde_json::Value {
     let text = call_result["result"]["content"][0]["text"]
         .as_str()
         .unwrap_or_else(|| panic!("missing content[0].text: {call_result}"));
-    serde_json::from_str(text).unwrap()
+    let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_no_nulls(&envelope, &envelope);
+    envelope
+}
+
+/// Schema v2: absent means none — a `null` anywhere is wasted tokens.
+fn assert_no_nulls(value: &serde_json::Value, whole: &serde_json::Value) {
+    match value {
+        serde_json::Value::Null => panic!("null in response: {whole}"),
+        serde_json::Value::Array(items) => items.iter().for_each(|v| assert_no_nulls(v, whole)),
+        serde_json::Value::Object(map) => map.values().for_each(|v| assert_no_nulls(v, whole)),
+        _ => {}
+    }
 }
 
 /// `project_overview`/`doctor`/`project_status` don't paginate, so their
@@ -161,18 +173,13 @@ fn envelope_of(call_result: &serde_json::Value) -> serde_json::Value {
 /// checks, minus `total`.
 fn assert_envelope_shape_without_total(envelope: &serde_json::Value) {
     let obj = envelope.as_object().expect("envelope must be an object");
-    for field in [
-        "schema_version",
-        "project",
-        "result",
-        "warnings",
-        "truncated",
-    ] {
+    for field in ["schema_version", "project", "result", "truncated"] {
         assert!(
             obj.contains_key(field),
             "missing envelope field {field:?}: {envelope}"
         );
     }
+    assert_warnings_only_when_present(envelope);
     assert!(
         !obj.contains_key("total"),
         "unexpected total key: {envelope}"
@@ -181,19 +188,27 @@ fn assert_envelope_shape_without_total(envelope: &serde_json::Value) {
 
 fn assert_envelope_shape(envelope: &serde_json::Value) {
     let obj = envelope.as_object().expect("envelope must be an object");
-    for field in [
-        "schema_version",
-        "project",
-        "result",
-        "warnings",
-        "truncated",
-        "total",
-    ] {
+    for field in ["schema_version", "project", "result", "truncated", "total"] {
         assert!(
             obj.contains_key(field),
             "missing envelope field {field:?}: {envelope}"
         );
     }
+    assert_warnings_only_when_present(envelope);
+}
+
+/// `warnings` is omitted when there are none; when present it is non-empty.
+fn assert_warnings_only_when_present(envelope: &serde_json::Value) {
+    if let Some(warnings) = envelope.get("warnings") {
+        assert!(
+            !warnings
+                .as_array()
+                .expect("warnings is an array")
+                .is_empty(),
+            "empty warnings must be omitted: {envelope}"
+        );
+    }
+    assert_eq!(envelope["schema_version"], 2);
 }
 
 /// Golden coverage for all read tools, one fixture project,
@@ -261,6 +276,23 @@ fn all_read_tools_return_the_28_3_envelope() {
         .unwrap()
         .iter()
         .any(|row| row["name"] == "Submit"));
+
+    // A page that merely hit the limit says so (one extra row is fetched to
+    // tell it from a page that is simply complete).
+    let result = session.call(
+        "codekurve_search_symbols",
+        serde_json::json!({"query": "call", "limit": 1}),
+    );
+    let envelope = envelope_of(&result);
+    assert_eq!(envelope["result"].as_array().unwrap().len(), 1);
+    assert_eq!(envelope["truncated"], true, "{envelope}");
+    let result = session.call(
+        "codekurve_search_symbols",
+        serde_json::json!({"query": "call", "limit": 50}),
+    );
+    let envelope = envelope_of(&result);
+    assert!(envelope["result"].as_array().unwrap().len() >= 2);
+    assert_eq!(envelope["truncated"], false, "{envelope}");
 
     let result = session.call(
         "codekurve_find_routes",
@@ -363,6 +395,10 @@ fn all_read_tools_return_the_28_3_envelope() {
         "src/a.ts::callLocal"
     );
     assert!(envelope["result"]["anchor"].get("external").is_none());
+    // Every callee row is in the anchor's own file: `path` lives on the
+    // anchor once, not on each row.
+    assert_eq!(envelope["result"]["anchor"]["path"], "src/a.ts");
+    assert!(envelope["result"]["rows"][0].get("path").is_none());
 
     // find_references: same underlying rows as find_callers here (no
     // non-call references in the fixture).
@@ -425,17 +461,32 @@ fn all_read_tools_return_the_28_3_envelope() {
         serde_json::json!({"symbol_name": "src/a.ts::callLocal", "to": "src/a.ts::getEligibility"}),
     );
     let envelope = envelope_of(&result);
-    assert_envelope_shape(&envelope);
+    // `trace_path` reports `reached_count` inside `result` instead of `total`.
+    assert_envelope_shape_without_total(&envelope);
     assert_eq!(envelope["result"]["path_found"], true);
-    let reached = envelope["result"]["reached"].as_array().unwrap();
-    assert!(!reached.is_empty());
+    // Only the nodes on the path, start first: callLocal -> getEligibility.
+    let path = envelope["result"]["path"].as_array().unwrap();
+    assert_eq!(path.len(), 2, "{envelope}");
+    assert_eq!(path[0]["qualified_name"], "src/a.ts::callLocal");
+    assert_eq!(path[1]["qualified_name"], "src/a.ts::getEligibility");
     for field in ["path", "start_line", "end_line"] {
         assert!(
-            reached[0].get(field).is_some(),
-            "reached row missing {field:?}: {}",
-            reached[0]
+            path[1].get(field).is_some(),
+            "path row missing {field:?}: {}",
+            path[1]
         );
     }
+    assert!(envelope["result"]["reached_count"].as_u64().unwrap() >= 2);
+    assert!(envelope["result"].get("reached").is_none());
+
+    // No path: no `path` rows, `path_found` false.
+    let result = session.call(
+        "codekurve_trace_path",
+        serde_json::json!({"symbol_name": "src/a.ts::getEligibility", "to": "src/a.ts::callLocal"}),
+    );
+    let envelope = envelope_of(&result);
+    assert_eq!(envelope["result"]["path_found"], false);
+    assert_eq!(envelope["result"]["path"].as_array().unwrap().len(), 0);
 
     // analyze_impact
     let result = session.call(
@@ -568,7 +619,7 @@ fn stale_warning_reflects_pending_files() {
     let mut session = McpSession::start(root);
     let result = session.call("codekurve_project_status", serde_json::json!({}));
     let envelope = envelope_of(&result);
-    assert_eq!(envelope["warnings"].as_array().unwrap().len(), 0);
+    assert!(envelope.get("warnings").is_none(), "{envelope}");
     assert_eq!(envelope["result"]["stale"], false);
     session.finish();
 

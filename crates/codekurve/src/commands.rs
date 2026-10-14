@@ -1100,7 +1100,7 @@ fn trace_json(outcome: &traverse::BfsOutcome) -> serde_json::Value {
     })
 }
 
-fn truncation_reason_str(r: traverse::TruncationReason) -> &'static str {
+pub fn truncation_reason_str(r: traverse::TruncationReason) -> &'static str {
     match r {
         traverse::TruncationReason::MaxDepth => "max_depth",
         traverse::TruncationReason::MaxNodes => "max_nodes",

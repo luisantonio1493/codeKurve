@@ -5,7 +5,7 @@
 //! `query::*` functions, and drops the guard before returning — no
 //! `.await` while the lock is held (design "Concurrency").
 
-use codekurve::commands::QueryArgs;
+use codekurve::commands::{self, QueryArgs};
 use codekurve::query::{self, RelKind, SearchInput};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -160,7 +160,7 @@ impl CodeKurve {
             "last_verified_at": data.last_verified_at,
             "stale": data.stale,
         });
-        let envelope = query::envelope(&project, result, warnings, false, None);
+        let envelope = query::mcp_envelope(&project, result, warnings, false, None);
         Ok(CallToolResult::success(vec![ContentBlock::text(
             envelope.to_string(),
         )]))
@@ -186,7 +186,7 @@ impl CodeKurve {
             .rows
             .iter()
             .map(|sym| {
-                serde_json::json!({
+                query::prune_nulls(serde_json::json!({
                     "id": sym.id,
                     "name": sym.name,
                     "qualified_name": sym.qualified_name,
@@ -201,12 +201,12 @@ impl CodeKurve {
                     // that constant rather than a stored column.
                     "confidence": "high",
                     "provenance": "tree-sitter",
-                })
+                }))
             })
             .collect();
         drop(session);
 
-        let envelope = query::envelope(
+        let envelope = query::mcp_envelope(
             &project,
             serde_json::Value::Array(rows),
             warnings,
@@ -246,10 +246,14 @@ impl CodeKurve {
         .map_err(|e| McpError::internal_error(e.message, None))?;
         let warnings = session.warnings();
         let project = session.config().project.name.clone();
-        let rows: Vec<_> = page.rows.iter().map(query::relationship_row).collect();
+        let rows: Vec<_> = page
+            .rows
+            .iter()
+            .map(|r| query::prune_nulls(query::relationship_row(r)))
+            .collect();
         drop(session);
 
-        let envelope = query::envelope(
+        let envelope = query::mcp_envelope(
             &project,
             serde_json::Value::Array(rows),
             warnings,
@@ -303,7 +307,7 @@ impl CodeKurve {
             (None, false, None)
         };
 
-        let mut row = serde_json::json!({
+        let mut row = query::prune_nulls(serde_json::json!({
             "id": sym.id,
             "name": sym.name,
             "qualified_name": sym.qualified_name,
@@ -320,13 +324,13 @@ impl CodeKurve {
             // drift for *this* symbol's own span/file.
             "stale": stale,
             "stale_reason": reason,
-        });
+        }));
         if source_truncated {
             row["source_truncated"] = serde_json::Value::Bool(true);
         }
         drop(session);
 
-        let envelope = query::envelope(&project, row, warnings, false, Some(1));
+        let envelope = query::mcp_envelope(&project, row, warnings, false, Some(1));
         Ok(CallToolResult::success(vec![ContentBlock::text(
             envelope.to_string(),
         )]))
@@ -392,10 +396,14 @@ impl CodeKurve {
             .map_err(|e| McpError::internal_error(e.message, None))?;
         let warnings = session.warnings();
         let project = session.config().project.name.clone();
-        let rows: Vec<_> = page.rows.iter().map(query::unresolved_row).collect();
+        let rows: Vec<_> = page
+            .rows
+            .iter()
+            .map(|r| query::prune_nulls(query::unresolved_row(r)))
+            .collect();
         drop(session);
 
-        let envelope = query::envelope(
+        let envelope = query::mcp_envelope(
             &project,
             serde_json::Value::Array(rows),
             warnings,
@@ -425,17 +433,29 @@ impl CodeKurve {
         };
         let outcome = query::trace(&session, &args, &input.to)
             .map_err(|e| McpError::internal_error(e.message, None))?;
-        let rows = query::bfs_rows(&session, &outcome)
+        // Only the nodes ON the path: the search frontier (up to 500 nodes)
+        // is not an answer to "how does A reach B".
+        let rows = query::path_rows(&session, &outcome)
             .map_err(|e| McpError::internal_error(e.message, None))?;
         let warnings = session.warnings();
         let project = session.config().project.name.clone();
-        let total = rows.len();
+        let reached_count = outcome.reached.len();
         let truncated = outcome.truncated;
+        let truncated_reason = outcome
+            .truncated_reason
+            .map(commands::truncation_reason_str);
         let path_found = outcome.path.is_some();
         drop(session);
 
-        let result = serde_json::json!({ "reached": rows, "path_found": path_found });
-        let envelope = query::envelope(&project, result, warnings, truncated, Some(total));
+        let result = serde_json::json!({
+            "path_found": path_found,
+            "path": rows,
+            "reached_count": reached_count,
+        });
+        let mut envelope = query::mcp_envelope(&project, result, warnings, truncated, None);
+        if let Some(reason) = truncated_reason {
+            envelope["truncated_reason"] = serde_json::json!(reason);
+        }
         Ok(CallToolResult::success(vec![ContentBlock::text(
             envelope.to_string(),
         )]))
@@ -467,10 +487,16 @@ impl CodeKurve {
         let project = session.config().project.name.clone();
         let total = rows.len();
         let truncated = outcome.truncated;
+        let truncated_reason = outcome
+            .truncated_reason
+            .map(commands::truncation_reason_str);
         drop(session);
 
         let result = serde_json::json!({ "reached": rows });
-        let envelope = query::envelope(&project, result, warnings, truncated, Some(total));
+        let mut envelope = query::mcp_envelope(&project, result, warnings, truncated, Some(total));
+        if let Some(reason) = truncated_reason {
+            envelope["truncated_reason"] = serde_json::json!(reason);
+        }
         Ok(CallToolResult::success(vec![ContentBlock::text(
             envelope.to_string(),
         )]))
@@ -500,9 +526,9 @@ impl CodeKurve {
             "symbols": data.symbols,
             "relationships": data.relationships,
             "languages": languages,
-            "entry_points": data.entry_points.iter().map(query::relationship_row).collect::<Vec<_>>(),
+            "entry_points": data.entry_points.iter().map(|r| query::prune_nulls(query::relationship_row(r))).collect::<Vec<_>>(),
         });
-        let envelope = query::envelope(&project, result, warnings, false, None);
+        let envelope = query::mcp_envelope(&project, result, warnings, false, None);
         Ok(CallToolResult::success(vec![ContentBlock::text(
             envelope.to_string(),
         )]))
@@ -527,7 +553,7 @@ impl CodeKurve {
             .map(|c| serde_json::json!({ "name": c.name, "ok": c.ok, "detail": c.detail }))
             .collect();
         let result = serde_json::json!({ "ok": report.ok, "checks": checks });
-        let envelope = query::envelope(&project, result, warnings, false, None);
+        let envelope = query::mcp_envelope(&project, result, warnings, false, None);
         Ok(CallToolResult::success(vec![ContentBlock::text(
             envelope.to_string(),
         )]))
@@ -562,7 +588,7 @@ impl CodeKurve {
             "files_deleted": outcome.files_deleted,
             "fell_back_to_full_reindex": outcome.fell_back_to_full_reindex,
         });
-        let envelope = query::envelope(&project, result, warnings, false, None);
+        let envelope = query::mcp_envelope(&project, result, warnings, false, None);
         Ok(CallToolResult::success(vec![ContentBlock::text(
             envelope.to_string(),
         )]))
@@ -619,11 +645,11 @@ impl CodeKurve {
         let rows: Vec<_> = page
             .rows
             .iter()
-            .map(|r| query::relationship_row_compact(r, anchor_is_target))
+            .map(|r| query::prune_nulls(query::relationship_row_compact(r, anchor_is_target)))
             .collect();
         drop(session);
 
-        let envelope = query::envelope(
+        let envelope = query::mcp_envelope(
             &project,
             serde_json::json!({ "anchor": anchor, "rows": rows }),
             warnings,
