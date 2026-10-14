@@ -798,8 +798,10 @@ pub fn doctor(s: &Session) -> DoctorReport {
 /// `NotIndexed`).
 pub fn reindex(root: &Path) -> Result<crate::incremental::BatchOutcome, CommandError> {
     let mut setup = commands::setup_index(root).map_err(CommandError::from)?;
-    let force_full = commands::analyzer_version_changed(&setup.conn, &setup.project_id)
-        .map_err(CommandError::from)?;
+    let fingerprint = commands::analysis_fingerprint(&setup.config, &setup.aliases);
+    let force_full =
+        commands::analyzer_version_changed(&setup.conn, &setup.project_id, &fingerprint)
+            .map_err(CommandError::from)?;
     let changes = crate::incremental::detect(
         &setup.conn,
         &setup.project_id,
@@ -818,12 +820,8 @@ pub fn reindex(root: &Path) -> Result<crate::incremental::BatchOutcome, CommandE
     };
     let outcome = crate::incremental::apply_batch(&mut setup.conn, &ctx, &changes)
         .map_err(CommandError::from)?;
-    codekurve_store::repo::set_analyzer_version(
-        &setup.conn,
-        &setup.project_id,
-        commands::ANALYZER_VERSION,
-    )
-    .map_err(|e| CommandError::from(e.to_string()))?;
+    codekurve_store::repo::set_analyzer_version(&setup.conn, &setup.project_id, &fingerprint)
+        .map_err(|e| CommandError::from(e.to_string()))?;
     Ok(outcome)
 }
 

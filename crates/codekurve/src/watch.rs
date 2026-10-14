@@ -96,7 +96,9 @@ fn needs_full_sweep(root: &Path, paths: &HashSet<PathBuf>) -> bool {
 }
 
 fn reconcile(setup: &mut IndexSetup) -> Result<(), String> {
-    let force_full = commands::analyzer_version_changed(&setup.conn, &setup.project_id)?;
+    let fingerprint = commands::analysis_fingerprint(&setup.config, &setup.aliases);
+    let force_full =
+        commands::analyzer_version_changed(&setup.conn, &setup.project_id, &fingerprint)?;
     let changes = incremental::detect(
         &setup.conn,
         &setup.project_id,
@@ -110,7 +112,7 @@ fn reconcile(setup: &mut IndexSetup) -> Result<(), String> {
             codekurve_store::repo::set_analyzer_version(
                 &setup.conn,
                 &setup.project_id,
-                commands::ANALYZER_VERSION,
+                &fingerprint,
             )
             .map_err(|e| e.to_string())?;
         }
@@ -124,12 +126,8 @@ fn reconcile(setup: &mut IndexSetup) -> Result<(), String> {
         full_reindex_threshold_pct: setup.config.index.watch.full_reindex_threshold_pct,
     };
     let outcome = incremental::apply_batch(&mut setup.conn, &ctx, &changes)?;
-    codekurve_store::repo::set_analyzer_version(
-        &setup.conn,
-        &setup.project_id,
-        commands::ANALYZER_VERSION,
-    )
-    .map_err(|e| e.to_string())?;
+    codekurve_store::repo::set_analyzer_version(&setup.conn, &setup.project_id, &fingerprint)
+        .map_err(|e| e.to_string())?;
     println!(
         "reconciled {} file(s) changed, {} deleted{}",
         outcome.files_changed,

@@ -286,19 +286,24 @@ fn find_file(base: &str, known_files: &HashSet<String>) -> Option<String> {
 /// A single-`*`-prefix `compilerOptions.paths` alias mapping (e.g.
 /// `"@app/*": "src/*"`), or a literal (no-wildcard) exact match.
 fn apply_alias(specifier: &str, aliases: &TsconfigAliases) -> Option<String> {
-    for (pattern, replacement) in aliases {
-        match pattern.strip_suffix('*') {
-            Some(prefix) => {
-                if let Some(rest) = specifier.strip_prefix(prefix) {
-                    let repl_prefix = replacement.strip_suffix('*').unwrap_or(replacement);
-                    return Some(format!("{repl_prefix}{rest}"));
-                }
-            }
-            None if pattern == specifier => return Some(replacement.clone()),
-            None => {}
-        }
+    // An exact (no-wildcard) match always wins; among wildcard patterns the
+    // longest matching prefix wins, as in TypeScript — never whichever the
+    // map happens to iterate first.
+    if let Some(replacement) = aliases.get(specifier) {
+        return Some(replacement.clone());
     }
-    None
+    aliases
+        .iter()
+        .filter_map(|(pattern, replacement)| {
+            let prefix = pattern.strip_suffix('*')?;
+            let rest = specifier.strip_prefix(prefix)?;
+            Some((prefix.len(), replacement, rest))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(a.1)))
+        .map(|(_, replacement, rest)| {
+            let repl_prefix = replacement.strip_suffix('*').unwrap_or(replacement);
+            format!("{repl_prefix}{rest}")
+        })
 }
 
 /// Counts of how many edges resolution produced, for `codekurve index`'s
@@ -1290,6 +1295,36 @@ mod tests {
         assert!(calls.iter().all(|r| r.confidence == Confidence::Low));
         assert!(calls.iter().all(|r| r.provenance == Provenance::Heuristic));
         assert!(files[0].unresolved.is_empty());
+    }
+
+    /// IDX-2: overlapping alias patterns resolve by longest prefix, never by
+    /// `HashMap` iteration order.
+    #[test]
+    fn overlapping_aliases_resolve_by_longest_prefix() {
+        for _ in 0..64 {
+            let aliases: TsconfigAliases = [
+                ("@app/*".to_string(), "src/*".to_string()),
+                ("@app/core/*".to_string(), "src/core/*".to_string()),
+                (
+                    "@app/core/special".to_string(),
+                    "src/special.ts".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect();
+            assert_eq!(
+                apply_alias("@app/core/x", &aliases).as_deref(),
+                Some("src/core/x")
+            );
+            assert_eq!(
+                apply_alias("@app/other", &aliases).as_deref(),
+                Some("src/other")
+            );
+            assert_eq!(
+                apply_alias("@app/core/special", &aliases).as_deref(),
+                Some("src/special.ts")
+            );
+        }
     }
 
     fn caller_with_candidates(n: usize) -> Vec<FileAnalysis> {

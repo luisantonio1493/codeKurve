@@ -96,11 +96,11 @@ pub fn detect(
 ) -> Result<Vec<FileChange>, String> {
     let report = discovery::discover_report(root, opts).map_err(|e| e.to_string())?;
     let discovered = report.files.clone();
-    let stored = if force_full {
-        HashMap::new()
-    } else {
-        repo::file_snapshot(conn, project_id).map_err(|e| e.to_string())?
-    };
+    let snapshot = repo::file_snapshot(conn, project_id).map_err(|e| e.to_string())?;
+    // `force_full` re-reads everything (every file looks new) but deletions
+    // are still judged against what is really stored.
+    let no_prior = HashMap::new();
+    let stored = if force_full { &no_prior } else { &snapshot };
 
     let mut changes = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -141,7 +141,7 @@ pub fn detect(
         changes.push(FileChange::Modified(file));
     }
 
-    for path in stored.keys() {
+    for path in snapshot.keys() {
         if seen.contains(path) {
             continue;
         }
@@ -649,6 +649,34 @@ mod tests {
         let aliases = TsconfigAliases::new();
         let changes = detect(conn, project, root, &options, None, false)?;
         apply_batch(conn, &ctx(root, project, &aliases, &options), &changes)
+    }
+
+    /// IDX-2: `force_full` treats every discovered file as new, but files
+    /// deleted while nothing was watching must still be reported as deleted.
+    #[test]
+    fn force_full_still_reports_offline_deletions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for name in ["a.ts", "b.ts", "c.ts", "d.ts"] {
+            std_fs::write(root.join(name), "export const x = 1;\n").unwrap();
+        }
+        let mut conn = db::open_in_memory().unwrap();
+        let project = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        seed_indexed(&mut conn, &project, root, &["a.ts", "b.ts", "c.ts", "d.ts"]);
+        for name in ["b.ts", "c.ts", "d.ts"] {
+            std_fs::remove_file(root.join(name)).unwrap();
+        }
+
+        let changes = detect(&conn, &project, root, &discovery_opts(), None, true).unwrap();
+
+        let deleted: Vec<_> = changes
+            .iter()
+            .filter_map(|c| match c {
+                FileChange::Deleted { relative_path } => Some(relative_path.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deleted.len(), 3, "got {changes:?}");
     }
 
     /// IDX-10: a touch-only edit (mtime moved, bytes identical) refreshes the

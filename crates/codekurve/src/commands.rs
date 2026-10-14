@@ -83,20 +83,47 @@ pub(crate) fn setup_index(root: &Path) -> Result<IndexSetup, String> {
 /// [`analyzer_version_changed`]).
 pub(crate) const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// True when the project's stored `analyzer_version` (§ repo::
-/// analyzer_version) doesn't match this build — a binary upgrade changed
-/// extraction logic without touching any source file, so content-hash-based
-/// change detection alone would never notice and stale relationships (e.g.
-/// a bug fix in the extractor) would stick around until something else
-/// happened to touch every file. `None` (never indexed, or migrated from a
-/// schema before this column existed) counts as changed too — one honest
-/// full reindex either way.
+/// Everything outside the source files that changes what analysis produces:
+/// the binary version, the config that decides what is indexed, and the
+/// resolved tsconfig aliases. Stamped on the project after a full (re)index
+/// and compared on every run, so changing any of them triggers one honest
+/// full reindex instead of leaving stale edges behind.
+pub(crate) fn analysis_fingerprint(config: &Config, aliases: &TsconfigAliases) -> String {
+    let mut sorted: Vec<(&String, &String)> = aliases.iter().collect();
+    sorted.sort();
+    let mut canonical = String::new();
+    for (pattern, replacement) in sorted {
+        canonical.push_str(&format!("alias:{pattern}={replacement}\n"));
+    }
+    for pattern in &config.ignore.patterns {
+        canonical.push_str(&format!("ignore:{pattern}\n"));
+    }
+    for language in &config.index.languages {
+        canonical.push_str(&format!("lang:{language}\n"));
+    }
+    canonical.push_str(&format!(
+        "gitignore:{}:{}\nhidden:{}\nsymlinks:{}\nmax_size:{}\n",
+        config.ignore.respect_gitignore,
+        config.ignore.respect_global_gitignore,
+        config.index.include_hidden,
+        config.index.follow_symlinks,
+        config.index.max_file_size_bytes,
+    ));
+    let hash = repo::content_hash(canonical.as_bytes());
+    format!("{ANALYZER_VERSION}+{}", &hash[..12.min(hash.len())])
+}
+
+/// True when the project's stored fingerprint doesn't match the current one
+/// (see [`analysis_fingerprint`]). `None` (never indexed, or an index from
+/// before the fingerprint existed) counts as changed too — one honest full
+/// reindex either way.
 pub(crate) fn analyzer_version_changed(
     conn: &Connection,
     project_id: &str,
+    fingerprint: &str,
 ) -> Result<bool, String> {
     let stored = repo::analyzer_version(conn, project_id).map_err(|e| e.to_string())?;
-    Ok(stored.as_deref() != Some(ANALYZER_VERSION))
+    Ok(stored.as_deref() != Some(fingerprint))
 }
 
 /// `codekurve index --root <path>` (task 5.5, design's shared engine):
@@ -111,7 +138,8 @@ pub(crate) fn analyzer_version_changed(
 /// detected" forever.
 pub fn index(root: &Path) -> Result<(), String> {
     let mut setup = setup_index(root)?;
-    let force_full = analyzer_version_changed(&setup.conn, &setup.project_id)?;
+    let fingerprint = analysis_fingerprint(&setup.config, &setup.aliases);
+    let force_full = analyzer_version_changed(&setup.conn, &setup.project_id, &fingerprint)?;
 
     let changes = crate::incremental::detect(
         &setup.conn,
@@ -123,7 +151,7 @@ pub fn index(root: &Path) -> Result<(), String> {
     )?;
     if changes.is_empty() {
         if force_full {
-            repo::set_analyzer_version(&setup.conn, &setup.project_id, ANALYZER_VERSION)
+            repo::set_analyzer_version(&setup.conn, &setup.project_id, &fingerprint)
                 .map_err(|e| e.to_string())?;
         }
         println!("index up to date, no changes detected");
@@ -138,7 +166,7 @@ pub fn index(root: &Path) -> Result<(), String> {
         full_reindex_threshold_pct: setup.config.index.watch.full_reindex_threshold_pct,
     };
     let outcome = crate::incremental::apply_batch(&mut setup.conn, &ctx, &changes)?;
-    repo::set_analyzer_version(&setup.conn, &setup.project_id, ANALYZER_VERSION)
+    repo::set_analyzer_version(&setup.conn, &setup.project_id, &fingerprint)
         .map_err(|e| e.to_string())?;
 
     println!(
@@ -1332,6 +1360,45 @@ mod symbol_ids_tests {
         assert_ne!(
             contains_to_ctors[0].target_symbol_id,
             contains_to_ctors[1].target_symbol_id
+        );
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+
+    /// IDX-2: anything that changes what the analyzer produces changes the
+    /// fingerprint; the order aliases were inserted in does not.
+    #[test]
+    fn analysis_fingerprint_tracks_analysis_inputs() {
+        let config = Config::default();
+        let aliases = TsconfigAliases::new();
+        let base = analysis_fingerprint(&config, &aliases);
+        assert!(base.starts_with(ANALYZER_VERSION), "{base}");
+        assert_eq!(base, analysis_fingerprint(&config, &aliases));
+
+        let mut other = config.clone();
+        other.ignore.patterns.push("**/generated/**".to_string());
+        assert_ne!(base, analysis_fingerprint(&other, &aliases));
+
+        let mut other = config.clone();
+        other.index.follow_symlinks = !other.index.follow_symlinks;
+        assert_ne!(base, analysis_fingerprint(&other, &aliases));
+
+        let mut with_alias = TsconfigAliases::new();
+        with_alias.insert("@app/*".to_string(), "src/*".to_string());
+        assert_ne!(base, analysis_fingerprint(&config, &with_alias));
+
+        let mut a = TsconfigAliases::new();
+        a.insert("@a/*".to_string(), "a/*".to_string());
+        a.insert("@b/*".to_string(), "b/*".to_string());
+        let mut b = TsconfigAliases::new();
+        b.insert("@b/*".to_string(), "b/*".to_string());
+        b.insert("@a/*".to_string(), "a/*".to_string());
+        assert_eq!(
+            analysis_fingerprint(&config, &a),
+            analysis_fingerprint(&config, &b)
         );
     }
 }
