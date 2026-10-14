@@ -646,7 +646,7 @@ fn write_json_client(
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let out = serde_json::to_string_pretty(&Value::Object(doc)).map_err(|e| e.to_string())?;
-    fs::write(path, out).map_err(|e| e.to_string())
+    safe_write(path, out)
 }
 
 fn manual_snippet(exe: &Path, root: &Path, servers_key: &str, include_type: bool) -> String {
@@ -714,7 +714,7 @@ fn write_opencode_json(path: &Path, exe: &Path, root: &Path) -> Result<(), Strin
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let out = serde_json::to_string_pretty(&Value::Object(doc)).map_err(|e| e.to_string())?;
-    fs::write(path, out).map_err(|e| e.to_string())
+    safe_write(path, out)
 }
 
 fn opencode_entry(exe: &Path, root: &Path) -> Value {
@@ -791,7 +791,7 @@ fn write_codex_toml(path: &Path, exe: &Path, root: &Path) -> Result<(), String> 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    fs::write(path, doc.to_string()).map_err(|e| e.to_string())
+    safe_write(path, doc.to_string())
 }
 
 fn manual_snippet_toml(exe: &Path, root: &Path) -> String {
@@ -840,7 +840,7 @@ fn remove_json_entry(path: &Path, servers_key: &str, apply: bool) -> Result<bool
 
     backup(path, &existing_bytes)?;
     let out = serde_json::to_string_pretty(&Value::Object(doc)).map_err(|e| e.to_string())?;
-    fs::write(path, out).map_err(|e| e.to_string())?;
+    safe_write(path, out)?;
     Ok(true)
 }
 
@@ -875,7 +875,7 @@ fn remove_codex_toml_entry(path: &Path, apply: bool) -> Result<bool, String> {
     }
 
     backup(path, &existing_bytes)?;
-    fs::write(path, doc.to_string()).map_err(|e| e.to_string())?;
+    safe_write(path, doc.to_string())?;
     Ok(true)
 }
 
@@ -886,7 +886,59 @@ fn backup(path: &Path, bytes: &[u8]) -> Result<(), String> {
         Some(ext) => format!("{}.bak", ext.to_string_lossy()),
         None => "bak".to_string(),
     });
-    fs::write(&bak, bytes).map_err(|e| format!("failed to back up {}: {e}", path.display()))
+    safe_write(&bak, bytes).map_err(|e| format!("failed to back up {}: {e}", path.display()))?;
+    // A backup of a private file (e.g. `~/.codex/config.toml`) must not be
+    // more readable than the original.
+    #[cfg(unix)]
+    if let Ok(meta) = fs::metadata(path) {
+        let _ = fs::set_permissions(&bak, meta.permissions());
+    }
+    Ok(())
+}
+
+/// Refuse to write through a symlink: a cloned repository controls its own
+/// tree, so a planted `.mcp.json` / `.mcp.json.bak` link could redirect our
+/// write onto a file such as an agent's settings.
+fn refuse_symlink(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(format!(
+            "refusing to write through symlink: {}",
+            path.display()
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Replace `path` atomically: write a sibling temp file, keep the existing
+/// file's permissions, then rename over the target. Symlinked targets are
+/// refused.
+fn safe_write(path: &Path, content: impl AsRef<[u8]>) -> Result<(), String> {
+    refuse_symlink(path)?;
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        std::io::Write::write_all(&mut file, content.as_ref())?;
+        if let Ok(meta) = fs::metadata(path) {
+            fs::set_permissions(&tmp, meta.permissions())?;
+        }
+        file.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result.map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -1266,5 +1318,62 @@ mod tests {
 
         assert!(remove_json_entry(&path, "mcpServers", false).unwrap());
         assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod safe_write_tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use tempfile::tempdir;
+
+    #[test]
+    fn backup_refuses_symlinked_bak() {
+        let dir = tempdir().unwrap();
+        let victim = dir.path().join("victim.json");
+        fs::write(&victim, "keep").unwrap();
+        let path = dir.path().join(".mcp.json");
+        symlink(&victim, dir.path().join(".mcp.json.bak")).unwrap();
+
+        let err = backup(&path, b"{\"attacker\":true}").unwrap_err();
+
+        assert!(err.contains("symlink"), "{err}");
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+    }
+
+    #[test]
+    fn write_refuses_symlinked_target() {
+        let dir = tempdir().unwrap();
+        let victim = dir.path().join("victim.json");
+        fs::write(&victim, "{}").unwrap();
+        let path = dir.path().join(".mcp.json");
+        symlink(&victim, &path).unwrap();
+
+        let err = write_json_client(&path, &exe_path(), Path::new("/proj"), "mcpServers", true)
+            .unwrap_err();
+
+        assert!(err.contains("symlink"), "{err}");
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "{}");
+    }
+
+    #[test]
+    fn safe_write_keeps_mode_and_leaves_no_temp_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        safe_write(&path, "new").unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    fn exe_path() -> PathBuf {
+        PathBuf::from("/usr/local/bin/codekurve")
     }
 }
