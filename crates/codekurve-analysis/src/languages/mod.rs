@@ -35,6 +35,24 @@ pub(crate) fn new_parser() -> tree_sitter::Parser {
     parser
 }
 
+/// TypeScript-family grammar for one file (IDX-9). `.tsx` needs the TSX
+/// grammar: the plain TypeScript grammar turns JSX into ERROR nodes. `.ts`
+/// keeps the plain grammar, since TSX reads `<T,>(x: T)` as a JSX tag. JS
+/// always uses TSX, which covers JSX.
+pub(crate) fn typescript_grammar(
+    language: LanguageId,
+    relative_path: &str,
+) -> tree_sitter::Language {
+    match language {
+        LanguageId::TypeScript if relative_path.ends_with(".tsx") => {
+            tree_sitter_typescript::LANGUAGE_TSX.into()
+        }
+        LanguageId::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        LanguageId::JavaScript => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        LanguageId::CSharp => unreachable!("TypeScript grammar requested for C#"),
+    }
+}
+
 use codekurve_core::error::Result;
 use codekurve_core::{
     Confidence, LanguageId, Provenance, RelationshipKind, SourceSpan, SymbolKind,

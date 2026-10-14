@@ -85,13 +85,14 @@ pub(crate) fn has_marker(source: &str, language: LanguageId) -> bool {
 /// Marker-gated re-parse (D1). Returns `None` on a grammar setup failure;
 /// callers already gate this behind `has_marker`, so this is only ever
 /// invoked for a file that has at least one framework marker.
-fn parse(source: &str, language: LanguageId) -> Option<Tree> {
+fn parse(source: &str, language: LanguageId, relative_path: &str) -> Option<Tree> {
     #[cfg(test)]
     PARSE_CALLS.with(|c| c.set(c.get() + 1));
 
     let grammar = match language {
-        LanguageId::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        LanguageId::JavaScript => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        LanguageId::TypeScript | LanguageId::JavaScript => {
+            crate::languages::typescript_grammar(language, relative_path)
+        }
         LanguageId::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
     };
     let mut parser = new_parser();
@@ -109,7 +110,7 @@ pub fn recognize(source: &str, language: LanguageId, analysis: &mut FileAnalysis
     if !has_marker(source, language) {
         return;
     }
-    let Some(tree) = parse(source, language) else {
+    let Some(tree) = parse(source, language, &analysis.file) else {
         return;
     };
     match language {

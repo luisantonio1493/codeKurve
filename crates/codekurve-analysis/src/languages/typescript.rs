@@ -13,8 +13,8 @@ use tree_sitter::Node;
 use crate::extract::{find_child, span_of};
 use crate::ir::{EdgeTarget, ExtractedRelationship, ExtractedSymbol, FileAnalysis};
 use crate::languages::{
-    analyzer_for, new_parser, push_unresolved_edge, resolve_pending, LanguageAnalyzer, PendingRel,
-    MAX_AST_DEPTH,
+    analyzer_for, new_parser, push_unresolved_edge, resolve_pending, typescript_grammar,
+    LanguageAnalyzer, PendingRel, MAX_AST_DEPTH,
 };
 
 /// One-field struct so a single implementation serves both TypeScript and
@@ -82,15 +82,11 @@ fn analyze(source: &str, language: LanguageId, relative_path: &str) -> Result<Fi
     // ponytail: one grammar for both languages — the TypeScript grammar parses
     // plain JS as a subset, TSX covers JS/JSX. Add tree-sitter-javascript only
     // if fidelity gaps appear (§12 lists it for later).
-    let grammar = match language {
-        LanguageId::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
-        LanguageId::JavaScript => tree_sitter_typescript::LANGUAGE_TSX,
-        LanguageId::CSharp => unreachable!("TypeScriptAnalyzer only serves TS/JS"),
-    };
+    let grammar = typescript_grammar(language, relative_path);
 
     let mut parser = new_parser();
     parser
-        .set_language(&grammar.into())
+        .set_language(&grammar)
         .map_err(|e| Error::Parse(e.to_string()))?;
 
     let tree = parser
