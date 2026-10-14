@@ -184,7 +184,10 @@ impl<'a> LazyEdges<'a> {
         self.cache.get(node).cloned().unwrap_or_default()
     }
 
-    /// One query for `nodes`. Per-node edge order matches a full table scan
+    /// One query for `nodes`. `+project_id` keeps the planner off the
+    /// project-wide index (it would scan every edge of the project once per
+    /// batch) and on the per-symbol `source_kind`/`target_kind` index.
+    /// Per-node edge order matches a full table scan
     /// (`ORDER BY rowid`), so BFS tie-breaking is identical to the in-memory
     /// path.
     fn load(&mut self, nodes: &[String]) -> Result<()> {
@@ -197,7 +200,7 @@ impl<'a> LazyEdges<'a> {
         let sql = format!(
             "SELECT {node_col}, {other_col}, kind, confidence, provenance
              FROM relationships
-             WHERE project_id = ? AND target_symbol_id IS NOT NULL
+             WHERE +project_id = ? AND target_symbol_id IS NOT NULL
                AND {node_col} IN ({placeholders})
              ORDER BY rowid"
         );
