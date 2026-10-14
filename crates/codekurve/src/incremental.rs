@@ -445,6 +445,7 @@ mod tests {
             max_file_size_bytes: 2_097_152,
             max_total_files: 0,
             languages: vec![LanguageId::TypeScript],
+            ignore_patterns: Vec::new(),
         }
     }
 

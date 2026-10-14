@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use codekurve_core::LanguageId;
+use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
 
 /// A source file selected by discovery.
@@ -30,6 +31,9 @@ pub struct DiscoveryOptions {
     pub max_total_files: usize,
     /// Languages to include. Empty means "all supported".
     pub languages: Vec<LanguageId>,
+    /// Gitignore-style globs (`config.ignore.patterns`) excluded from the walk
+    /// on top of the ignore-file rules. Empty applies no extra exclusions.
+    pub ignore_patterns: Vec<String>,
 }
 
 impl DiscoveryOptions {
@@ -50,6 +54,9 @@ pub fn discover(
     options: &DiscoveryOptions,
 ) -> Result<Vec<DiscoveredFile>, codekurve_core::Error> {
     let mut builder = WalkBuilder::new(root);
+    if !options.ignore_patterns.is_empty() {
+        builder.overrides(build_ignore_overrides(root, &options.ignore_patterns)?);
+    }
     builder
         .hidden(!options.include_hidden)
         .git_ignore(options.respect_gitignore)
@@ -99,6 +106,31 @@ pub fn discover(
     Ok(files)
 }
 
+/// Compile `ignore.patterns` into walk overrides. Override globs are a
+/// whitelist by default, so each pattern is added as a `!` negation: matching
+/// paths are excluded and every other path stays eligible.
+fn build_ignore_overrides(
+    root: &Path,
+    patterns: &[String],
+) -> Result<ignore::overrides::Override, codekurve_core::Error> {
+    let invalid = |pattern: &str, err: ignore::Error| codekurve_core::Error::InvalidIgnorePattern {
+        pattern: pattern.to_string(),
+        reason: err.to_string(),
+    };
+    let mut builder = OverrideBuilder::new(root);
+    for pattern in patterns {
+        builder
+            .add(&format!("!{pattern}"))
+            .map_err(|err| invalid(pattern, err))?;
+    }
+    builder
+        .build()
+        .map_err(|err| codekurve_core::Error::InvalidIgnorePattern {
+            pattern: patterns.join(", "),
+            reason: err.to_string(),
+        })
+}
+
 /// Build a `/`-separated path relative to `root`, or `None` if `path` is not
 /// under `root`.
 fn relative_slash_path(root: &Path, path: &Path) -> Option<String> {
@@ -124,6 +156,7 @@ mod tests {
             max_file_size_bytes: 2_097_152,
             max_total_files: 0,
             languages: vec![LanguageId::TypeScript, LanguageId::JavaScript],
+            ignore_patterns: Vec::new(),
         }
     }
 
@@ -221,5 +254,54 @@ mod tests {
         let found = discover(root, &opts).unwrap();
 
         assert_eq!(found.len(), 3);
+    }
+
+    /// `ignore.patterns` (default secret/minified/build globs) must exclude
+    /// matching files even when they are not gitignored. Hidden files are
+    /// included so `.env.ts` is only excluded by the pattern.
+    #[test]
+    fn ignore_patterns_exclude_secret_minified_and_build_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("src")).unwrap();
+        fs::create_dir(root.join("dist")).unwrap();
+        fs::write(root.join("src").join("a.ts"), "export class A {}").unwrap();
+        fs::write(root.join("src").join("app.min.js"), "function a(){}").unwrap();
+        fs::write(root.join(".env.ts"), "export const k = 1;").unwrap();
+        fs::write(root.join("secrets.ts"), "export const s = 1;").unwrap();
+        fs::write(root.join("dist").join("x.ts"), "export class X {}").unwrap();
+
+        let mut opts = options();
+        opts.include_hidden = true;
+        opts.ignore_patterns = ["**/.env*", "**/secrets.*", "**/dist/**", "**/*.min.js"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let found: Vec<String> = discover(root, &opts)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.relative_path)
+            .collect();
+
+        assert_eq!(found, vec!["src/a.ts".to_string()]);
+    }
+
+    /// A pattern that is not a valid glob fails discovery, naming the pattern,
+    /// instead of silently indexing files it was meant to exclude.
+    #[test]
+    fn invalid_ignore_pattern_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("a.ts"), "").unwrap();
+
+        let mut opts = options();
+        opts.ignore_patterns = vec!["src/[unclosed".to_string()];
+        let err = discover(root, &opts).unwrap_err();
+
+        assert!(matches!(
+            err,
+            codekurve_core::Error::InvalidIgnorePattern { ref pattern, .. }
+                if pattern == "src/[unclosed"
+        ));
     }
 }
