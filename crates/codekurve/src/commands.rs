@@ -149,15 +149,6 @@ pub fn index(root: &Path) -> Result<(), String> {
         None,
         force_full,
     )?;
-    if changes.is_empty() {
-        if force_full {
-            repo::set_analyzer_version(&setup.conn, &setup.project_id, &fingerprint)
-                .map_err(|e| e.to_string())?;
-        }
-        println!("index up to date, no changes detected");
-        return Ok(());
-    }
-
     let ctx = crate::incremental::IndexContext {
         root: &setup.root,
         project_id: &setup.project_id,
@@ -169,6 +160,15 @@ pub fn index(root: &Path) -> Result<(), String> {
     repo::set_analyzer_version(&setup.conn, &setup.project_id, &fingerprint)
         .map_err(|e| e.to_string())?;
 
+    crate::incremental::warn_unverified(&outcome);
+    if outcome.files_changed == 0 && outcome.files_deleted == 0 {
+        if outcome.unverified == 0 {
+            println!("index up to date, no changes detected");
+        } else {
+            println!("no changes in the files that could be read");
+        }
+        return Ok(());
+    }
     println!(
         "indexed {} file(s) changed, {} deleted{}",
         outcome.files_changed,

@@ -33,6 +33,11 @@ pub enum FileChange {
         relative_path: String,
         modified_ns: i64,
     },
+    /// Stored file the engine could not look at (unreadable directory or
+    /// file): its rows are kept, but the index cannot be called verified.
+    Unverified {
+        relative_path: String,
+    },
 }
 
 /// Everything `apply_batch` needs beyond `changes` itself (design
@@ -55,6 +60,9 @@ pub struct BatchOutcome {
     pub files_changed: usize,
     pub files_deleted: usize,
     pub fell_back_to_full_reindex: bool,
+    /// Indexed files that could not be read or walked this time; their rows
+    /// were kept and the index is left marked stale until they can be.
+    pub unverified: usize,
 }
 
 /// Task 5.1/7.6 (design "Interfaces" + "walk-intersection handles it"):
@@ -158,6 +166,9 @@ pub fn detect(
         }
 
         let Ok(bytes) = fs::read(&file.absolute_path) else {
+            changes.push(FileChange::Unverified {
+                relative_path: file.relative_path.clone(),
+            });
             continue;
         };
         if prior.content_hash.as_deref() == Some(repo::content_hash(&bytes).as_str()) {
@@ -180,6 +191,9 @@ pub fn detect(
         }
         // The walk could not look here: absence is not evidence of deletion.
         if report.is_unverified(path) {
+            changes.push(FileChange::Unverified {
+                relative_path: path.clone(),
+            });
             continue;
         }
         changes.push(FileChange::Deleted {
@@ -232,14 +246,27 @@ pub fn apply_batch(
     if !touched.is_empty() {
         repo::touch_files(conn, ctx.project_id, &touched).map_err(|e| e.to_string())?;
     }
+    let unverified = changes
+        .iter()
+        .filter(|c| matches!(c, FileChange::Unverified { .. }))
+        .count();
     let real: Vec<FileChange> = changes
         .iter()
-        .filter(|c| !matches!(c, FileChange::Touched { .. }))
+        .filter(|c| {
+            !matches!(
+                c,
+                FileChange::Touched { .. } | FileChange::Unverified { .. }
+            )
+        })
         .cloned()
         .collect();
     let changes = real.as_slice();
     if changes.is_empty() {
-        return Ok(BatchOutcome::default());
+        record_unverified(conn, ctx.project_id, unverified)?;
+        return Ok(BatchOutcome {
+            unverified,
+            ..BatchOutcome::default()
+        });
     }
     let ts = repo::now_ts();
 
@@ -260,11 +287,50 @@ pub fn apply_batch(
     // that's a deliberately accepted edge case (D only ever narrows what
     // gets reparsed further, it never breaks correctness).
     let tracked = repo::count_files(conn, ctx.project_id).map_err(|e| e.to_string())?;
-    if is_oversized(changes.len(), tracked, ctx.full_reindex_threshold_pct) {
-        return apply_via_full_reindex(conn, ctx);
-    }
+    let mut outcome = if is_oversized(changes.len(), tracked, ctx.full_reindex_threshold_pct) {
+        apply_via_full_reindex(conn, ctx)?
+    } else {
+        apply_incremental_changes(conn, ctx, changes, &ts)?
+    };
+    // The batch above marked the index verified; files we could not look at
+    // take that back.
+    record_unverified(conn, ctx.project_id, unverified)?;
+    outcome.unverified = unverified;
+    Ok(outcome)
+}
 
-    apply_incremental_changes(conn, ctx, changes, &ts)
+/// Publish the verification state after a pass: with unverifiable files the
+/// index is left stale (`pending_files` = how many), otherwise a stale mark
+/// left by an earlier failure is cleared.
+fn record_unverified(
+    conn: &mut Connection,
+    project_id: &str,
+    unverified: usize,
+) -> Result<(), String> {
+    let ts = repo::now_ts();
+    if unverified > 0 {
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        repo::set_pending_files(&tx, project_id, &ts, unverified as i64)
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    } else if repo::pending_files(conn, project_id).map_err(|e| e.to_string())? > 0 {
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        repo::mark_verified(&tx, project_id, &ts).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    } else {
+        Ok(())
+    }
+}
+
+/// One stderr line when files could not be verified, shared by `index`,
+/// `watch` and MCP reindex.
+pub fn warn_unverified(outcome: &BatchOutcome) {
+    if outcome.unverified > 0 {
+        eprintln!(
+            "warning: {} indexed file(s) could not be read; their existing rows were kept and the index is marked stale until they can be verified",
+            outcome.unverified
+        );
+    }
 }
 
 /// The last path segment an import of this file would end in: the file stem,
@@ -361,6 +427,7 @@ fn apply_via_full_reindex(
         files_changed: outcome.files,
         files_deleted: 0,
         fell_back_to_full_reindex: true,
+        unverified: 0,
     })
 }
 
@@ -380,7 +447,7 @@ fn apply_incremental_changes(
         match change {
             FileChange::Created(f) | FileChange::Modified(f) => created_or_modified.push(f.clone()),
             FileChange::Deleted { relative_path } => deleted.push(relative_path.clone()),
-            FileChange::Touched { .. } => {} // handled in `apply_batch`
+            FileChange::Touched { .. } | FileChange::Unverified { .. } => {} // handled in `apply_batch`
         }
     }
     let b_paths: HashSet<String> = created_or_modified
@@ -525,6 +592,7 @@ fn apply_incremental_changes(
         files_changed: b_paths.len(),
         files_deleted: deleted.len(),
         fell_back_to_full_reindex: false,
+        unverified: 0,
     })
 }
 
@@ -1021,6 +1089,72 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, FileChange::Deleted { .. })),
             "unreadable directory read as deletion: {changes:?}"
+        );
+    }
+
+    /// IDX-1 (degraded status): files the engine could not verify keep their
+    /// rows but must not be reported as a verified index.
+    #[cfg(unix)]
+    #[test]
+    fn unverified_files_mark_the_index_stale_until_they_can_be_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std_fs::create_dir(root.join("locked")).unwrap();
+        for i in 0..10 {
+            std_fs::write(root.join(format!("f{i}.ts")), "export const k = 1;\n").unwrap();
+        }
+        std_fs::write(root.join("locked/b.ts"), "export const b = 1;\n").unwrap();
+        let mut conn = db::open_in_memory().unwrap();
+        let project = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        sync(&mut conn, &project, root).unwrap();
+        assert_eq!(repo::pending_files(&conn, &project).unwrap(), 0);
+
+        if !deny(&root.join("locked")) {
+            return;
+        }
+        let outcome = sync(&mut conn, &project, root);
+        let pending = repo::pending_files(&conn, &project).unwrap();
+        let rows = repo::count_files(&conn, &project).unwrap();
+        allow(&root.join("locked"));
+
+        let outcome = outcome.unwrap();
+        assert_eq!(outcome.unverified, 1);
+        assert_eq!(
+            pending, 1,
+            "an unverifiable file must leave the index stale"
+        );
+        assert_eq!(rows, 11, "its rows are kept");
+
+        let outcome = sync(&mut conn, &project, root).unwrap();
+        assert_eq!(outcome.unverified, 0);
+        assert_eq!(repo::pending_files(&conn, &project).unwrap(), 0);
+    }
+
+    /// A file that changed and then became unreadable is unverified too, not
+    /// silently "unchanged".
+    #[cfg(unix)]
+    #[test]
+    fn modified_then_unreadable_file_is_unverified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std_fs::write(root.join("a.ts"), "export const a = 1;\n").unwrap();
+        let mut conn = db::open_in_memory().unwrap();
+        let project = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        seed_indexed(&mut conn, &project, root, &["a.ts"]);
+
+        std_fs::write(root.join("a.ts"), "export const a = 22;\n").unwrap();
+        if !deny(&root.join("a.ts")) {
+            return;
+        }
+        let changes = detect(&conn, &project, root, &discovery_opts(), None, false);
+        allow(&root.join("a.ts"));
+
+        let changes = changes.unwrap();
+        assert!(
+            changes.iter().any(
+                |c| matches!(c, FileChange::Unverified { relative_path } if relative_path == "a.ts")
+            ),
+            "got {changes:?}"
         );
     }
 

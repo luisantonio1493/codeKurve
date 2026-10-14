@@ -107,17 +107,6 @@ fn reconcile(setup: &mut IndexSetup) -> Result<(), String> {
         None,
         force_full,
     )?;
-    if changes.is_empty() {
-        if force_full {
-            codekurve_store::repo::set_analyzer_version(
-                &setup.conn,
-                &setup.project_id,
-                &fingerprint,
-            )
-            .map_err(|e| e.to_string())?;
-        }
-        return Ok(());
-    }
     let ctx = IndexContext {
         root: &setup.root,
         project_id: &setup.project_id,
@@ -128,6 +117,10 @@ fn reconcile(setup: &mut IndexSetup) -> Result<(), String> {
     let outcome = incremental::apply_batch(&mut setup.conn, &ctx, &changes)?;
     codekurve_store::repo::set_analyzer_version(&setup.conn, &setup.project_id, &fingerprint)
         .map_err(|e| e.to_string())?;
+    incremental::warn_unverified(&outcome);
+    if changes.is_empty() {
+        return Ok(());
+    }
     println!(
         "reconciled {} file(s) changed, {} deleted{}",
         outcome.files_changed,
@@ -171,9 +164,6 @@ fn apply_flush(setup: &mut IndexSetup, paths: &HashSet<PathBuf>) -> Result<Flush
             return Ok(Flush::Retry);
         }
     };
-    if changes.is_empty() {
-        return Ok(Flush::Done);
-    }
     let ctx = IndexContext {
         root: &setup.root,
         project_id: &setup.project_id,
@@ -183,6 +173,10 @@ fn apply_flush(setup: &mut IndexSetup, paths: &HashSet<PathBuf>) -> Result<Flush
     };
     match incremental::apply_batch(&mut setup.conn, &ctx, &changes) {
         Ok(outcome) => {
+            incremental::warn_unverified(&outcome);
+            if changes.is_empty() {
+                return Ok(Flush::Done);
+            }
             println!(
                 "indexed {} file(s) changed, {} deleted{}",
                 outcome.files_changed,
