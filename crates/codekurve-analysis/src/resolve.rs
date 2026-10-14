@@ -475,6 +475,12 @@ fn resolve_one(
 /// analyzer (design "Resolution Changes") rather than a shared free
 /// function, so a second language never silently inherits TypeScript's
 /// rules; language-filtered candidates land in a later PR (PR5).
+/// A by-name hit with more candidates than this is noise, not information:
+/// on a real C# API `x.Name` fanned out to 450 same-named properties and made
+/// 90% of the index. Past the cap no edges are emitted and the reference is
+/// kept as unresolved ("ambiguous: N candidates") so it stays discoverable.
+pub const MAX_AMBIGUOUS_CANDIDATES: usize = 8;
+
 fn resolve_by_name(
     source_language: LanguageId,
     rel: &ExtractedRelationship,
@@ -511,6 +517,13 @@ fn resolve_by_name(
                 Confidence::High,
             );
             report.resolved += 1;
+        }
+        many if many.len() > MAX_AMBIGUOUS_CANDIDATES => {
+            let mut reference =
+                unresolved_ref(rel, text, &format!("ambiguous: {} candidates", many.len()));
+            reference.candidate_count = many.len();
+            unresolved.push(reference);
+            report.unresolved += 1;
         }
         many => {
             // Never silently pick one (§20.4/§27.4): one Low-confidence,
@@ -1277,6 +1290,56 @@ mod tests {
         assert!(calls.iter().all(|r| r.confidence == Confidence::Low));
         assert!(calls.iter().all(|r| r.provenance == Provenance::Heuristic));
         assert!(files[0].unresolved.is_empty());
+    }
+
+    fn caller_with_candidates(n: usize) -> Vec<FileAnalysis> {
+        let mut files = vec![analyzed(
+            "src/caller.ts",
+            "function run() { return doWork(); }\n",
+        )];
+        for i in 0..n {
+            files.push(analyzed(
+                &format!("src/worker{i}.ts"),
+                "export function doWork() { return 1; }\n",
+            ));
+        }
+        files
+    }
+
+    /// At the cap, every candidate still gets its Low-confidence edge.
+    #[test]
+    fn candidates_at_the_cap_still_produce_edges() {
+        let mut files = caller_with_candidates(MAX_AMBIGUOUS_CANDIDATES);
+        let report = resolve(&mut files, &TsconfigAliases::new());
+
+        let calls = files[0]
+            .relationships
+            .iter()
+            .filter(|r| r.kind == RelationshipKind::Calls)
+            .count();
+        assert_eq!(calls, MAX_AMBIGUOUS_CANDIDATES);
+        assert_eq!(report.unresolved, 0);
+    }
+
+    /// Past the cap a by-name hit is noise, not information: no edges, one
+    /// unresolved row that says how many candidates there were.
+    #[test]
+    fn candidates_over_the_cap_become_one_unresolved_reference() {
+        let n = MAX_AMBIGUOUS_CANDIDATES + 1;
+        let mut files = caller_with_candidates(n);
+        let report = resolve(&mut files, &TsconfigAliases::new());
+
+        assert!(files[0]
+            .relationships
+            .iter()
+            .all(|r| r.kind != RelationshipKind::Calls));
+        assert_eq!(report.unresolved, 1);
+        let unresolved = &files[0].unresolved;
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].target_text, "doWork");
+        assert_eq!(unresolved[0].reason, format!("ambiguous: {n} candidates"));
+        assert_eq!(unresolved[0].candidate_count, n);
+        assert_eq!(unresolved[0].confidence, Confidence::Unresolved);
     }
 
     /// Task 4.1/4.2 (design "Baseline for re-resolution"): `resolve_with`
