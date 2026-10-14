@@ -169,6 +169,18 @@ pub fn prune_nulls(mut row: serde_json::Value) -> serde_json::Value {
     row
 }
 
+/// Remove `keys` from a JSON object row. Used for MCP fields that are
+/// derivable from `qualified_name` (`path` is everything before the first
+/// `::`, or all of it for a file-level symbol).
+pub fn drop_keys(mut row: serde_json::Value, keys: &[&str]) -> serde_json::Value {
+    if let Some(object) = row.as_object_mut() {
+        for key in keys {
+            object.remove(*key);
+        }
+    }
+    row
+}
+
 /// [`prune_nulls`] all the way down: object fields that are `null` are
 /// dropped at every depth (array elements are kept as they are).
 pub fn prune_nulls_deep(value: serde_json::Value) -> serde_json::Value {
@@ -303,7 +315,6 @@ pub fn reached_row(s: &Session, r: &traverse::Reached) -> Result<serde_json::Val
         "symbol_id": r.symbol_id,
         "qualified_name": sym.as_ref().map(|sym| sym.qualified_name.clone()),
         "depth": r.depth,
-        "path": sym.as_ref().map(|sym| sym.relative_path.clone()),
         "start_line": sym.as_ref().map(|sym| sym.span.start_line),
         "end_line": sym.as_ref().map(|sym| sym.span.end_line),
         "confidence": r.via.as_ref().map(|e| e.confidence.clone()),
@@ -392,8 +403,6 @@ pub fn relationship_anchor(r: &StoredRelationship, anchor_is_target: bool) -> se
         serde_json::json!({
             "symbol_id": r.source_symbol_id,
             "qualified_name": r.source_qualified_name,
-            // Every row's `path` is this anchor's own file: said once here.
-            "path": r.source_relative_path,
         })
     }
 }
@@ -412,7 +421,6 @@ pub fn relationship_row_compact(
             "source_symbol_id": r.source_symbol_id,
             "source_qualified_name": r.source_qualified_name,
             "kind": r.kind,
-            "path": r.source_relative_path,
             "start_line": r.start_line,
             "start_column": r.start_column,
             "confidence": r.confidence,

@@ -41,6 +41,7 @@ pub struct ReindexInput {}
 #[serde(deny_unknown_fields)]
 pub struct SearchSymbolsInput {
     pub query: String,
+    /// Max rows (default 50, max 500).
     pub limit: Option<u32>,
 }
 
@@ -50,7 +51,9 @@ pub struct SearchSymbolsInput {
 #[serde(deny_unknown_fields)]
 pub struct FindRoutesInput {
     pub query: Option<String>,
+    /// Max rows (default 50, max 500).
     pub limit: Option<u32>,
+    /// Rows to skip (default 0).
     pub offset: Option<u32>,
 }
 
@@ -61,7 +64,9 @@ pub struct FindRoutesInput {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct GetSymbolInput {
     pub id: String,
+    /// Extra source lines on each side (default 0, max 200).
     pub ctx_lines: Option<u32>,
+    /// Read the source (default true); false returns only the location.
     pub include_source: Option<bool>,
 }
 
@@ -73,16 +78,11 @@ pub struct GetSymbolInput {
 pub struct RelationshipInput {
     pub symbol_id: Option<String>,
     pub symbol_name: Option<String>,
-    /// Filter by resolution confidence (`exact`/`high`/`medium`/`low`/
-    /// `unresolved`, floor inclusive). Caveat: the heuristic by-name resolver
-    /// tags most real hits `low` whenever a name collides with another
-    /// project symbol of the same name — common in larger codebases (e.g. a
-    /// property name reused across sibling classes). `medium`/`high` can
-    /// come back empty even when `low`/unfiltered has real results; prefer
-    /// leaving this unset for consumer-discovery and triaging by `reason`/
-    /// `provenance` instead of filtering confidence away.
+    /// Confidence floor: exact|high|medium|low|unresolved. By-name matches are often `low`; leave unset to see them.
     pub min_confidence: Option<String>,
+    /// Max rows (default 50, max 500).
     pub limit: Option<u32>,
+    /// Rows to skip (default 0).
     pub offset: Option<u32>,
 }
 
@@ -95,7 +95,9 @@ pub struct FindUnresolvedInput {
     pub target_text: Option<String>,
     pub symbol_id: Option<String>,
     pub symbol_name: Option<String>,
+    /// Max rows (default 50, max 500).
     pub limit: Option<u32>,
+    /// Rows to skip (default 0).
     pub offset: Option<u32>,
 }
 
@@ -106,14 +108,9 @@ pub struct TracePathInput {
     pub symbol_id: Option<String>,
     pub symbol_name: Option<String>,
     pub to: String,
-    /// Filter by resolution confidence (`exact`/`high`/`medium`/`low`/
-    /// `unresolved`, floor inclusive). Caveat: the heuristic by-name resolver
-    /// tags most real hits `low` whenever a name collides with another
-    /// project symbol of the same name — common in larger codebases (e.g. a
-    /// property name reused across sibling classes). `medium`/`high` can
-    /// come back empty even when `low`/unfiltered has real results; prefer
-    /// leaving this unset and triaging by `reason`/`provenance` instead.
+    /// Confidence floor: exact|high|medium|low|unresolved. By-name matches are often `low`; leave unset to see them.
     pub min_confidence: Option<String>,
+    /// Max hops (default 10).
     pub depth: Option<u32>,
 }
 
@@ -124,15 +121,9 @@ pub struct TracePathInput {
 pub struct AnalyzeImpactInput {
     pub symbol_id: Option<String>,
     pub symbol_name: Option<String>,
-    /// Filter by resolution confidence (`exact`/`high`/`medium`/`low`/
-    /// `unresolved`, floor inclusive). Caveat: the heuristic by-name resolver
-    /// tags most real hits `low` whenever a name collides with another
-    /// project symbol of the same name — common in larger codebases (e.g. a
-    /// property name reused across sibling classes). `medium`/`high` can
-    /// come back empty even when `low`/unfiltered has real results; prefer
-    /// leaving this unset for consumer-discovery and triaging by `reason`/
-    /// `provenance` instead of filtering confidence away.
+    /// Confidence floor: exact|high|medium|low|unresolved. By-name matches are often `low`; leave unset to see them.
     pub min_confidence: Option<String>,
+    /// Max hops (default 10).
     pub depth: Option<u32>,
 }
 
@@ -186,22 +177,17 @@ impl CodeKurve {
             .rows
             .iter()
             .map(|sym| {
-                query::prune_nulls(serde_json::json!({
+                // `name` and `path` are derivable from `qualified_name`
+                // (`<path>::<Scope>.<name>`), and every symbol row is
+                // tree-sitter / high confidence: none of that is repeated.
+                serde_json::json!({
                     "id": sym.id,
-                    "name": sym.name,
                     "qualified_name": sym.qualified_name,
                     "kind": sym.kind,
                     "language": sym.language,
-                    "path": sym.relative_path,
                     "start_line": sym.span.start_line,
                     "end_line": sym.span.end_line,
-                    // ponytail: `reindex` hardcodes provenance/confidence at
-                    // write time (codekurve-store::repo::insert_file) — no
-                    // per-symbol variance yet to read back, so these mirror
-                    // that constant rather than a stored column.
-                    "confidence": "high",
-                    "provenance": "tree-sitter",
-                }))
+                })
             })
             .collect();
         drop(session);
@@ -249,7 +235,7 @@ impl CodeKurve {
         let rows: Vec<_> = page
             .rows
             .iter()
-            .map(|r| query::prune_nulls(query::relationship_row(r)))
+            .map(|r| query::drop_keys(query::prune_nulls(query::relationship_row(r)), &["path"]))
             .collect();
         drop(session);
 
@@ -309,15 +295,11 @@ impl CodeKurve {
 
         let mut row = query::prune_nulls(serde_json::json!({
             "id": sym.id,
-            "name": sym.name,
             "qualified_name": sym.qualified_name,
             "kind": sym.kind,
             "language": sym.language,
-            "path": sym.relative_path,
             "start_line": sym.span.start_line,
             "end_line": sym.span.end_line,
-            "confidence": "high",
-            "provenance": "tree-sitter",
             "source": source,
             // Distinct from the project-level stale warning (spec
             // "get_symbol Reads Live Source and Flags Drift"): this flags
@@ -369,7 +351,7 @@ impl CodeKurve {
     }
 
     #[tool(
-        description = "Explain why a relationship is missing. Reach for this when find_implementations/find_callers/find_references come back empty for a symbol that clearly ought to have relationships: the analyzer records every reference it could not resolve, with the reason it stopped, instead of guessing an edge. Typical causes are a target defined outside the indexed project (an external base class or interface, e.g. a C# `class X : IFoo` where `IFoo` comes from a NuGet package and base-class vs interface is undeterminable) or a name with zero/ambiguous candidates. Filter by target_text (exact match on the name as written in the source), by symbol_id/symbol_name, or pass nothing to list the whole project."
+        description = "Explain a missing relationship: lists references the analyzer could not resolve, with the reason (e.g. external base class, no or ambiguous candidates). Use when find_callers/find_implementations come back empty. Filter by target_text (exact), symbol_id/symbol_name, or none for all"
     )]
     fn codekurve_find_unresolved(
         &self,
@@ -399,7 +381,7 @@ impl CodeKurve {
         let rows: Vec<_> = page
             .rows
             .iter()
-            .map(|r| query::prune_nulls(query::unresolved_row(r)))
+            .map(|r| query::drop_keys(query::prune_nulls(query::unresolved_row(r)), &["path"]))
             .collect();
         drop(session);
 
@@ -526,7 +508,7 @@ impl CodeKurve {
             "symbols": data.symbols,
             "relationships": data.relationships,
             "languages": languages,
-            "entry_points": data.entry_points.iter().map(|r| query::prune_nulls(query::relationship_row(r))).collect::<Vec<_>>(),
+            "entry_points": data.entry_points.iter().map(|r| query::drop_keys(query::prune_nulls(query::relationship_row(r)), &["path"])).collect::<Vec<_>>(),
         });
         let envelope = query::mcp_envelope(&project, result, warnings, false, None);
         Ok(CallToolResult::success(vec![ContentBlock::text(

@@ -7,7 +7,7 @@ All notable changes to this project are documented here. Format follows
 
 ### Changed
 
-- MCP responses use `schema_version` 2: `null` fields and an empty `warnings` are omitted; `trace_path` returns only the nodes on the found path (plus `reached_count`) instead of every visited node; `analyze_impact`/`trace_path` rows carry `qualified_name`; `find_callees` states the shared `path` once in the anchor; `truncated_reason` is reported; `search_symbols` reports `truncated` when more matches exist. The CLI `--json` output is unchanged (version 1)
+- MCP responses use `schema_version` 2: `null` fields and an empty `warnings` are omitted; `trace_path` returns only the nodes on the found path (plus `reached_count`) instead of every visited node; `analyze_impact`/`trace_path` rows carry `qualified_name`; rows no longer carry `path`/`name` (derivable from `qualified_name`) or the constant `confidence`/`provenance` on symbol rows; tool descriptions and schema text are about 23% shorter; `truncated_reason` is reported; `search_symbols` reports `truncated` when more matches exist. The CLI `--json` output is unchanged (version 1)
 
 ### Fixed
 

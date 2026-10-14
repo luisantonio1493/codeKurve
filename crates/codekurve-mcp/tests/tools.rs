@@ -275,7 +275,9 @@ fn all_read_tools_return_the_28_3_envelope() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|row| row["name"] == "Submit"));
+        .any(|row| row["qualified_name"]
+            .as_str()
+            .is_some_and(|qn| qn.ends_with(".Submit"))));
 
     // A page that merely hit the limit says so (one extra row is fetched to
     // tell it from a page that is simply complete).
@@ -315,12 +317,32 @@ fn all_read_tools_return_the_28_3_envelope() {
     let hits = envelope["result"].as_array().unwrap();
     assert!(!hits.is_empty());
     let hit = &hits[0];
-    for field in ["path", "start_line", "end_line", "confidence", "provenance"] {
+    for field in [
+        "id",
+        "qualified_name",
+        "kind",
+        "language",
+        "start_line",
+        "end_line",
+    ] {
         assert!(
             hit.get(field).is_some(),
             "search row missing {field:?}: {hit}"
         );
     }
+    // Derivable or constant fields are not sent: `path` is the part of
+    // `qualified_name` before the first `::`, `name` its last segment, and
+    // symbol rows are always tree-sitter / high confidence.
+    for field in ["path", "name", "confidence", "provenance"] {
+        assert!(
+            hit.get(field).is_none(),
+            "search row must not repeat {field:?}: {hit}"
+        );
+    }
+    assert_eq!(
+        hit["qualified_name"].as_str().unwrap().split("::").next(),
+        Some("src/a.ts")
+    );
     let symbol_id = hit["id"].as_str().unwrap().to_string();
 
     // get_symbol, chained off the search hit's id (design "SymbolHit carries
@@ -356,13 +378,14 @@ fn all_read_tools_return_the_28_3_envelope() {
         envelope["result"]["anchor"]["qualified_name"],
         "src/a.ts::getEligibility"
     );
-    for field in ["path", "start_line", "confidence", "provenance"] {
+    for field in ["start_line", "confidence", "provenance"] {
         assert!(
             rows[0].get(field).is_some(),
             "caller row missing {field:?}: {}",
             rows[0]
         );
     }
+    assert!(rows[0].get("path").is_none(), "{}", rows[0]);
     assert!(
         rows[0].get("target_qualified_name").is_none(),
         "caller row should not repeat the anchor: {}",
@@ -395,9 +418,7 @@ fn all_read_tools_return_the_28_3_envelope() {
         "src/a.ts::callLocal"
     );
     assert!(envelope["result"]["anchor"].get("external").is_none());
-    // Every callee row is in the anchor's own file: `path` lives on the
-    // anchor once, not on each row.
-    assert_eq!(envelope["result"]["anchor"]["path"], "src/a.ts");
+    assert!(envelope["result"]["anchor"].get("path").is_none());
     assert!(envelope["result"]["rows"][0].get("path").is_none());
 
     // find_references: same underlying rows as find_callers here (no
@@ -431,13 +452,14 @@ fn all_read_tools_return_the_28_3_envelope() {
     assert_eq!(envelope["total"], 1);
     assert_eq!(rows[0]["target_text"], "missingThing");
     assert_eq!(rows[0]["source_qualified_name"], "src/b.ts::callGhost");
-    for field in ["path", "kind", "reason", "confidence", "candidate_count"] {
+    for field in ["kind", "reason", "confidence", "candidate_count"] {
         assert!(
             rows[0].get(field).is_some(),
             "unresolved row missing {field:?}: {}",
             rows[0]
         );
     }
+    assert!(rows[0].get("path").is_none(), "{}", rows[0]);
     assert!(rows[0]["reason"].as_str().unwrap().contains("no matching"));
 
     // …and the exact-target filter, plus a miss returning an empty page
@@ -469,7 +491,7 @@ fn all_read_tools_return_the_28_3_envelope() {
     assert_eq!(path.len(), 2, "{envelope}");
     assert_eq!(path[0]["qualified_name"], "src/a.ts::callLocal");
     assert_eq!(path[1]["qualified_name"], "src/a.ts::getEligibility");
-    for field in ["path", "start_line", "end_line"] {
+    for field in ["start_line", "end_line"] {
         assert!(
             path[1].get(field).is_some(),
             "path row missing {field:?}: {}",

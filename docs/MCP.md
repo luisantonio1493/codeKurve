@@ -47,11 +47,18 @@ Every response is one JSON envelope:
 first), `result.path_found` and `result.reached_count` (how many nodes the
 search visited) — never the whole visited frontier. `analyze_impact` rows
 carry `qualified_name`, so a node can be read without a follow-up
-`get_symbol`. `find_callees` states the shared file once in `result.anchor.path`
-instead of on every row. `codekurve_search_symbols` sets `truncated` when
+`get_symbol`. `codekurve_search_symbols` sets `truncated` when
 more matches exist than `limit` (which is capped at `queries.max_limit`).
 `get_symbol` omits `source_truncated` unless the snippet was cut at
 `queries.max_snippet_bytes`.
+
+Derivable or constant fields are not repeated. A symbol's file is the part
+of its `qualified_name` before the first `::` (the whole name for a
+file-level symbol), and its short name is the last segment, so rows do not
+carry `path` or `name`. Symbol rows (`search_symbols`, `get_symbol`) are
+always tree-sitter provenance and high confidence, so they carry neither
+field; relationship, graph and unresolved rows keep `confidence`/`provenance`
+because those vary per edge.
 
 The CLI's `--json` output keeps `schema_version` 1 and is unchanged.
 
