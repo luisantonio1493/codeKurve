@@ -685,6 +685,18 @@ pub fn file_snapshot(
     Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
 }
 
+/// Refresh the stored mtime of files whose bytes did not change, so the
+/// size+mtime fast path in change detection applies to them again.
+pub fn touch_files(conn: &Connection, project_id: &str, files: &[(&str, i64)]) -> Result<()> {
+    let mut stmt = conn.prepare_cached(
+        "UPDATE files SET modified_ns = ?1 WHERE project_id = ?2 AND relative_path = ?3",
+    )?;
+    for (path, modified_ns) in files {
+        stmt.execute(params![modified_ns, project_id, path])?;
+    }
+    Ok(())
+}
+
 /// Content-derived id; the ordinal only disambiguates rows whose entire
 /// content tuple is identical (e.g. the same call twice on one line).
 /// Design "Stable Row Ids": replaces deriving `rel`/`unr` ids from a

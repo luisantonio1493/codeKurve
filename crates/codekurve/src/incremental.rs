@@ -24,7 +24,15 @@ use crate::commands::{self, FileMeta};
 pub enum FileChange {
     Created(DiscoveredFile),
     Modified(DiscoveredFile),
-    Deleted { relative_path: String },
+    Deleted {
+        relative_path: String,
+    },
+    /// mtime moved but the bytes did not: nothing to re-index, only the
+    /// stored mtime to refresh so the fast path applies next time.
+    Touched {
+        relative_path: String,
+        modified_ns: i64,
+    },
 }
 
 /// Everything `apply_batch` needs beyond `changes` itself (design
@@ -123,7 +131,12 @@ pub fn detect(
             continue;
         };
         if prior.content_hash.as_deref() == Some(repo::content_hash(&bytes).as_str()) {
-            continue; // touch-only: mtime moved, content didn't
+            // touch-only: mtime moved, content didn't
+            changes.push(FileChange::Touched {
+                relative_path: file.relative_path.clone(),
+                modified_ns: mtime,
+            });
+            continue;
         }
         changes.push(FileChange::Modified(file));
     }
@@ -174,6 +187,27 @@ pub fn apply_batch(
     ctx: &IndexContext,
     changes: &[FileChange],
 ) -> Result<BatchOutcome, String> {
+    // Touch-only entries are bookkeeping, not changes: refresh their stored
+    // mtime and carry on with whatever real changes remain.
+    let touched: Vec<(&str, i64)> = changes
+        .iter()
+        .filter_map(|c| match c {
+            FileChange::Touched {
+                relative_path,
+                modified_ns,
+            } => Some((relative_path.as_str(), *modified_ns)),
+            _ => None,
+        })
+        .collect();
+    if !touched.is_empty() {
+        repo::touch_files(conn, ctx.project_id, &touched).map_err(|e| e.to_string())?;
+    }
+    let real: Vec<FileChange> = changes
+        .iter()
+        .filter(|c| !matches!(c, FileChange::Touched { .. }))
+        .cloned()
+        .collect();
+    let changes = real.as_slice();
     if changes.is_empty() {
         return Ok(BatchOutcome::default());
     }
@@ -302,6 +336,7 @@ fn apply_incremental_changes(
         match change {
             FileChange::Created(f) | FileChange::Modified(f) => created_or_modified.push(f.clone()),
             FileChange::Deleted { relative_path } => deleted.push(relative_path.clone()),
+            FileChange::Touched { .. } => {} // handled in `apply_batch`
         }
     }
     let b_paths: HashSet<String> = created_or_modified
@@ -584,8 +619,13 @@ mod tests {
         assert!(changes.iter().any(
             |c| matches!(c, FileChange::Deleted { relative_path } if relative_path == "removed.ts")
         ));
-        // Exactly touched (skipped) excluded: changed + added + removed = 3.
-        assert_eq!(changes.len(), 3);
+        // The touched file only gets its mtime refreshed (`Touched`), so the
+        // real changes are changed + added + removed = 3.
+        let real = changes
+            .iter()
+            .filter(|c| !matches!(c, FileChange::Touched { .. }))
+            .count();
+        assert_eq!(real, 3);
     }
 
     fn ctx<'a>(
@@ -609,6 +649,33 @@ mod tests {
         let aliases = TsconfigAliases::new();
         let changes = detect(conn, project, root, &options, None, false)?;
         apply_batch(conn, &ctx(root, project, &aliases, &options), &changes)
+    }
+
+    /// IDX-10: a touch-only edit (mtime moved, bytes identical) refreshes the
+    /// stored mtime, so the fast path applies again instead of re-reading and
+    /// re-hashing the file on every later pass.
+    #[test]
+    fn touch_only_edit_refreshes_the_stored_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std_fs::write(root.join("a.ts"), "export const a = 1;\n").unwrap();
+        let mut conn = db::open_in_memory().unwrap();
+        let project = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        sync(&mut conn, &project, root).unwrap();
+
+        let future = SystemTime::now() + std::time::Duration::from_secs(3600);
+        let file = std_fs::File::options()
+            .write(true)
+            .open(root.join("a.ts"))
+            .unwrap();
+        file.set_modified(future).unwrap();
+        let new_mtime = mtime_ns(&std_fs::metadata(root.join("a.ts")).unwrap()).unwrap();
+
+        sync(&mut conn, &project, root).unwrap();
+
+        let stored = repo::file_snapshot(&conn, &project).unwrap();
+        assert_eq!(stored["a.ts"].modified_ns, Some(new_mtime));
+        assert_eq!(repo::pending_files(&conn, &project).unwrap(), 0);
     }
 
     /// IDX-1: a Latin-1 file is indexed (lossy decode) instead of failing the
