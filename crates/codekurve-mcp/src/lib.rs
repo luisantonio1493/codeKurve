@@ -32,6 +32,7 @@ pub(crate) fn log(msg: &str) {
 pub fn run(root: &Path) -> Result<(), String> {
     let session = Session::open(root).map_err(|e| e.message)?;
     let allow_reindex = session.config().mcp.allow_reindex;
+    codekurve::commands::warn_elevated_settings(session.config());
 
     tokio::runtime::Builder::new_current_thread()
         .enable_all()

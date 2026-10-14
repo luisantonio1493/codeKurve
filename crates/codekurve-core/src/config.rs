@@ -205,6 +205,39 @@ impl Default for Queries {
 }
 
 impl Config {
+    /// The index database path under `root`. A repository ships its own
+    /// `.codekurve/config.toml`, so `storage.database` is untrusted: it must
+    /// be a relative path without `..` that stays inside the project.
+    pub fn database_path(
+        &self,
+        root: &std::path::Path,
+    ) -> std::result::Result<std::path::PathBuf, String> {
+        use std::path::Component;
+
+        let rel = std::path::Path::new(&self.storage.database);
+        if rel.is_absolute() || rel.components().any(|c| !matches!(c, Component::Normal(_))) {
+            return Err(format!(
+                "storage.database {:?} must be a relative path inside the project root (no absolute path, no `..`)",
+                self.storage.database
+            ));
+        }
+        Ok(root.join(rel))
+    }
+
+    /// Settings that widen what a server or indexer will touch. A cloned
+    /// repository can enable them from its own config, so entry points warn
+    /// when any is on.
+    pub fn elevated_settings(&self) -> Vec<&'static str> {
+        let mut on = Vec::new();
+        if self.mcp.allow_reindex {
+            on.push("mcp.allow_reindex");
+        }
+        if self.index.follow_symlinks {
+            on.push("index.follow_symlinks");
+        }
+        on
+    }
+
     /// Parse a config from TOML text.
     pub fn from_toml(text: &str) -> Result<Self> {
         Ok(toml::from_str(text)?)
@@ -266,5 +299,32 @@ mod tests {
         assert_eq!(parsed.index.max_total_files, 50_000);
         assert_eq!(parsed.index.languages, vec!["typescript".to_string()]);
         assert!(parsed.index.follow_symlinks);
+    }
+
+    #[test]
+    fn database_path_stays_inside_the_project_root() {
+        let root = std::path::Path::new("/proj");
+        let mut cfg = Config::default();
+        assert_eq!(
+            cfg.database_path(root).unwrap(),
+            root.join(".codekurve/index.db")
+        );
+        for bad in ["/etc/index.db", "../index.db", "a/../../index.db"] {
+            cfg.storage.database = bad.to_string();
+            let err = cfg.database_path(root).unwrap_err();
+            assert!(err.contains("storage.database"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn elevated_settings_lists_only_what_is_switched_on() {
+        let mut cfg = Config::default();
+        assert!(cfg.elevated_settings().is_empty());
+        cfg.mcp.allow_reindex = true;
+        cfg.index.follow_symlinks = true;
+        assert_eq!(
+            cfg.elevated_settings(),
+            vec!["mcp.allow_reindex", "index.follow_symlinks"]
+        );
     }
 }

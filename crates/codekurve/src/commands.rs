@@ -56,7 +56,8 @@ pub(crate) fn setup_index(root: &Path) -> Result<IndexSetup, String> {
     let options = discovery_options(&config);
     let aliases = load_tsconfig_aliases(&root);
 
-    let db_path = root.join(&config.storage.database);
+    let db_path = config.database_path(&root)?;
+    warn_elevated_settings(&config);
     let conn = db::open(&db_path).map_err(|e| e.to_string())?;
     let config_text = config.to_toml().map_err(|e| e.to_string())?;
     let project_id = repo::upsert_project(
@@ -1211,8 +1212,19 @@ fn load_config(root: &Path) -> Result<Config, String> {
     Config::from_toml(&text).map_err(|e| e.to_string())
 }
 
+/// Tell the user (stderr — stdout may carry MCP or `--json` output) when the
+/// project's own config switched on a setting that widens what is touched.
+pub fn warn_elevated_settings(config: &Config) {
+    for setting in config.elevated_settings() {
+        eprintln!(
+            "warning: {setting} is enabled by this project's .codekurve/config.toml; \
+             only keep it on for repositories you trust"
+        );
+    }
+}
+
 fn open_existing_db(root: &Path, config: &Config) -> Result<Connection, String> {
-    let db_path = root.join(&config.storage.database);
+    let db_path = config.database_path(root)?;
     if !db_path.exists() {
         return Err(format!(
             "no index found ({}). run `codekurve index` first.",
