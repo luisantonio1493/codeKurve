@@ -11,6 +11,30 @@
 pub mod csharp;
 pub mod typescript;
 
+/// Deepest AST level the recursive walkers descend into (SEC-7). Tree-sitter
+/// happily builds trees thousands of levels deep (`[[[[...`, `a+a+a+...`),
+/// and each walker recursion costs stack; past this cap a walker stops
+/// descending but keeps every symbol it already extracted, so the file still
+/// indexes and nothing panics. Sized against the debug-build frame cost of the
+/// TypeScript walker: 512 overflowed a 2 MB thread stack in the SEC-7 repro,
+/// 256 leaves headroom while still covering long fluent call chains.
+pub(crate) const MAX_AST_DEPTH: usize = 256;
+
+/// Parse budget for one file (SEC-7). A parse that exceeds it yields no tree,
+/// which callers already treat as a failed parse.
+const PARSE_TIMEOUT_MICROS: u64 = 5_000_000;
+
+/// Fresh tree-sitter parser with the shared parse timeout applied. Every
+/// parser in the analysis pipeline is created here so none can run unbounded.
+/// `set_timeout_micros` is deprecated upstream in favor of a progress
+/// callback; the simple budget is kept because it is the one-line equivalent.
+#[allow(deprecated)]
+pub(crate) fn new_parser() -> tree_sitter::Parser {
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_timeout_micros(PARSE_TIMEOUT_MICROS);
+    parser
+}
+
 use codekurve_core::error::Result;
 use codekurve_core::{
     Confidence, LanguageId, Provenance, RelationshipKind, SourceSpan, SymbolKind,

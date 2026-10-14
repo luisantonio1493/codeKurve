@@ -18,13 +18,13 @@ use codekurve_core::error::{Error, Result};
 use codekurve_core::{
     Confidence, LanguageId, Provenance, RelationshipKind, SourceSpan, SymbolKind, Visibility,
 };
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
 use crate::extract::{find_child, span_of};
 use crate::ir::{EdgeTarget, ExtractedRelationship, ExtractedSymbol, FileAnalysis};
 use crate::languages::{
-    analyzer_for, push_unresolved_edge, resolve_pending, LanguageAnalyzer, PendingRel,
-    BASE_LIST_REASON, PROPERTY_TYPE_REASON,
+    analyzer_for, new_parser, push_unresolved_edge, resolve_pending, LanguageAnalyzer, PendingRel,
+    BASE_LIST_REASON, MAX_AST_DEPTH, PROPERTY_TYPE_REASON,
 };
 
 /// design "C# Node-Kind Mapping": `implicit_object_creation_expression` (the
@@ -78,6 +78,10 @@ struct CsCtx<'a> {
     namespace_stack: Vec<String>,
     type_stack: Vec<String>,
     partial_ordinals: HashMap<String, u32>,
+    /// Live depth of the `collect`/`walk_expressions` recursion, capped at
+    /// `MAX_AST_DEPTH` (SEC-7). A counter here rather than a parameter because
+    /// the declaration handlers all sit between the recursive calls.
+    depth: usize,
     out: Vec<ExtractedSymbol>,
     out_rels: Vec<ExtractedRelationship>,
     /// Deferred `Calls`/`Constructs` targets (design "C# Node-Kind Mapping"
@@ -89,7 +93,7 @@ struct CsCtx<'a> {
 }
 
 fn analyze(source: &str, relative_path: &str) -> Result<FileAnalysis> {
-    let mut parser = Parser::new();
+    let mut parser = new_parser();
     parser
         .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
         .map_err(|e| Error::Parse(e.to_string()))?;
@@ -104,6 +108,7 @@ fn analyze(source: &str, relative_path: &str) -> Result<FileAnalysis> {
         namespace_stack: Vec::new(),
         type_stack: Vec::new(),
         partial_ordinals: HashMap::new(),
+        depth: 0,
         out: Vec::new(),
         out_rels: Vec::new(),
         pending: Vec::new(),
@@ -151,6 +156,16 @@ fn analyze(source: &str, relative_path: &str) -> Result<FileAnalysis> {
 /// local key of the nearest enclosing namespace/type/enum, used as the
 /// `Contains` source when this node turns out to be a declaration.
 fn collect(node: Node, container_key: Option<&str>, ctx: &mut CsCtx) {
+    if ctx.depth >= MAX_AST_DEPTH {
+        return;
+    }
+    ctx.depth += 1;
+    collect_node(node, container_key, ctx);
+    ctx.depth -= 1;
+}
+
+/// Body of `collect`; recursion goes back through `collect` so the depth cap applies.
+fn collect_node(node: Node, container_key: Option<&str>, ctx: &mut CsCtx) {
     match node.kind() {
         "namespace_declaration" => {
             handle_block_namespace(node, container_key, ctx);
@@ -507,6 +522,16 @@ fn collect_member_body(node: Node, scope: &str, ctx: &mut CsCtx) {
 /// emits an unresolved `Constructs` edge directly (target-typed `new()` —
 /// design "C# Node-Kind Mapping", never dropped or guessed).
 fn walk_expressions(node: Node, scope: &str, ctx: &mut CsCtx) {
+    if ctx.depth >= MAX_AST_DEPTH {
+        return;
+    }
+    ctx.depth += 1;
+    walk_expression_node(node, scope, ctx);
+    ctx.depth -= 1;
+}
+
+/// Body of `walk_expressions`; recursion goes back through it so the depth cap applies.
+fn walk_expression_node(node: Node, scope: &str, ctx: &mut CsCtx) {
     match node.kind() {
         "invocation_expression" => {
             if let Some(target_name) = cs_callee_name(node, ctx.source) {
@@ -873,11 +898,14 @@ const BUILTIN_SCALAR_TYPES: &[&str] = &[
 /// (`array_type`) to their inner type, and `ICollection<Child>`/`List<Child>`
 /// (`COLLECTION_WRAPPERS`) to their sole type argument — anything else
 /// (`Dictionary<K, V>`, tuples, pointers) is skipped rather than guessed.
-fn cs_entity_type_name(node: Node, source: &[u8]) -> Option<String> {
+fn cs_entity_type_name(node: Node, source: &[u8], depth: usize) -> Option<String> {
+    if depth > MAX_AST_DEPTH {
+        return None;
+    }
     match node.kind() {
         "predefined_type" => None,
         "nullable_type" | "array_type" => {
-            cs_entity_type_name(node.child_by_field_name("type")?, source)
+            cs_entity_type_name(node.child_by_field_name("type")?, source, depth + 1)
         }
         "generic_name" => {
             let mut cursor = node.walk();
@@ -889,7 +917,7 @@ fn cs_entity_type_name(node: Node, source: &[u8]) -> Option<String> {
                 let args = find_child(node, "type_argument_list")?;
                 let mut arg_cursor = args.walk();
                 let first_arg = args.named_children(&mut arg_cursor).next()?;
-                return cs_entity_type_name(first_arg, source);
+                return cs_entity_type_name(first_arg, source, depth + 1);
             }
             Some(outer.to_string())
         }
@@ -897,7 +925,9 @@ fn cs_entity_type_name(node: Node, source: &[u8]) -> Option<String> {
             let name = node.utf8_text(source).ok()?;
             (!BUILTIN_SCALAR_TYPES.contains(&name)).then(|| name.to_string())
         }
-        "qualified_name" => cs_entity_type_name(node.child_by_field_name("name")?, source),
+        "qualified_name" => {
+            cs_entity_type_name(node.child_by_field_name("name")?, source, depth + 1)
+        }
         _ => None,
     }
 }
@@ -905,7 +935,7 @@ fn cs_entity_type_name(node: Node, source: &[u8]) -> Option<String> {
 /// Emits the `UsesType`/`PROPERTY_TYPE_REASON` edge for one property/field
 /// declared type, if `cs_entity_type_name` found an entity-shaped name.
 fn emit_property_type_edge(type_node: Node, source_key: &str, ctx: &mut CsCtx) {
-    if let Some(name) = cs_entity_type_name(type_node, ctx.source) {
+    if let Some(name) = cs_entity_type_name(type_node, ctx.source, 0) {
         push_unresolved_edge(
             &mut ctx.out_rels,
             source_key,

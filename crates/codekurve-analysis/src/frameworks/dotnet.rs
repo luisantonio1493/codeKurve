@@ -25,6 +25,7 @@ use tree_sitter::Node;
 use crate::extract::{find_child, span_of};
 use crate::frameworks::AttrPattern;
 use crate::ir::{EdgeTarget, ExtractedRelationship, ExtractedSymbol, FileAnalysis};
+use crate::languages::MAX_AST_DEPTH;
 
 /// design "Q2 — .NET split" PR5 table: attribute name -> HTTP verb text.
 const HTTP_VERB_ATTRS: &[(&str, &str)] = &[
@@ -186,7 +187,7 @@ struct CallInfo<'a> {
 /// prefilter and this file's own parse have already run.
 pub(crate) fn recognize(root: Node, source: &[u8], analysis: &mut FileAnalysis) {
     let mut top_level_key: Option<String> = None;
-    walk(root, source, analysis, None, &mut top_level_key);
+    walk(root, source, analysis, None, &mut top_level_key, 0);
 }
 
 /// `current_method` is the local key of the nearest enclosing
@@ -202,7 +203,11 @@ fn walk(
     analysis: &mut FileAnalysis,
     current_method: Option<&str>,
     top_level_key: &mut Option<String>,
+    depth: usize,
 ) {
+    if depth > MAX_AST_DEPTH {
+        return;
+    }
     let mut next_method: Option<String> = None;
 
     match node.kind() {
@@ -231,7 +236,14 @@ fn walk(
     let next_method = next_method.as_deref().or(current_method);
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk(child, source, analysis, next_method, top_level_key);
+        walk(
+            child,
+            source,
+            analysis,
+            next_method,
+            top_level_key,
+            depth + 1,
+        );
     }
 }
 
