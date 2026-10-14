@@ -13,9 +13,21 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  # Same cargo-deny invocation and pinned action as ci.yml's `audit` job, run
+  # here so a release cannot publish with a failing advisory/license/ban check.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: cargo-deny (advisories, licenses, bans, sources)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories licenses bans sources
+
   build:
     strategy:
       fail-fast: false
@@ -38,9 +50,9 @@ jobs:
             artifact: codekurve-windows-x64.exe
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           targets: ${{ matrix.target }}
 
@@ -55,7 +67,7 @@ jobs:
         if: runner.os == 'Windows'
         run: copy target\${{ matrix.target }}\release\codekurve.exe ${{ matrix.artifact }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: bin-${{ matrix.target }}
           path: ${{ matrix.artifact }}
@@ -63,9 +75,9 @@ jobs:
   sbom:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
 
       - name: install cargo-cyclonedx
         run: cargo install cargo-cyclonedx --locked
@@ -78,7 +90,7 @@ jobs:
           mkdir -p sbom-out
           find . -name '*.cdx.json' -exec cp {} sbom-out/ \;
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sbom
           path: sbom-out
@@ -86,9 +98,9 @@ jobs:
   licenses:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
 
       - name: install cargo-about
         run: cargo install cargo-about --locked --features cli
@@ -96,7 +108,7 @@ jobs:
       - name: generate third-party NOTICE report
         run: cargo about generate about.hbs > NOTICE-3rdparty.md
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: license-report
           path: NOTICE-3rdparty.md
@@ -105,7 +117,7 @@ jobs:
     needs: [build, sbom, licenses]
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
 
@@ -122,19 +134,22 @@ jobs:
         working-directory: bundle
         run: sha256sum -c SHA256SUMS
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: codekurve-release-bundle
           path: bundle
 
   publish:
-    needs: [bundle]
+    needs: [bundle, deny]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
+    # Only job that writes to the repository (creates the GitHub Release).
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: codekurve-release-bundle
           path: bundle
