@@ -40,7 +40,29 @@ supply-chain cost plainly.
 
 Respects `.gitignore` plus configurable exclusions; sensitive-file patterns
 (`.env`, `*.pem`, `*.key`, `credentials*`, ...) are excluded by default but
-the policy is configurable, not hardcoded (plan §29.3).
+the policy is configurable, not hardcoded (plan §29.3). `ignore.patterns`
+is enforced by discovery for full, incremental and watcher indexing; an
+invalid glob is a hard error.
+
+## Untrusted project config
+
+A cloned repository ships its own `.codekurve/config.toml`, so it is treated
+as untrusted input:
+
+- `storage.database` must be a relative path inside the project root;
+  absolute paths and `..` are rejected.
+- `mcp.allow_reindex` and `index.follow_symlinks` are honored, but `mcp`,
+  `index` and `watch` print a warning on stderr when the project's own config
+  enables either.
+
+## Source reads
+
+`get_symbol` resolves the symbol's file under the project root and refuses
+absolute paths, `..`, and symlinked files or directories. Files above
+`index.max_file_size_bytes` are not read, `ctx_lines` is capped at 200, and
+the returned snippet is cut at `queries.max_snippet_bytes` on a character
+boundary (`source_truncated: true`). Symbol lookup by id is scoped to the
+project, and the MCP search `limit` is clamped to `queries.max_limit`.
 
 ## Storage
 
@@ -57,7 +79,11 @@ SQLite is local, no source-code duplication beyond what's required (plan
   `$HOME/.codex/config.toml`, user scope — Codex has no project-scoped
   config).
 - Backups: `install` writes `<file>.bak` before any rewrite of an existing
-  client config, letting a user roll back without git.
+  client config, letting a user roll back without git. Config and backup
+  writes go through a temp file + rename, refuse symlinked targets, and keep
+  the original file's permissions.
+- On Unix the index database is created `0600`, `.codekurve/` `0700` and
+  `config.toml` `0600`.
 
 ## Update process
 

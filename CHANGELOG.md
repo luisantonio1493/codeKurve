@@ -5,6 +5,17 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Security
+
+- `install`: write client configs and `.bak` backups atomically and refuse symlinks
+- Enforce `ignore.patterns` during discovery (secrets, `.env`, minified, `dist`)
+- Contain `get_symbol` source reads to the project root; cap snippet size, `ctx_lines` and search `limit`
+- Scope symbol lookup by id to the project
+- Cap AST recursion depth and set a parse timeout so deeply nested files cannot crash indexing
+- Create the index database and project config owner-only on Unix
+- Reject `storage.database` outside the project root; warn when a project config enables `mcp.allow_reindex` or `index.follow_symlinks`
+- Match route-search text literally (escape `LIKE` wildcards); recover from a poisoned MCP session lock
+
 ### Added
 
 - Initialize Rust workspace (5 crates)
