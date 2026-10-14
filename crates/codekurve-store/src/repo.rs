@@ -130,6 +130,13 @@ pub fn symbol_id(file_id: &str, symbol_key: &str) -> String {
     hash_id("sym", &format!("{file_id}/{symbol_key}"))
 }
 
+/// `execute` through the connection's prepared-statement cache: bulk writes
+/// (one symbol/relationship/FTS row at a time) used to re-parse the same SQL
+/// for every row.
+fn exec(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> rusqlite::Result<usize> {
+    conn.prepare_cached(sql)?.execute(params)
+}
+
 /// Register or update a project by its canonical root path. Returns its id.
 pub fn upsert_project(
     conn: &Connection,
@@ -194,24 +201,29 @@ pub fn reindex(
 
     // Relationships/unresolved first: they FK-reference symbols/files, so
     // they must go before those tables are cleared (foreign_keys = ON).
-    tx.execute(
+    exec(
+        &tx,
         "DELETE FROM relationships WHERE project_id = ?1",
         params![project_id],
     )?;
-    tx.execute(
+    exec(
+        &tx,
         "DELETE FROM unresolved_references WHERE project_id = ?1",
         params![project_id],
     )?;
-    tx.execute(
+    exec(
+        &tx,
         "DELETE FROM symbols_fts WHERE symbol_id IN
              (SELECT id FROM symbols WHERE project_id = ?1)",
         params![project_id],
     )?;
-    tx.execute(
+    exec(
+        &tx,
         "DELETE FROM symbols WHERE project_id = ?1",
         params![project_id],
     )?;
-    tx.execute(
+    exec(
+        &tx,
         "DELETE FROM files WHERE project_id = ?1",
         params![project_id],
     )?;
@@ -250,7 +262,8 @@ fn insert_file_and_symbols(
     file: &FileInput,
 ) -> Result<usize> {
     let file_id = file_id(project_id, &file.relative_path);
-    tx.execute(
+    exec(
+        tx,
         "INSERT INTO files(id, project_id, relative_path, language, size_bytes,
              content_hash, modified_ns, parse_status, generation, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ok', 1, ?8, ?8)
@@ -292,7 +305,8 @@ fn insert_file_and_symbols(
             .map(|r| r.as_str())
             .collect::<Vec<_>>()
             .join(",");
-        tx.execute(
+        exec(
+            tx,
             "INSERT INTO symbols(id, project_id, file_id, symbol_key, name, qualified_name,
                  kind, language, start_byte, end_byte, start_line, start_column,
                  end_line, end_column, provenance, confidence, visibility, is_partial,
@@ -321,7 +335,8 @@ fn insert_file_and_symbols(
                 ts,
             ],
         )?;
-        tx.execute(
+        exec(
+            tx,
             "INSERT INTO symbols_fts(symbol_id, name, qualified_name, kind, relative_path)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -360,11 +375,13 @@ fn delete_file_owned_relationships(
     project_id: &str,
     file_id: &str,
 ) -> Result<()> {
-    tx.execute(
+    exec(
+        tx,
         "DELETE FROM relationships WHERE project_id = ?1 AND source_file_id = ?2",
         params![project_id, file_id],
     )?;
-    tx.execute(
+    exec(
+        tx,
         "DELETE FROM unresolved_references WHERE project_id = ?1 AND source_file_id = ?2",
         params![project_id, file_id],
     )?;
@@ -376,11 +393,16 @@ fn delete_file_owned_relationships(
 /// [`delete_file_owned_relationships`] has already run — see that function's
 /// doc comment.
 fn delete_file_owned_symbols(tx: &Transaction, file_id: &str) -> Result<()> {
-    tx.execute(
+    exec(
+        tx,
         "DELETE FROM symbols_fts WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)",
         params![file_id],
     )?;
-    tx.execute("DELETE FROM symbols WHERE file_id = ?1", params![file_id])?;
+    exec(
+        tx,
+        "DELETE FROM symbols WHERE file_id = ?1",
+        params![file_id],
+    )?;
     Ok(())
 }
 
@@ -395,7 +417,7 @@ fn convert_inbound_to_unresolved(
     file_id: &str,
     reason: &str,
 ) -> Result<()> {
-    let mut stmt = tx.prepare(
+    let mut stmt = tx.prepare_cached(
         "SELECT r.id, r.source_symbol_id, r.source_file_id, r.kind, s.name
          FROM relationships r
          JOIN symbols s ON s.id = r.target_symbol_id
@@ -416,7 +438,11 @@ fn convert_inbound_to_unresolved(
 
     let mut unresolved = Vec::with_capacity(inbound.len());
     for (rel_id, source_symbol_id, source_file_id, kind, target_name) in &inbound {
-        tx.execute("DELETE FROM relationships WHERE id = ?1", params![rel_id])?;
+        exec(
+            tx,
+            "DELETE FROM relationships WHERE id = ?1",
+            params![rel_id],
+        )?;
         unresolved.push(UnresolvedReferenceInput {
             source_symbol_id: Some(source_symbol_id.clone()),
             source_file_id: source_file_id.clone(),
@@ -455,7 +481,7 @@ pub fn delete_file(
     )?;
 
     delete_file_owned_rows(tx, project_id, &file_id)?;
-    tx.execute("DELETE FROM files WHERE id = ?1", params![file_id])?;
+    exec(tx, "DELETE FROM files WHERE id = ?1", params![file_id])?;
     Ok(())
 }
 
@@ -520,7 +546,8 @@ pub fn apply_incremental(
 /// (T1 of the Batch Atomicity sequence) so an interrupted run honestly
 /// reports staleness until T2 commits.
 pub fn set_pending_files(tx: &Transaction, project_id: &str, ts: &str, count: i64) -> Result<()> {
-    tx.execute(
+    exec(
+        tx,
         "INSERT INTO index_state(project_id, pending_files, updated_at)
          VALUES (?1, ?2, ?3)
          ON CONFLICT(project_id) DO UPDATE SET
@@ -536,7 +563,8 @@ pub fn set_pending_files(tx: &Transaction, project_id: &str, ts: &str, count: i6
 /// the same transaction as the batch's data writes (never a separate one —
 /// spec "Freshness Metadata Written Inside the Data Transaction").
 pub fn mark_verified(tx: &Transaction, project_id: &str, ts: &str) -> Result<()> {
-    tx.execute(
+    exec(
+        tx,
         "INSERT INTO index_state(project_id, pending_files, last_verified_at, updated_at)
          VALUES (?1, 0, ?2, ?2)
          ON CONFLICT(project_id) DO UPDATE SET
@@ -648,7 +676,7 @@ pub fn symbol_ids_for_files(
         format!("SELECT id FROM symbols WHERE project_id = ? AND file_id IN ({placeholders})");
     let mut binds: Vec<&str> = vec![project_id];
     binds.extend(file_ids.iter().map(String::as_str));
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter().copied()), |row| {
         row.get::<_, String>(0)
     })?;
@@ -670,7 +698,7 @@ pub fn symbol_ids_by_qualified_names(
     if pairs.is_empty() {
         return Ok(out);
     }
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT s.id FROM symbols s JOIN files f ON f.id = s.file_id
          WHERE s.project_id = ?1 AND f.relative_path = ?2 AND s.qualified_name = ?3",
     )?;
@@ -700,7 +728,7 @@ pub fn file_snapshot(
     conn: &Connection,
     project_id: &str,
 ) -> Result<HashMap<String, StoredFileMeta>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT relative_path, size_bytes, content_hash, modified_ns
          FROM files WHERE project_id = ?1",
     )?;
@@ -769,7 +797,8 @@ fn persist_relationships(
                 &start_column,
             ],
         );
-        tx.execute(
+        exec(
+            tx,
             "INSERT INTO relationships(id, project_id, source_symbol_id, target_symbol_id,
                  target_external, kind, provenance, confidence, source_file_id,
                  start_line, start_column, reason, generation, created_at, updated_at)
@@ -814,7 +843,8 @@ fn persist_unresolved(
                 &u.target_text,
             ],
         );
-        tx.execute(
+        exec(
+            tx,
             "INSERT INTO unresolved_references(id, project_id, source_symbol_id, source_file_id,
                  relationship_kind, target_text, context_json, candidate_count, reason,
                  confidence, generation, created_at, updated_at)
@@ -995,7 +1025,7 @@ fn query_relationships(
     let mut binds: Vec<&str> = vec![project_id, symbol_id];
     binds.extend(kinds.iter().map(|k| k.as_str()));
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(
         rusqlite::params_from_iter(binds.iter().copied()),
         map_relationship,
@@ -1067,7 +1097,7 @@ pub fn unresolved(
          ORDER BY f.relative_path, u.target_text"
     );
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(
         rusqlite::params_from_iter(binds.iter().copied()),
         map_unresolved,
@@ -1115,7 +1145,7 @@ pub fn find_candidates_by_name(
     project_id: &str,
     name: &str,
 ) -> Result<Vec<SymbolCandidate>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT s.id, s.qualified_name, s.kind, f.relative_path
          FROM symbols s
          JOIN files f ON f.id = s.file_id
@@ -1143,7 +1173,7 @@ pub fn search(
     // ponytail: quote as a phrase to neutralize FTS5 operators; richer
     // tokenization/prefix search can come later.
     let fts_query = format!("\"{}\"", query.replace('"', "\"\""));
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT s.id, s.name, s.qualified_name, s.kind, s.language, f.relative_path,
                 s.start_byte, s.end_byte, s.start_line, s.start_column, s.end_line, s.end_column,
                 s.visibility, s.is_partial, s.is_record, s.roles
@@ -1198,7 +1228,7 @@ fn search_partial(
     }
     binds.push(format!("{}%", terms[0]));
     binds.push(limit.to_string());
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), map_stored)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
@@ -1254,7 +1284,7 @@ pub fn routes(
         "%{}%",
         escape_like(&route_query.unwrap_or("").replace('/', "").to_lowercase())
     );
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT r.source_symbol_id, src.qualified_name, r.target_symbol_id, tgt.qualified_name,
                 r.target_external, r.kind, r.provenance, r.confidence, r.start_line, r.start_column,
                 src_file.relative_path, r.reason
@@ -1284,7 +1314,7 @@ pub fn find_project(conn: &Connection, root_path: &str) -> Result<Option<String>
 
 /// Exact-name lookup for the `symbol` command.
 pub fn find_by_name(conn: &Connection, project_id: &str, name: &str) -> Result<Vec<StoredSymbol>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT s.id, s.name, s.qualified_name, s.kind, s.language, f.relative_path,
                 s.start_byte, s.end_byte, s.start_line, s.start_column, s.end_line, s.end_column,
                 s.visibility, s.is_partial, s.is_record, s.roles
@@ -1306,7 +1336,7 @@ pub fn find_symbol_by_id(
     project_id: &str,
     id: &str,
 ) -> Result<Option<StoredSymbol>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT s.id, s.name, s.qualified_name, s.kind, s.language, f.relative_path,
                 s.start_byte, s.end_byte, s.start_line, s.start_column, s.end_line, s.end_column,
                 s.visibility, s.is_partial, s.is_record, s.roles
@@ -1323,7 +1353,7 @@ pub fn find_symbol_by_id(
 /// `files.language` is nullable (parse failures/unrecognized extensions),
 /// grouped under `"unknown"` rather than dropped.
 pub fn language_breakdown(conn: &Connection, project_id: &str) -> Result<Vec<(String, usize)>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT COALESCE(language, 'unknown') AS lang, COUNT(*)
          FROM files
          WHERE project_id = ?1
@@ -1373,12 +1403,13 @@ pub struct ResolutionSnapshot {
 /// index, cheap to read back (design: "Reading rows is far cheaper than
 /// tree-sitter").
 pub fn resolution_snapshot(conn: &Connection, project_id: &str) -> Result<ResolutionSnapshot> {
-    let mut file_stmt = conn.prepare("SELECT relative_path FROM files WHERE project_id = ?1")?;
+    let mut file_stmt =
+        conn.prepare_cached("SELECT relative_path FROM files WHERE project_id = ?1")?;
     let files = file_stmt
         .query_map(params![project_id], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    let mut sym_stmt = conn.prepare(
+    let mut sym_stmt = conn.prepare_cached(
         "SELECT s.name, f.relative_path, s.qualified_name, s.kind, s.language,
                 EXISTS(SELECT 1 FROM relationships r
                        WHERE r.target_symbol_id = s.id AND r.kind = 'exports') AS exported
@@ -1451,7 +1482,7 @@ pub fn dependents_by_target_symbol(
     let mut binds: Vec<&str> = vec![project_id];
     binds.extend(target_symbol_ids.iter().map(String::as_str));
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter().copied()), |row| {
         row.get::<_, String>(0)
     })?;
@@ -1488,7 +1519,7 @@ pub fn dependents_by_unresolved_target(
     let mut binds: Vec<&str> = vec![project_id];
     binds.extend(target_texts.iter().map(String::as_str));
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter().copied()), |row| {
         row.get::<_, String>(0)
     })?;
@@ -1525,7 +1556,7 @@ pub fn dependents_by_unresolved_module(
             binds.push(format!("%/{escaped}"));
             binds.push(format!("%/{escaped}.%"));
         }
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |row| {
             row.get::<_, String>(0)
         })?;
@@ -2160,7 +2191,7 @@ mod tests {
 
         let ids_of = |conn: &mut Connection, batches: Vec<Vec<RelationshipInput>>| -> Vec<String> {
             let tx = conn.transaction().unwrap();
-            tx.execute("DELETE FROM relationships", []).unwrap();
+            exec(&tx, "DELETE FROM relationships", []).unwrap();
             for batch in &batches {
                 persist_relationships(&tx, &project, "ts1", batch).unwrap();
             }
@@ -2211,7 +2242,7 @@ mod tests {
         let ids_of =
             |conn: &mut Connection, batches: Vec<Vec<UnresolvedReferenceInput>>| -> Vec<String> {
                 let tx = conn.transaction().unwrap();
-                tx.execute("DELETE FROM unresolved_references", []).unwrap();
+                exec(&tx, "DELETE FROM unresolved_references", []).unwrap();
                 for batch in &batches {
                     persist_unresolved(&tx, &project, "ts1", batch).unwrap();
                 }

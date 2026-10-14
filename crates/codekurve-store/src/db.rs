@@ -47,6 +47,9 @@ pub fn open_in_memory() -> Result<Connection> {
 }
 
 fn configure(conn: &Connection) -> Result<()> {
+    // Bulk indexing and BFS issue the same handful of statements thousands of
+    // times; the default cache (16) is too small for the repo's query set.
+    conn.set_prepared_statement_cache_capacity(64);
     conn.execute_batch(
         "PRAGMA foreign_keys = ON;
          PRAGMA journal_mode = WAL;
