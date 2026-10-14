@@ -122,10 +122,9 @@ impl Session {
 /// this the same way `Session::warnings` does internally, instead of a
 /// second copy of the pending-files check.
 pub(crate) fn pending_warning(conn: &Connection, project_id: &str) -> Vec<String> {
-    match repo::index_status(conn, project_id) {
-        Ok(status) if status.pending_files > 0 => vec![format!(
-            "index is stale ({} pending file(s)); run `codekurve index`",
-            status.pending_files
+    match repo::pending_files(conn, project_id) {
+        Ok(pending) if pending > 0 => vec![format!(
+            "index is stale ({pending} pending file(s)); run `codekurve index`"
         )],
         _ => Vec::new(),
     }

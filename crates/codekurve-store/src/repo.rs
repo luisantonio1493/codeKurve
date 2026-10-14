@@ -545,6 +545,20 @@ pub struct IndexStatus {
     pub last_verified_at: Option<String>,
 }
 
+/// Just the pending-file count: every MCP call asks for it to decide on a
+/// staleness warning, and [`index_status`] would run four `COUNT(*)` scans
+/// to answer that.
+pub fn pending_files(conn: &Connection, project_id: &str) -> Result<i64> {
+    Ok(conn
+        .query_row(
+            "SELECT pending_files FROM index_state WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
+}
+
 pub fn index_status(conn: &Connection, project_id: &str) -> Result<IndexStatus> {
     let symbols: i64 = conn.query_row(
         "SELECT COUNT(*) FROM symbols WHERE project_id = ?1",
@@ -1658,6 +1672,24 @@ mod tests {
         assert_eq!(hits("a_b"), 1, "`_` must not match any character");
         assert_eq!(hits("%"), 1, "`%` must only match a literal percent sign");
         assert_eq!(hits("a"), 2);
+    }
+
+    #[test]
+    fn pending_files_matches_index_status() {
+        let conn = seed();
+        let pid = project_id(&conn);
+        conn.execute(
+            "UPDATE index_state SET pending_files = 3 WHERE project_id = ?1",
+            params![pid],
+        )
+        .unwrap();
+
+        assert_eq!(pending_files(&conn, &pid).unwrap(), 3);
+        assert_eq!(
+            pending_files(&conn, &pid).unwrap(),
+            index_status(&conn, &pid).unwrap().pending_files
+        );
+        assert_eq!(pending_files(&conn, "unknown-project").unwrap(), 0);
     }
 
     #[test]
