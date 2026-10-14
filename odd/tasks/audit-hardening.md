@@ -18,7 +18,11 @@ T4 S1 SEC-7 + SEC-12 DONE (haiku writers; commits 'cap AST depth', 'owner-only')
 T5 S1 SEC-6 (installers only; update.rs left on main by design, now verified by the script), SEC-8 (user chose: warn + bound DB path), SEC-9 — DONE; SEC-6/SEC-9 by haiku writers, SEC-8 inline (RED observed); commits 'verify release checksums', 'bound storage.database', 'harden workflows'
 T6 S4 QRY-1 pending_files instead of 4 COUNTs per MCP call — inline, RED observed (compile) — DONE
 T7 S5 PERF-2 cap by-name candidates at 8 (user chose: unresolved 'ambiguous: N candidates') — inline, RED observed — DONE. Real C# project (350 files): relationships 197014 -> 52202, DB 106 MB -> 38 MB, debug index 13.4s -> 5.8s
-T8.. remaining S2-S5 IDs — pending (one task per ID group)
+T8 S2 IDX-9 .tsx grammar (haiku writer, RED observed) — DONE
+T9 S2 IDX-1 walk/read failures never deletions; non-UTF-8 — inline, RED observed — DONE
+T10 S2 IDX-3/4/5 watcher order, rescan, bounded retry — inline, RED (compile) observed; IDX-3 ordering has no automated test — DONE
+T11 S2 IDX-10 touch refresh, IDX-2 fingerprint + alias order + force_full deletions (force_full test: RED not observed separately), IDX-6 stable read (test seam), IDX-7 inbound edges, IDX-8 module dependents — inline — DONE
+T12.. S3 token efficiency, S4 QRY-2..11, S5 PERF-1,3..8 — pending
 Verifier (independent, Phase 1): no blockers; advisories A1 follow_symlinks still indexes outside files, A2 depth-capped file skipped silently, A4 stray .bak before symlink refusal, A5 cargo install not --version pinned
 
 ## Log
