@@ -70,6 +70,14 @@ enum Flush {
 /// message; `pending_files` stays non-zero so status keeps saying "stale".
 const MAX_RETRIES: u32 = 5;
 
+/// Whether the event paths touch the inputs that shape analysis but are not
+/// source files: the root `tsconfig.json` (aliases) and the project config.
+fn config_inputs_changed(root: &Path, paths: &HashSet<PathBuf>) -> bool {
+    paths.iter().any(|p| {
+        p == &root.join("tsconfig.json") || p == &root.join(".codekurve").join("config.toml")
+    })
+}
+
 /// Marker path in a pending set meaning "sweep the whole project".
 fn full_sweep_marker() -> PathBuf {
     PathBuf::new()
@@ -144,6 +152,23 @@ fn reconcile(setup: &mut IndexSetup) -> Result<(), String> {
 /// behind with no clear signal — this stops the watcher instead, matching
 /// startup [`reconcile`]'s fatal behavior for the same condition.
 fn apply_flush(setup: &mut IndexSetup, paths: &HashSet<PathBuf>) -> Result<Flush, String> {
+    // Config or tsconfig edits change what every file means: reload them and
+    // reconcile the whole project (the analysis fingerprint decides whether
+    // that is a full reindex).
+    if config_inputs_changed(&setup.root, paths) {
+        println!("project configuration changed; reloading");
+        return match commands::setup_index(&setup.root).and_then(|fresh| {
+            *setup = fresh;
+            reconcile(setup)
+        }) {
+            Ok(()) => Ok(Flush::Done),
+            Err(e) if e.contains("max_total_files") => Err(e),
+            Err(e) => {
+                eprintln!("error: {e}");
+                Ok(Flush::Retry)
+            }
+        };
+    }
     let sweep = needs_full_sweep(&setup.root, paths);
     let filter = relative_paths(&setup.root, paths);
     if !sweep && filter.is_empty() {
@@ -531,5 +556,23 @@ mod tests {
         let root = Path::new("/proj");
         let paths = HashSet::from([PathBuf::from("/proj")]);
         assert!(needs_full_sweep(root, &paths));
+    }
+
+    /// IDX-2/A3: an edit to the files that decide what analysis produces
+    /// (root tsconfig, the project config) must not be ignored by the watcher.
+    #[test]
+    fn config_inputs_are_recognized_in_event_paths() {
+        let root = Path::new("/proj");
+        let hit = |p: &str| config_inputs_changed(root, &HashSet::from([PathBuf::from(p)]));
+        assert!(hit("/proj/tsconfig.json"));
+        assert!(hit("/proj/.codekurve/config.toml"));
+        assert!(!hit("/proj/src/a.ts"));
+        assert!(!hit("/proj/.codekurve/index.db"));
+        assert!(!hit("/proj/.codekurve/index.db-wal"));
+        assert!(
+            !hit("/proj/packages/app/tsconfig.json"),
+            "only the root one is loaded"
+        );
+        assert!(!hit("/other/tsconfig.json"));
     }
 }

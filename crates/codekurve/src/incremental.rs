@@ -1092,6 +1092,158 @@ mod tests {
         );
     }
 
+    fn snapshot_of(conn: &Connection) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stmt = conn
+            .prepare(
+                "SELECT 'unresolved|' || relationship_kind || '|' || target_text || '|' || reason
+                 FROM unresolved_references
+                 UNION ALL
+                 SELECT 'edge|' || r.kind || '|' || s.qualified_name || '|' ||
+                        COALESCE(t.qualified_name, r.target_external, '') || '|' || r.confidence
+                 FROM relationships r
+                 JOIN symbols s ON s.id = r.source_symbol_id
+                 LEFT JOIN symbols t ON t.id = r.target_symbol_id
+                 ORDER BY 1",
+            )
+            .unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        for row in rows {
+            out.push(row.unwrap());
+        }
+        out
+    }
+
+    /// Index `before` (plus filler so edits stay under the full-reindex
+    /// threshold), apply the transition to `after` incrementally, and compare
+    /// with a clean index of `after`. The plan's acceptance criterion:
+    /// "incremental results equal a clean rebuild".
+    fn assert_incremental_equals_clean(before: &[(&str, &str)], after: &[(&str, &str)]) {
+        let filler = |root: &Path| {
+            for i in 0..12 {
+                std_fs::write(root.join(format!("f{i}.ts")), "export const k = 1;\n").unwrap();
+            }
+        };
+        let write = |root: &Path, files: &[(&str, &str)]| {
+            for (path, text) in files {
+                if let Some(parent) = root.join(path).parent() {
+                    std_fs::create_dir_all(parent).unwrap();
+                }
+                std_fs::write(root.join(path), text).unwrap();
+            }
+        };
+
+        let incremental = tempfile::tempdir().unwrap();
+        filler(incremental.path());
+        write(incremental.path(), before);
+        let mut conn_a = db::open_in_memory().unwrap();
+        let project_a = upsert_project(&conn_a, "demo", "/tmp/a", "hash").unwrap();
+        sync(&mut conn_a, &project_a, incremental.path()).unwrap();
+
+        // Transition: delete what `after` no longer has, then write `after`
+        // with a bumped mtime so the fast path cannot hide the edit.
+        for (path, _) in before {
+            if !after.iter().any(|(p, _)| p == path) {
+                std_fs::remove_file(incremental.path().join(path)).unwrap();
+            }
+        }
+        write(incremental.path(), after);
+        for (path, _) in after {
+            std_fs::File::options()
+                .write(true)
+                .open(incremental.path().join(path))
+                .unwrap()
+                .set_modified(SystemTime::now() + std::time::Duration::from_secs(7200))
+                .unwrap();
+        }
+        let outcome = sync(&mut conn_a, &project_a, incremental.path()).unwrap();
+        assert!(!outcome.fell_back_to_full_reindex, "must stay incremental");
+
+        let clean = tempfile::tempdir().unwrap();
+        filler(clean.path());
+        write(clean.path(), after);
+        let mut conn_b = db::open_in_memory().unwrap();
+        let project_b = upsert_project(&conn_b, "demo", "/tmp/b", "hash").unwrap();
+        sync(&mut conn_b, &project_b, clean.path()).unwrap();
+
+        assert_eq!(snapshot_of(&conn_a), snapshot_of(&conn_b));
+    }
+
+    const UTIL: &str = "export function helper() { return 1; }\n";
+    const MAIN: &str =
+        "import { helper } from './util';\nexport function main() { return helper(); }\n";
+
+    /// Editing a file that has named imports used to turn them into "not
+    /// exported by target module".
+    #[test]
+    fn equivalence_edit_importer() {
+        assert_incremental_equals_clean(
+            &[("util.ts", UTIL), ("main.ts", MAIN)],
+            &[
+                ("util.ts", UTIL),
+                ("main.ts", &MAIN.replace("helper()", "helper() + 1")),
+            ],
+        );
+    }
+
+    #[test]
+    fn equivalence_rename_exported_symbol() {
+        assert_incremental_equals_clean(
+            &[("util.ts", UTIL), ("main.ts", MAIN)],
+            &[
+                ("util.ts", &UTIL.replace("helper", "helper2")),
+                ("main.ts", MAIN),
+            ],
+        );
+    }
+
+    #[test]
+    fn equivalence_delete_imported_module() {
+        assert_incremental_equals_clean(
+            &[("util.ts", UTIL), ("main.ts", MAIN)],
+            &[("main.ts", MAIN)],
+        );
+    }
+
+    #[test]
+    fn equivalence_create_missing_module() {
+        assert_incremental_equals_clean(
+            &[("main.ts", MAIN)],
+            &[("util.ts", UTIL), ("main.ts", MAIN)],
+        );
+    }
+
+    #[test]
+    fn equivalence_move_module_and_fix_import() {
+        assert_incremental_equals_clean(
+            &[("util.ts", UTIL), ("main.ts", MAIN)],
+            &[
+                ("lib/util.ts", UTIL),
+                ("main.ts", &MAIN.replace("./util", "./lib/util")),
+            ],
+        );
+    }
+
+    #[test]
+    fn equivalence_class_inheritance_across_files() {
+        assert_incremental_equals_clean(
+            &[
+                ("base.ts", "export class Base { run() { return 1; } }\n"),
+                (
+                    "child.ts",
+                    "import { Base } from './base';\nexport class Child extends Base { go() { return this.run(); } }\n",
+                ),
+            ],
+            &[
+                ("base.ts", "export class Base { run() { return 2; } stop() {} }\n"),
+                (
+                    "child.ts",
+                    "import { Base } from './base';\nexport class Child extends Base { go() { return this.run(); } }\n",
+                ),
+            ],
+        );
+    }
+
     /// IDX-1 (degraded status): files the engine could not verify keep their
     /// rows but must not be reported as a verified index.
     #[cfg(unix)]

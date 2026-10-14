@@ -1347,9 +1347,11 @@ pub struct BaselineSymbolRow {
     pub qualified_name: String,
     pub kind: SymbolKind,
     pub language: LanguageId,
-    /// Mirrors `SymbolTable::build`'s own `exports` fallback (resolve.rs):
+    /// Mirrors `SymbolTable::build_with`'s own `exports` rules (resolve.rs):
     /// true when a persisted `kind = 'exports'` relationship targets this
-    /// symbol, i.e. it was resolvable as an import binding at index time.
+    /// symbol, or it is a top-level TypeScript class/function/interface
+    /// (plain `export` declarations leave no edge) — i.e. it was resolvable
+    /// as an import binding at index time.
     pub exported: bool,
 }
 
@@ -1388,13 +1390,31 @@ pub fn resolution_snapshot(conn: &Connection, project_id: &str) -> Result<Resolu
         .query_map(params![project_id], |row| {
             let kind: String = row.get(3)?;
             let language: String = row.get(4)?;
+            let qualified_name: String = row.get(2)?;
+            let kind = parse_symbol_kind(&kind);
+            let language = parse_language(&language);
+            // `export class Foo {}` / `export function f() {}` leave no
+            // `exports` edge (extract.rs), so the persisted edge alone would
+            // make every plain declaration export look un-exported on an
+            // incremental pass. Mirror the clean build's fallback
+            // (`SymbolTable::build_with`): a top-level TypeScript
+            // class/function/interface — qualified name `<path>::<Name>`,
+            // no member separator — counts as exported.
+            let top_level_declaration = language == LanguageId::TypeScript
+                && matches!(
+                    kind,
+                    SymbolKind::Class | SymbolKind::Function | SymbolKind::Interface
+                )
+                && qualified_name
+                    .split_once("::")
+                    .is_some_and(|(_, local)| !local.contains('.'));
             Ok(BaselineSymbolRow {
                 name: row.get(0)?,
                 relative_path: row.get(1)?,
-                qualified_name: row.get(2)?,
-                kind: parse_symbol_kind(&kind),
-                language: parse_language(&language),
-                exported: row.get::<_, i64>(5)? != 0,
+                qualified_name,
+                kind,
+                language,
+                exported: row.get::<_, i64>(5)? != 0 || top_level_declaration,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2803,7 +2823,10 @@ mod tests {
             .iter()
             .find(|s| s.name == "MemberService")
             .unwrap();
-        assert!(!member_service.exported);
+        // No `exports` edge targets it, but a top-level TypeScript class is
+        // exported by the clean build's declaration fallback, and the
+        // snapshot must agree or incremental passes lose its importers.
+        assert!(member_service.exported);
     }
 
     /// Task 5.7 (design "Batch Atomicity"): mirrors

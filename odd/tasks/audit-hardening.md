@@ -23,7 +23,8 @@ T9 S2 IDX-1 walk/read failures never deletions; non-UTF-8 — inline, RED observ
 T10 S2 IDX-3/4/5 watcher order, rescan, bounded retry — inline, RED (compile) observed; IDX-3 ordering has no automated test — DONE
 T11 S2 IDX-10 touch refresh, IDX-2 fingerprint + alias order + force_full deletions (force_full test: RED not observed separately), IDX-6 stable read (test seam), IDX-7 inbound edges, IDX-8 module dependents — inline — DONE
 T12 S3 TOK-1,2,4(callees path),5,6 + schema_version 2 envelope — inline; tests written with the change (contract tests updated; new no-null guard in envelope_of) — DONE. Measured on real C# project: trace_path no-path 133579 -> 147 chars; find_callees -27%; impact +42% (names added). TOK-3/TOK-4 (user: 'Quitar y documentar (Recomendado)'): rows drop path/name and constant confidence/provenance on symbol rows (search 20.8KB -> 13.6KB, -35%); TOK-7 tool listing 9015 -> 6934 chars (-23%). Still open: TOK-8 overview routes, TOK-9 limit on trace/impact
-T13.. S4 QRY-2..11, S5 PERF-1,3..8 — pending
+T13 S2 verifier follow-ups: B1 degraded status (Unverified), A1 incremental==clean (baseline bug: exported fallback), A2, A3 watch reload — inline, RED observed for each — DONE. Phase 2 verifier (independent): no blockers after B1 fix
+T14.. S4 QRY-2..11, S5 PERF-1,3..8 — pending
 Verifier (independent, Phase 1): no blockers; advisories A1 follow_symlinks still indexes outside files, A2 depth-capped file skipped silently, A4 stray .bak before symlink refusal, A5 cargo install not --version pinned
 
 ## Log

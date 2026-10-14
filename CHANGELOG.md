@@ -11,6 +11,9 @@ All notable changes to this project are documented here. Format follows
 
 ### Fixed
 
+- Index: editing a file with named imports no longer leaves them unresolved ("not exported by target module"): an incremental pass now equals a clean rebuild (covered by six equivalence tests)
+- Index: files that cannot be read or walked keep their rows but leave the index marked stale (`status` pending count, stderr warning) until they can be verified again
+- Watch: edits to the root `tsconfig.json` or `.codekurve/config.toml` reload the configuration and reconcile
 - Index: a directory the walk cannot read, or a file that cannot be read during a full reindex, is no longer treated as a deletion (the existing index is kept and the failure reported)
 - Index: non-UTF-8 files (e.g. Latin-1 C#) are indexed instead of failing the batch
 - Index: touch-only edits refresh the stored mtime; bytes and mtime are read as a consistent pair
