@@ -42,17 +42,62 @@ impl DiscoveryOptions {
     }
 }
 
-/// Walk `root` and return the eligible source files, sorted by relative path
-/// for deterministic output. Unreadable entries are skipped rather than
-/// aborting the walk. Hard-fails with `Error::TooManyFiles` the moment the
-/// discovered count exceeds `options.max_total_files` (`0` = unlimited) —
-/// mid-walk short-circuit, not a post-walk count check, so an oversized
-/// project never finishes an expensive full walk just to be rejected
-/// (design "max_total_files enforcement point").
+/// What a walk found, plus what it could not look at. A caller that diffs
+/// the walk against stored state must not read "not found" as "deleted" for
+/// anything under `unreadable` (or at all when `incomplete`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiscoveryReport {
+    pub files: Vec<DiscoveredFile>,
+    /// Root-relative `/`-separated paths (directories or files) the walk
+    /// failed on, e.g. a permission error.
+    pub unreadable: Vec<String>,
+    /// A walk error carried no usable path: nothing can be ruled deleted.
+    pub incomplete: bool,
+}
+
+impl DiscoveryReport {
+    /// Whether `relative_path` lies at or under something the walk failed on.
+    pub fn is_unverified(&self, relative_path: &str) -> bool {
+        self.incomplete
+            || self.unreadable.iter().any(|failed| {
+                relative_path == failed
+                    || relative_path
+                        .strip_prefix(failed.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+    }
+}
+
+fn walk_error_path(err: &ignore::Error) -> Option<&Path> {
+    match err {
+        ignore::Error::WithPath { path, .. } => Some(path),
+        ignore::Error::WithDepth { err, .. } => walk_error_path(err),
+        ignore::Error::Loop { child, .. } => Some(child),
+        ignore::Error::Partial(errors) => errors.iter().find_map(walk_error_path),
+        _ => None,
+    }
+}
+
+/// [`discover_report`] without the failure detail (callers that only want
+/// the files, e.g. a first index).
 pub fn discover(
     root: &Path,
     options: &DiscoveryOptions,
 ) -> Result<Vec<DiscoveredFile>, codekurve_core::Error> {
+    discover_report(root, options).map(|report| report.files)
+}
+
+/// Walk `root` and return the eligible source files, sorted by relative path
+/// for deterministic output. Walk errors are recorded in the report instead
+/// of being dropped. Hard-fails with `Error::TooManyFiles` the moment the
+/// discovered count exceeds `options.max_total_files` (`0` = unlimited) —
+/// mid-walk short-circuit, not a post-walk count check, so an oversized
+/// project never finishes an expensive full walk just to be rejected
+/// (design "max_total_files enforcement point").
+pub fn discover_report(
+    root: &Path,
+    options: &DiscoveryOptions,
+) -> Result<DiscoveryReport, codekurve_core::Error> {
     let mut builder = WalkBuilder::new(root);
     if !options.ignore_patterns.is_empty() {
         builder.overrides(build_ignore_overrides(root, &options.ignore_patterns)?);
@@ -69,7 +114,19 @@ pub fn discover(
         .max_filesize(Some(options.max_file_size_bytes));
 
     let mut files = Vec::new();
-    for entry in builder.build().flatten() {
+    let mut unreadable = Vec::new();
+    let mut incomplete = false;
+    for entry in builder.build() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                match walk_error_path(&err).and_then(|path| relative_slash_path(root, path)) {
+                    Some(relative) if !relative.is_empty() => unreadable.push(relative),
+                    _ => incomplete = true,
+                }
+                continue;
+            }
+        };
         // ponytail: extension filter is enough for TS/JS/C# (`LanguageId::
         // from_extension` covers `.cs` since Phase 5); explicit binary
         // sniffing (§15.2) lands when non-text extensions matter.
@@ -103,7 +160,11 @@ pub fn discover(
     }
 
     files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
-    Ok(files)
+    Ok(DiscoveryReport {
+        files,
+        unreadable,
+        incomplete,
+    })
 }
 
 /// Compile `ignore.patterns` into walk overrides. Override globs are a
@@ -303,5 +364,32 @@ mod tests {
             codekurve_core::Error::InvalidIgnorePattern { ref pattern, .. }
                 if pattern == "src/[unclosed"
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_directory_is_reported_not_swallowed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("locked")).unwrap();
+        std::fs::write(dir.path().join("locked/b.ts"), "export const b = 1;\n").unwrap();
+        std::fs::write(dir.path().join("ok.ts"), "export const a = 1;\n").unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = std::fs::read_dir(&locked).is_err();
+
+        let report = discover_report(dir.path(), &options());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if !denied {
+            return; // running as root: mode bits are ignored
+        }
+
+        let report = report.unwrap();
+        assert_eq!(report.files.len(), 1);
+        assert_eq!(report.unreadable, vec!["locked".to_string()]);
+        assert!(report.is_unverified("locked/b.ts"));
+        assert!(!report.is_unverified("ok.ts"));
+        assert!(!report.is_unverified("lockedx/b.ts"));
     }
 }

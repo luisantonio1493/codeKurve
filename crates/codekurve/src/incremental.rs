@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
-use codekurve_analysis::discovery::{self, DiscoveredFile, DiscoveryOptions};
+use codekurve_analysis::discovery::{self, DiscoveredFile, DiscoveryOptions, DiscoveryReport};
 use codekurve_analysis::extract;
 use codekurve_analysis::ir::{EdgeTarget, FileAnalysis};
 use codekurve_analysis::resolve::{self, TsconfigAliases};
@@ -69,6 +69,15 @@ pub struct BatchOutcome {
 /// routes into a full [`repo::reindex`] (no separate codepath needed). Set
 /// by callers that detected an analyzer-version mismatch (new extraction
 /// logic, unchanged source files — content hashes alone can't see that).
+/// Raw bytes plus a lossy UTF-8 view. Hash and size are taken from the bytes
+/// (what `detect` compares against); a Latin-1 file still gets analyzed
+/// instead of failing the batch.
+fn read_source(path: &Path) -> std::io::Result<(Vec<u8>, String)> {
+    let bytes = fs::read(path)?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    Ok((bytes, text))
+}
+
 pub fn detect(
     conn: &Connection,
     project_id: &str,
@@ -77,7 +86,8 @@ pub fn detect(
     filter: Option<&HashSet<String>>,
     force_full: bool,
 ) -> Result<Vec<FileChange>, String> {
-    let discovered = discovery::discover(root, opts).map_err(|e| e.to_string())?;
+    let report = discovery::discover_report(root, opts).map_err(|e| e.to_string())?;
+    let discovered = report.files.clone();
     let stored = if force_full {
         HashMap::new()
     } else {
@@ -123,6 +133,10 @@ pub fn detect(
             continue;
         }
         if filter.is_some_and(|f| !filter_matches(f, path)) {
+            continue;
+        }
+        // The walk could not look here: absence is not evidence of deletion.
+        if report.is_unverified(path) {
             continue;
         }
         changes.push(FileChange::Deleted {
@@ -189,6 +203,10 @@ pub fn apply_batch(
     apply_incremental_changes(conn, ctx, changes, &ts)
 }
 
+fn file_meta_paths(analyses: &[FileAnalysis]) -> HashSet<&str> {
+    analyses.iter().map(|a| a.file.as_str()).collect()
+}
+
 fn is_oversized(changed: usize, tracked: usize, threshold_pct: u32) -> bool {
     if tracked == 0 {
         // Bootstrap: nothing tracked yet, so every discovered file reads as
@@ -206,25 +224,51 @@ fn apply_via_full_reindex(
     conn: &mut Connection,
     ctx: &IndexContext,
 ) -> Result<BatchOutcome, String> {
-    let discovered = discovery::discover(ctx.root, ctx.options).map_err(|e| e.to_string())?;
+    let report: DiscoveryReport =
+        discovery::discover_report(ctx.root, ctx.options).map_err(|e| e.to_string())?;
 
     let mut analyses: Vec<FileAnalysis> = Vec::new();
     let mut file_meta: Vec<FileMeta> = Vec::new();
-    for file in &discovered {
-        let Ok(source) = fs::read_to_string(&file.absolute_path) else {
+    let mut skipped: Vec<String> = Vec::new();
+    for file in &report.files {
+        let Ok((bytes, source)) = read_source(&file.absolute_path) else {
+            skipped.push(file.relative_path.clone());
             continue;
         };
         let Ok(analysis) = extract::analyze(&source, file.language, &file.relative_path) else {
+            skipped.push(file.relative_path.clone());
             continue;
         };
         let meta = fs::metadata(&file.absolute_path).map_err(|e| e.to_string())?;
         file_meta.push(FileMeta {
             language: file.language,
-            size_bytes: source.len() as u64,
-            content_hash: repo::content_hash(source.as_bytes()),
+            size_bytes: bytes.len() as u64,
+            content_hash: repo::content_hash(&bytes),
             modified_ns: mtime_ns(&meta)?,
         });
         analyses.push(analysis);
+    }
+
+    // `reindex` replaces the whole project, so a file we could not read or
+    // walk would silently vanish from the index. Refuse and keep what is
+    // stored; files that were never indexed are only warned about.
+    let stored = repo::file_snapshot(conn, ctx.project_id).map_err(|e| e.to_string())?;
+    let analyzed: HashSet<&str> = file_meta_paths(&analyses);
+    let mut lost: Vec<&String> = stored
+        .keys()
+        .filter(|path| !analyzed.contains(path.as_str()))
+        .filter(|path| skipped.contains(path) || report.is_unverified(path))
+        .collect();
+    if !lost.is_empty() {
+        lost.sort();
+        return Err(format!(
+            "{} previously indexed file(s) could not be read or parsed (e.g. {}); keeping the existing index",
+            lost.len(),
+            lost[0]
+        ));
+    }
+    for path in &skipped {
+        eprintln!("warning: skipped unreadable or unparsable file {path}");
     }
     resolve::resolve(&mut analyses, ctx.aliases);
 
@@ -272,14 +316,14 @@ fn apply_incremental_changes(
     let mut analyses: Vec<FileAnalysis> = Vec::new();
     let mut file_meta: Vec<FileMeta> = Vec::new();
     for file in &created_or_modified {
-        let source = fs::read_to_string(&file.absolute_path).map_err(|e| e.to_string())?;
+        let (bytes, source) = read_source(&file.absolute_path).map_err(|e| e.to_string())?;
         let analysis = extract::analyze(&source, file.language, &file.relative_path)
             .map_err(|e| e.to_string())?;
         let meta = fs::metadata(&file.absolute_path).map_err(|e| e.to_string())?;
         file_meta.push(FileMeta {
             language: file.language,
-            size_bytes: source.len() as u64,
-            content_hash: repo::content_hash(source.as_bytes()),
+            size_bytes: bytes.len() as u64,
+            content_hash: repo::content_hash(&bytes),
             modified_ns: mtime_ns(&meta)?,
         });
         analyses.push(analysis);
@@ -321,7 +365,7 @@ fn apply_incremental_changes(
         let absolute = ctx.root.join(path);
         // Vanished since it was last indexed (rare race); skip this cycle,
         // it'll be reconsidered on the next sweep.
-        let Ok(source) = fs::read_to_string(&absolute) else {
+        let Ok((bytes, source)) = read_source(&absolute) else {
             continue;
         };
         let ext = Path::new(path)
@@ -337,8 +381,8 @@ fn apply_incremental_changes(
         let meta = fs::metadata(&absolute).map_err(|e| e.to_string())?;
         file_meta.push(FileMeta {
             language,
-            size_bytes: source.len() as u64,
-            content_hash: repo::content_hash(source.as_bytes()),
+            size_bytes: bytes.len() as u64,
+            content_hash: repo::content_hash(&bytes),
             modified_ns: mtime_ns(&meta)?,
         });
         analyses.push(analysis);
@@ -542,6 +586,151 @@ mod tests {
         ));
         // Exactly touched (skipped) excluded: changed + added + removed = 3.
         assert_eq!(changes.len(), 3);
+    }
+
+    fn ctx<'a>(
+        root: &'a Path,
+        project_id: &'a str,
+        aliases: &'a TsconfigAliases,
+        options: &'a DiscoveryOptions,
+    ) -> IndexContext<'a> {
+        IndexContext {
+            root,
+            project_id,
+            aliases,
+            options,
+            full_reindex_threshold_pct: 25,
+        }
+    }
+
+    /// Run `detect` + `apply_batch` once, like a real `index` pass.
+    fn sync(conn: &mut Connection, project: &str, root: &Path) -> Result<BatchOutcome, String> {
+        let options = discovery_opts();
+        let aliases = TsconfigAliases::new();
+        let changes = detect(conn, project, root, &options, None, false)?;
+        apply_batch(conn, &ctx(root, project, &aliases, &options), &changes)
+    }
+
+    /// IDX-1: a Latin-1 file is indexed (lossy decode) instead of failing the
+    /// batch, and its hash is of the raw bytes so the next pass sees no change.
+    #[test]
+    fn non_utf8_file_is_indexed_and_stable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for i in 0..10 {
+            std_fs::write(root.join(format!("f{i}.ts")), "export const a = 1;\n").unwrap();
+        }
+        let mut conn = db::open_in_memory().unwrap();
+        let project = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        sync(&mut conn, &project, root).unwrap();
+
+        // incremental path (1 change out of 10 tracked, under the 25% threshold)
+        std_fs::write(
+            root.join("latin1.ts"),
+            b"export const caf = 1; // caf\xe9\n".as_slice(),
+        )
+        .unwrap();
+        let outcome = sync(&mut conn, &project, root).expect("non-UTF-8 must not fail the batch");
+        assert!(!outcome.fell_back_to_full_reindex);
+        assert_eq!(repo::count_files(&conn, &project).unwrap(), 11);
+
+        let again = detect(&conn, &project, root, &discovery_opts(), None, false).unwrap();
+        assert!(again.is_empty(), "unchanged bytes re-detected as {again:?}");
+    }
+
+    /// IDX-1: the full-reindex fallback keeps non-UTF-8 files too.
+    #[test]
+    fn full_reindex_keeps_non_utf8_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std_fs::write(root.join("ok.ts"), "export const a = 1;\n").unwrap();
+        std_fs::write(
+            root.join("latin1.ts"),
+            b"export const b = 1; // \xe9\n".as_slice(),
+        )
+        .unwrap();
+        let mut conn = db::open_in_memory().unwrap();
+        let project = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+
+        sync(&mut conn, &project, root).unwrap();
+
+        assert_eq!(repo::count_files(&conn, &project).unwrap(), 2);
+    }
+
+    #[cfg(unix)]
+    fn deny(path: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        std_fs::set_permissions(path, std_fs::Permissions::from_mode(0o000)).unwrap();
+        // Running as root ignores the mode bits; the scenario can't be built.
+        let readable = if path.is_dir() {
+            std_fs::read_dir(path).is_ok()
+        } else {
+            std_fs::read(path).is_ok()
+        };
+        if readable {
+            std_fs::set_permissions(path, std_fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        !readable
+    }
+
+    #[cfg(unix)]
+    fn allow(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std_fs::set_permissions(path, std_fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// IDX-1: a directory the walk cannot read is a failure, not a deletion.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_directory_does_not_delete_its_indexed_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std_fs::create_dir(root.join("locked")).unwrap();
+        std_fs::write(root.join("keep.ts"), "export const a = 1;\n").unwrap();
+        std_fs::write(root.join("locked/b.ts"), "export const b = 1;\n").unwrap();
+        let mut conn = db::open_in_memory().unwrap();
+        let project = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        seed_indexed(&mut conn, &project, root, &["keep.ts", "locked/b.ts"]);
+
+        if !deny(&root.join("locked")) {
+            return;
+        }
+        let changes = detect(&conn, &project, root, &discovery_opts(), None, false);
+        allow(&root.join("locked"));
+
+        let changes = changes.unwrap();
+        assert!(
+            !changes
+                .iter()
+                .any(|c| matches!(c, FileChange::Deleted { .. })),
+            "unreadable directory read as deletion: {changes:?}"
+        );
+    }
+
+    /// IDX-1: a full reindex must not wipe the index when a previously
+    /// indexed file can no longer be read.
+    #[cfg(unix)]
+    #[test]
+    fn full_reindex_with_unreadable_indexed_file_keeps_the_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std_fs::write(root.join("a.ts"), "export const a = 1;\n").unwrap();
+        std_fs::write(root.join("b.ts"), "export const b = 1;\n").unwrap();
+        let mut conn = db::open_in_memory().unwrap();
+        let project = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        sync(&mut conn, &project, root).unwrap();
+        assert_eq!(repo::count_files(&conn, &project).unwrap(), 2);
+
+        if !deny(&root.join("b.ts")) {
+            return;
+        }
+        let options = discovery_opts();
+        let aliases = TsconfigAliases::new();
+        let result = apply_via_full_reindex(&mut conn, &ctx(root, &project, &aliases, &options));
+        allow(&root.join("b.ts"));
+
+        assert!(result.is_err(), "expected an error, got {result:?}");
+        assert_eq!(repo::count_files(&conn, &project).unwrap(), 2);
     }
 
     /// Task 7.6 (design's open question: "`watch` on macOS FSEvents may
