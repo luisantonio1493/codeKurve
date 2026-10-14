@@ -63,14 +63,59 @@ fi
 # Release tags are vX.Y.Z; accept a bare X.Y.Z in CODEKURVE_VERSION too.
 case "$version" in v*) ;; *) version="v$version" ;; esac
 
-# 3. Download the raw binary directly to its final destination.
-url="https://github.com/$REPO/releases/download/$version/$asset"
+# 3. Download the binary and verify it before touching the installed copy.
+#
+# Integrity: the release publishes a SHA256SUMS manifest (`<sha256>  <file>`)
+# next to the binaries. The binary is checked against its entry before it is
+# made executable or moved into place. A missing manifest, missing entry, or
+# mismatch aborts with the existing install left untouched.
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+  echo "codekurve: neither sha256sum nor shasum is available; cannot verify the download." >&2
+  exit 1
+fi
+
+release_base="https://github.com/$REPO/releases/download/$version"
+url="$release_base/$asset"
 echo "Installing codekurve $version ($asset)..."
 mkdir -p "$BIN_DIR"
 tmp="$(mktemp "$BIN_DIR/.codekurve.XXXXXX")"
 trap 'rm -f "$tmp"' EXIT
 curl -fsSL "$url" -o "$tmp" || { echo "codekurve: download failed: $url" >&2; exit 1; }
+
+manifest="$(curl -fsSL "$release_base/SHA256SUMS")" \
+  || { echo "codekurve: could not download SHA256SUMS from $release_base; refusing to install an unverified binary." >&2; exit 1; }
+expected="$(printf '%s\n' "$manifest" \
+  | awk -v f="$asset" '{ n = $2; sub(/^\*/, "", n); if (n == f) print $1 }')"
+expected_count="$(printf '%s\n' "$expected" | grep -c . || true)"
+if [ "$expected_count" -ne 1 ]; then
+  echo "codekurve: SHA256SUMS has $expected_count entries for $asset (expected exactly 1); refusing to install." >&2
+  exit 1
+fi
+expected="$(printf '%s' "$expected" | tr 'A-F' 'a-f')"
+actual="$(sha256_of "$tmp" | tr 'A-F' 'a-f')"
+if [ "$actual" != "$expected" ]; then
+  echo "codekurve: checksum mismatch for $asset (expected $expected, got $actual); refusing to install." >&2
+  exit 1
+fi
+
+# Smoke test the verified file before it replaces anything.
 chmod +x "$tmp"
+if ! "$tmp" --version >/dev/null 2>&1; then
+  echo "codekurve: downloaded $asset failed its '--version' smoke test; existing install left unchanged." >&2
+  exit 1
+fi
+
+# Keep the previous binary for manual rollback, then replace it.
+if [ -e "$DEST" ]; then
+  cp -p "$DEST" "$DEST.prev"
+fi
 mv "$tmp" "$DEST"
 trap - EXIT
 
