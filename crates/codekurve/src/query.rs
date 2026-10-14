@@ -267,17 +267,18 @@ pub fn trace(
     let target = commands::resolve_symbol(conn, project_id, None, Some(to))?;
     let min_confidence = commands::parse_confidence(args.min_confidence)?;
 
-    let adjacency = traverse::load_adjacency(conn, project_id, false)
-        .map_err(|e| CommandError::from(e.to_string()))?;
     let caps = commands::bfs_caps(args.depth);
-    Ok(traverse::bfs(
-        &adjacency,
+    traverse::bfs_db(
+        conn,
+        project_id,
+        false,
         &from,
         Some(&target),
         &caps,
         None,
         min_confidence,
-    ))
+    )
+    .map_err(|e| CommandError::from(e.to_string()))
 }
 
 /// Extracted from `commands::impact`: bounded reverse BFS (§26.5) —
@@ -288,17 +289,18 @@ pub fn impact(s: &Session, args: &QueryArgs) -> Result<traverse::BfsOutcome, Com
     let symbol_id = commands::resolve_symbol(conn, project_id, args.symbol_id, args.symbol_name)?;
     let min_confidence = commands::parse_confidence(args.min_confidence)?;
 
-    let adjacency = traverse::load_adjacency(conn, project_id, true)
-        .map_err(|e| CommandError::from(e.to_string()))?;
     let caps = commands::bfs_caps(args.depth);
-    Ok(traverse::bfs(
-        &adjacency,
+    traverse::bfs_db(
+        conn,
+        project_id,
+        true,
         &symbol_id,
         None,
         &caps,
         None,
         min_confidence,
-    ))
+    )
+    .map_err(|e| CommandError::from(e.to_string()))
 }
 
 /// One §28.3 row (path, line range, confidence, provenance) for a

@@ -107,8 +107,8 @@ pub fn run(args: &QueryArgs, output: &Path, yes: bool) -> Result<(), CommandErro
     Ok(())
 }
 
-/// Bidirectional neighbourhood: the existing bounded BFS (`traverse::bfs`)
-/// run once forward and once over the reverse-keyed adjacency, then merged.
+/// Bidirectional neighbourhood: the existing bounded BFS (`traverse::bfs_db`)
+/// run once forward and once over the reverse-keyed edges, then merged.
 /// No new traversal — the caps, the truncation reasons and the
 /// `min_confidence` filter are exactly the ones `trace`/`impact` already
 /// respect.
@@ -120,16 +120,19 @@ fn build(session: &Session, args: &QueryArgs) -> Result<Graph, CommandError> {
 
     let mut outcomes = Vec::new();
     for reverse in [false, true] {
-        let adjacency = traverse::load_adjacency(conn, project_id, reverse)
-            .map_err(|e| CommandError::from(e.to_string()))?;
-        outcomes.push(traverse::bfs(
-            &adjacency,
-            &focus,
-            None,
-            &caps,
-            None,
-            min_confidence,
-        ));
+        outcomes.push(
+            traverse::bfs_db(
+                conn,
+                project_id,
+                reverse,
+                &focus,
+                None,
+                &caps,
+                None,
+                min_confidence,
+            )
+            .map_err(|e| CommandError::from(e.to_string()))?,
+        );
     }
     merge(session, &focus, &outcomes[0], &outcomes[1])
 }

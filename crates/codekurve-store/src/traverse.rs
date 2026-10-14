@@ -125,6 +125,154 @@ pub fn bfs(
     allowed_kinds: Option<&[RelationshipKind]>,
     min_confidence: Option<Confidence>,
 ) -> BfsOutcome {
+    bfs_core(
+        &mut |node, _queue| adjacency.get(node).cloned().unwrap_or_default(),
+        start,
+        target,
+        caps,
+        allowed_kinds,
+        min_confidence,
+    )
+}
+
+/// Edges read from SQLite on demand. The search asks for one node's edges;
+/// the load is widened to the nodes already waiting in the BFS queue, so a
+/// whole frontier costs one `IN (...)` query instead of one query per node —
+/// and nothing outside what the search touches is ever read (the old path
+/// loaded every edge of the project, ~110 ms per call at 200k edges).
+struct LazyEdges<'a> {
+    conn: &'a Connection,
+    project_id: &'a str,
+    reverse: bool,
+    cache: HashMap<String, Vec<Edge>>,
+    requested: HashSet<String>,
+    edges_loaded: usize,
+    error: Option<crate::error::Error>,
+}
+
+/// Nodes fetched per query (well under SQLite's variable limit).
+const FRONTIER_BATCH: usize = 500;
+
+impl<'a> LazyEdges<'a> {
+    fn new(conn: &'a Connection, project_id: &'a str, reverse: bool) -> Self {
+        Self {
+            conn,
+            project_id,
+            reverse,
+            cache: HashMap::new(),
+            requested: HashSet::new(),
+            edges_loaded: 0,
+            error: None,
+        }
+    }
+
+    fn edges_of(&mut self, node: &str, queue: &VecDeque<String>) -> Vec<Edge> {
+        if !self.requested.contains(node) && self.error.is_none() {
+            let mut batch: Vec<&str> = vec![node];
+            batch.extend(
+                queue
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|n| !self.requested.contains(*n))
+                    .take(FRONTIER_BATCH - 1),
+            );
+            let batch: Vec<String> = batch.into_iter().map(str::to_string).collect();
+            if let Err(e) = self.load(&batch) {
+                self.error = Some(e);
+            }
+        }
+        self.cache.get(node).cloned().unwrap_or_default()
+    }
+
+    /// One query for `nodes`. Per-node edge order matches a full table scan
+    /// (`ORDER BY rowid`), so BFS tie-breaking is identical to the in-memory
+    /// path.
+    fn load(&mut self, nodes: &[String]) -> Result<()> {
+        let (node_col, other_col) = if self.reverse {
+            ("target_symbol_id", "source_symbol_id")
+        } else {
+            ("source_symbol_id", "target_symbol_id")
+        };
+        let placeholders = vec!["?"; nodes.len()].join(",");
+        let sql = format!(
+            "SELECT {node_col}, {other_col}, kind, confidence, provenance
+             FROM relationships
+             WHERE project_id = ? AND target_symbol_id IS NOT NULL
+               AND {node_col} IN ({placeholders})
+             ORDER BY rowid"
+        );
+        let mut binds: Vec<&str> = vec![self.project_id];
+        binds.extend(nodes.iter().map(String::as_str));
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                Edge {
+                    neighbor_symbol_id: row.get(1)?,
+                    kind: row.get(2)?,
+                    confidence: row.get(3)?,
+                    provenance: row.get(4)?,
+                },
+            ))
+        })?;
+        for node in nodes {
+            self.requested.insert(node.clone());
+        }
+        for row in rows {
+            let (node, edge) = row?;
+            self.edges_loaded += 1;
+            self.cache.entry(node).or_default().push(edge);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn loaded_edge_count(&self) -> usize {
+        self.edges_loaded
+    }
+
+    fn finish(self) -> Result<()> {
+        match self.error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
+/// [`bfs`] over the database: same result as `bfs(&load_adjacency(..), ..)`,
+/// reading only the edges around the nodes the search visits.
+#[allow(clippy::too_many_arguments)]
+pub fn bfs_db(
+    conn: &Connection,
+    project_id: &str,
+    reverse: bool,
+    start: &str,
+    target: Option<&str>,
+    caps: &BfsCaps,
+    allowed_kinds: Option<&[RelationshipKind]>,
+    min_confidence: Option<Confidence>,
+) -> Result<BfsOutcome> {
+    let mut lazy = LazyEdges::new(conn, project_id, reverse);
+    let outcome = bfs_core(
+        &mut |node, queue| lazy.edges_of(node, queue),
+        start,
+        target,
+        caps,
+        allowed_kinds,
+        min_confidence,
+    );
+    lazy.finish()?;
+    Ok(outcome)
+}
+
+fn bfs_core(
+    neighbors: &mut dyn FnMut(&str, &VecDeque<String>) -> Vec<Edge>,
+    start: &str,
+    target: Option<&str>,
+    caps: &BfsCaps,
+    allowed_kinds: Option<&[RelationshipKind]>,
+    min_confidence: Option<Confidence>,
+) -> BfsOutcome {
     let started_at = Instant::now();
     let mut visited: HashSet<String> = HashSet::new();
     let mut queue: VecDeque<String> = VecDeque::new();
@@ -156,16 +304,14 @@ pub fn bfs(
 
     'bfs: while let Some(node) = queue.pop_front() {
         let depth = depths[&node];
+        let edges = neighbors(&node, &queue);
         if depth >= caps.max_depth {
-            if adjacency.get(&node).is_some_and(|e| !e.is_empty()) {
+            if !edges.is_empty() {
                 depth_capped = true;
             }
             continue;
         }
-        let Some(edges) = adjacency.get(&node) else {
-            continue;
-        };
-        for edge in edges {
+        for edge in &edges {
             if started_at.elapsed() > caps.max_duration {
                 truncated_reason = Some(TruncationReason::MaxDuration);
                 break 'bfs;
@@ -442,5 +588,141 @@ mod tests {
 
         let reverse = load_adjacency(&conn, &project, true).unwrap();
         assert_eq!(reverse[&b_id][0].neighbor_symbol_id, a_id);
+    }
+
+    /// QRY-2: a graph with a cycle, a diamond and a disconnected component,
+    /// returned as (conn, project, ids by name).
+    fn seeded_graph() -> (Connection, String, HashMap<String, String>) {
+        let mut conn = db::open_in_memory().unwrap();
+        let project = repo::upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        let names = ["A", "B", "C", "D", "E", "X", "Y"];
+        let files = vec![repo::FileInput {
+            relative_path: "src/graph.ts".to_string(),
+            language: "typescript".to_string(),
+            content_hash: "test-hash".to_string(),
+            modified_ns: 0,
+            size_bytes: 10,
+            symbols: names
+                .iter()
+                .map(|n| symbol(n, SymbolKind::Function))
+                .collect(),
+        }];
+        repo::reindex(&mut conn, &project, &files, &[], &[]).unwrap();
+        let id = |n: &str| -> String {
+            conn.query_row("SELECT id FROM symbols WHERE name = ?1", [n], |r| r.get(0))
+                .unwrap()
+        };
+        let ids: HashMap<String, String> = names.iter().map(|n| (n.to_string(), id(n))).collect();
+        let file_id: String = conn
+            .query_row("SELECT id FROM files LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let rel = |from: &str, to: &str, confidence: Confidence| repo::RelationshipInput {
+            source_symbol_id: ids[from].clone(),
+            target_symbol_id: Some(ids[to].clone()),
+            target_external: None,
+            kind: RelationshipKind::Calls,
+            provenance: codekurve_core::Provenance::Extracted,
+            confidence,
+            source_file_id: file_id.clone(),
+            start_line: Some(1),
+            start_column: Some(0),
+            reason: None,
+        };
+        // A -> B -> D, A -> C -> D (diamond), D -> E, E -> A (cycle), X -> Y (apart)
+        let relationships = vec![
+            rel("A", "B", Confidence::Exact),
+            rel("A", "C", Confidence::Low),
+            rel("B", "D", Confidence::Exact),
+            rel("C", "D", Confidence::High),
+            rel("D", "E", Confidence::Exact),
+            rel("E", "A", Confidence::Medium),
+            rel("X", "Y", Confidence::Exact),
+        ];
+        repo::reindex(&mut conn, &project, &files, &relationships, &[]).unwrap();
+        (conn, project, ids)
+    }
+
+    fn assert_same(a: &BfsOutcome, b: &BfsOutcome) {
+        assert_eq!(a.reached, b.reached);
+        assert_eq!(a.path, b.path);
+        assert_eq!(a.truncated, b.truncated);
+        assert_eq!(a.truncated_reason, b.truncated_reason);
+    }
+
+    /// QRY-2: the lazy, frontier-batched traversal returns exactly what the
+    /// in-memory one does over the fully loaded adjacency — same nodes, same
+    /// order, same path, same truncation.
+    #[test]
+    fn bfs_db_matches_the_in_memory_bfs() {
+        let (conn, project, ids) = seeded_graph();
+        for reverse in [false, true] {
+            let adjacency = load_adjacency(&conn, &project, reverse).unwrap();
+            for start in ["A", "D", "X", "E"] {
+                for (target, depth) in [(None, 10), (Some("E"), 10), (Some("D"), 1), (None, 1)] {
+                    let target = target.map(|t| ids[t].as_str());
+                    let want = bfs(&adjacency, &ids[start], target, &caps(depth), None, None);
+                    let got = bfs_db(
+                        &conn,
+                        &project,
+                        reverse,
+                        &ids[start],
+                        target,
+                        &caps(depth),
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                    assert_same(&want, &got);
+                }
+            }
+            // confidence floor and node cap behave the same too
+            let want = bfs(
+                &adjacency,
+                &ids["A"],
+                None,
+                &caps(10),
+                None,
+                Some(Confidence::High),
+            );
+            let got = bfs_db(
+                &conn,
+                &project,
+                reverse,
+                &ids["A"],
+                None,
+                &caps(10),
+                None,
+                Some(Confidence::High),
+            )
+            .unwrap();
+            assert_same(&want, &got);
+
+            let tight = BfsCaps {
+                max_nodes: 3,
+                ..caps(10)
+            };
+            let want = bfs(&adjacency, &ids["A"], None, &tight, None, None);
+            let got = bfs_db(
+                &conn, &project, reverse, &ids["A"], None, &tight, None, None,
+            )
+            .unwrap();
+            assert_same(&want, &got);
+        }
+    }
+
+    /// QRY-2: only the neighbourhood of what the search touches is read, not
+    /// the whole project.
+    #[test]
+    fn lazy_edges_load_only_what_the_search_touches() {
+        let (conn, project, ids) = seeded_graph();
+        let mut lazy = LazyEdges::new(&conn, &project, false);
+        let edges = lazy.edges_of(&ids["X"], &VecDeque::new());
+        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            lazy.loaded_edge_count(),
+            1,
+            "A..E's six edges must not be loaded"
+        );
+        assert!(lazy.finish().is_ok());
     }
 }
