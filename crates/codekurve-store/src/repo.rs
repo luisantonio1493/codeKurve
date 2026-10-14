@@ -384,22 +384,17 @@ fn delete_file_owned_symbols(tx: &Transaction, file_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Task 5.2 (spec "Per-File Delete Removes Symbols and Converts Inbound
-/// Edges to Unresolved"): removes a tracked file entirely — its own symbols,
-/// its own outbound edges, and its `files` row — and converts every inbound
-/// edge (a relationship from another file targeting one of this file's
-/// symbols) into an `unresolved_references` row instead of silently
-/// dropping it. `target_text` uses the target symbol's bare `name`, mirroring
-/// how by-name resolution (`resolve_by_name`/`resolve_binding`) already
-/// looks targets up.
-pub fn delete_file(
+/// Every relationship from ANOTHER file into `file_id`'s symbols becomes an
+/// `unresolved_references` row (target text = the symbol's bare name), so
+/// the symbols can be deleted without a dangling foreign key and without
+/// silently dropping the reference.
+fn convert_inbound_to_unresolved(
     tx: &Transaction,
     project_id: &str,
     ts: &str,
-    relative_path: &str,
+    file_id: &str,
+    reason: &str,
 ) -> Result<()> {
-    let file_id = file_id(project_id, relative_path);
-
     let mut stmt = tx.prepare(
         "SELECT r.id, r.source_symbol_id, r.source_file_id, r.kind, s.name
          FROM relationships r
@@ -429,11 +424,35 @@ pub fn delete_file(
             target_text: target_name.clone(),
             context_json: None,
             candidate_count: 0,
-            reason: "target symbol's file was deleted".to_string(),
+            reason: reason.to_string(),
             confidence: Confidence::Unresolved,
         });
     }
-    persist_unresolved(tx, project_id, ts, &unresolved)?;
+    persist_unresolved(tx, project_id, ts, &unresolved)
+}
+
+/// Task 5.2 (spec "Per-File Delete Removes Symbols and Converts Inbound
+/// Edges to Unresolved"): removes a tracked file entirely — its own symbols,
+/// its own outbound edges, and its `files` row — and converts every inbound
+/// edge (a relationship from another file targeting one of this file's
+/// symbols) into an `unresolved_references` row instead of silently
+/// dropping it. `target_text` uses the target symbol's bare `name`, mirroring
+/// how by-name resolution (`resolve_by_name`/`resolve_binding`) already
+/// looks targets up.
+pub fn delete_file(
+    tx: &Transaction,
+    project_id: &str,
+    ts: &str,
+    relative_path: &str,
+) -> Result<()> {
+    let file_id = file_id(project_id, relative_path);
+    convert_inbound_to_unresolved(
+        tx,
+        project_id,
+        ts,
+        &file_id,
+        "target symbol's file was deleted",
+    )?;
 
     delete_file_owned_rows(tx, project_id, &file_id)?;
     tx.execute("DELETE FROM files WHERE id = ?1", params![file_id])?;
@@ -470,6 +489,19 @@ pub fn apply_incremental(
     // `delete_file_owned_relationships`'s doc comment).
     for file in files {
         delete_file_owned_relationships(tx, project_id, &file_id(project_id, &file.relative_path))?;
+    }
+    // An edge still pointing into a batch file's symbols now comes from a
+    // file outside the batch (e.g. a dependent that could not be re-read);
+    // park it as unresolved rather than let the symbol delete violate the
+    // foreign key and roll the whole batch back.
+    for file in files {
+        convert_inbound_to_unresolved(
+            tx,
+            project_id,
+            ts,
+            &file_id(project_id, &file.relative_path),
+            "target symbol was replaced; this file was not re-analyzed",
+        )?;
     }
     for file in files {
         delete_file_owned_symbols(tx, &file_id(project_id, &file.relative_path))?;
@@ -1441,6 +1473,49 @@ pub fn dependents_by_unresolved_target(
         row.get::<_, String>(0)
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Files holding a relative import that did not resolve to any project file
+/// (`reason = 'module not found in project'`) and whose specifier ends in one
+/// of `stems` — i.e. imports a newly created module may now satisfy, even
+/// when the import names no symbol (`import * as M from './m'`, `import
+/// './m'`). Bare package specifiers (`react`) never match: they have no `/`.
+pub fn dependents_by_unresolved_module(
+    conn: &Connection,
+    project_id: &str,
+    stems: &[String],
+) -> Result<Vec<String>> {
+    let mut found = Vec::new();
+    for chunk in stems.chunks(100) {
+        let clauses = chunk
+            .iter()
+            .map(|_| "(u.target_text LIKE ? ESCAPE '\\' OR u.target_text LIKE ? ESCAPE '\\')")
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let sql = format!(
+            "SELECT DISTINCT f.relative_path
+             FROM unresolved_references u
+             JOIN files f ON f.id = u.source_file_id
+             WHERE u.project_id = ? AND u.reason = 'module not found in project'
+               AND u.target_text LIKE '%/%' AND ({clauses})"
+        );
+        let mut binds: Vec<String> = vec![project_id.to_string()];
+        for stem in chunk {
+            let escaped = escape_like(stem);
+            binds.push(format!("%/{escaped}"));
+            binds.push(format!("%/{escaped}.%"));
+        }
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+            row.get::<_, String>(0)
+        })?;
+        for row in rows {
+            found.push(row?);
+        }
+    }
+    found.sort();
+    found.dedup();
+    Ok(found)
 }
 
 /// Stable BLAKE3 content hash of the config text.

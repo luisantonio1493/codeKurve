@@ -77,13 +77,43 @@ pub struct BatchOutcome {
 /// routes into a full [`repo::reindex`] (no separate codepath needed). Set
 /// by callers that detected an analyzer-version mismatch (new extraction
 /// logic, unchanged source files — content hashes alone can't see that).
-/// Raw bytes plus a lossy UTF-8 view. Hash and size are taken from the bytes
-/// (what `detect` compares against); a Latin-1 file still gets analyzed
-/// instead of failing the batch.
-fn read_source(path: &Path) -> std::io::Result<(Vec<u8>, String)> {
-    let bytes = fs::read(path)?;
-    let text = String::from_utf8_lossy(&bytes).into_owned();
-    Ok((bytes, text))
+/// A file read whose bytes and mtime describe the same version of it.
+struct StableRead {
+    bytes: Vec<u8>,
+    text: String,
+    modified_ns: i64,
+}
+
+fn read_stable(path: &Path) -> Result<StableRead, String> {
+    read_stable_with(path, || {})
+}
+
+/// Stat, read, stat again; if size or mtime moved, a write raced the read —
+/// retry a few times, then fail the file (the watcher retries the batch).
+/// Raw bytes plus a lossy UTF-8 view: hash and size come from the bytes
+/// (what `detect` compares against), so a Latin-1 file is still analyzed
+/// instead of failing the batch. `between` runs after the read, before the
+/// second stat (a test seam; a no-op in production).
+fn read_stable_with(path: &Path, mut between: impl FnMut()) -> Result<StableRead, String> {
+    for _ in 0..3 {
+        let before = fs::metadata(path).map_err(|e| e.to_string())?;
+        let bytes = fs::read(path).map_err(|e| e.to_string())?;
+        between();
+        let after = fs::metadata(path).map_err(|e| e.to_string())?;
+        let (before_ns, after_ns) = (mtime_ns(&before)?, mtime_ns(&after)?);
+        if before.len() == after.len() && before_ns == after_ns {
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            return Ok(StableRead {
+                bytes,
+                text,
+                modified_ns: after_ns,
+            });
+        }
+    }
+    Err(format!(
+        "{} kept changing while it was being read",
+        path.display()
+    ))
 }
 
 pub fn detect(
@@ -237,6 +267,21 @@ pub fn apply_batch(
     apply_incremental_changes(conn, ctx, changes, &ts)
 }
 
+/// The last path segment an import of this file would end in: the file stem,
+/// or the directory name for an `index` file.
+fn module_stem(relative_path: &str) -> Option<String> {
+    let path = Path::new(relative_path);
+    let stem = path.file_stem()?.to_str()?;
+    if stem == "index" {
+        return path
+            .parent()?
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string);
+    }
+    Some(stem.to_string())
+}
+
 fn file_meta_paths(analyses: &[FileAnalysis]) -> HashSet<&str> {
     analyses.iter().map(|a| a.file.as_str()).collect()
 }
@@ -265,20 +310,19 @@ fn apply_via_full_reindex(
     let mut file_meta: Vec<FileMeta> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     for file in &report.files {
-        let Ok((bytes, source)) = read_source(&file.absolute_path) else {
+        let Ok(read) = read_stable(&file.absolute_path) else {
             skipped.push(file.relative_path.clone());
             continue;
         };
-        let Ok(analysis) = extract::analyze(&source, file.language, &file.relative_path) else {
+        let Ok(analysis) = extract::analyze(&read.text, file.language, &file.relative_path) else {
             skipped.push(file.relative_path.clone());
             continue;
         };
-        let meta = fs::metadata(&file.absolute_path).map_err(|e| e.to_string())?;
         file_meta.push(FileMeta {
             language: file.language,
-            size_bytes: bytes.len() as u64,
-            content_hash: repo::content_hash(&bytes),
-            modified_ns: mtime_ns(&meta)?,
+            size_bytes: read.bytes.len() as u64,
+            content_hash: repo::content_hash(&read.bytes),
+            modified_ns: read.modified_ns,
         });
         analyses.push(analysis);
     }
@@ -351,15 +395,14 @@ fn apply_incremental_changes(
     let mut analyses: Vec<FileAnalysis> = Vec::new();
     let mut file_meta: Vec<FileMeta> = Vec::new();
     for file in &created_or_modified {
-        let (bytes, source) = read_source(&file.absolute_path).map_err(|e| e.to_string())?;
-        let analysis = extract::analyze(&source, file.language, &file.relative_path)
+        let read = read_stable(&file.absolute_path)?;
+        let analysis = extract::analyze(&read.text, file.language, &file.relative_path)
             .map_err(|e| e.to_string())?;
-        let meta = fs::metadata(&file.absolute_path).map_err(|e| e.to_string())?;
         file_meta.push(FileMeta {
             language: file.language,
-            size_bytes: bytes.len() as u64,
-            content_hash: repo::content_hash(&bytes),
-            modified_ns: mtime_ns(&meta)?,
+            size_bytes: read.bytes.len() as u64,
+            content_hash: repo::content_hash(&read.bytes),
+            modified_ns: read.modified_ns,
         });
         analyses.push(analysis);
     }
@@ -392,6 +435,21 @@ fn apply_incremental_changes(
         repo::dependents_by_unresolved_target(conn, ctx.project_id, &new_names)
             .map_err(|e| e.to_string())?,
     );
+    // A newly created module can satisfy a relative import that named no
+    // symbol, so by-name matching never sees it: match the import specifiers
+    // against the new files' module names (`foo.ts` -> `foo`, `a/index.ts`
+    // -> `a`).
+    let new_modules: Vec<String> = changes
+        .iter()
+        .filter_map(|c| match c {
+            FileChange::Created(f) => module_stem(&f.relative_path),
+            _ => None,
+        })
+        .collect();
+    dependents.extend(
+        repo::dependents_by_unresolved_module(conn, ctx.project_id, &new_modules)
+            .map_err(|e| e.to_string())?,
+    );
     dependents.retain(|p| !b_paths.contains(p) && !deleted_set.contains(p));
 
     let mut d_paths: Vec<String> = dependents.into_iter().collect();
@@ -400,7 +458,7 @@ fn apply_incremental_changes(
         let absolute = ctx.root.join(path);
         // Vanished since it was last indexed (rare race); skip this cycle,
         // it'll be reconsidered on the next sweep.
-        let Ok((bytes, source)) = read_source(&absolute) else {
+        let Ok(read) = read_stable(&absolute) else {
             continue;
         };
         let ext = Path::new(path)
@@ -410,15 +468,14 @@ fn apply_incremental_changes(
         let Some(language) = LanguageId::from_extension(ext) else {
             continue;
         };
-        let Ok(analysis) = extract::analyze(&source, language, path) else {
+        let Ok(analysis) = extract::analyze(&read.text, language, path) else {
             continue;
         };
-        let meta = fs::metadata(&absolute).map_err(|e| e.to_string())?;
         file_meta.push(FileMeta {
             language,
-            size_bytes: bytes.len() as u64,
-            content_hash: repo::content_hash(&bytes),
-            modified_ns: mtime_ns(&meta)?,
+            size_bytes: read.bytes.len() as u64,
+            content_hash: repo::content_hash(&read.bytes),
+            modified_ns: read.modified_ns,
         });
         analyses.push(analysis);
     }
@@ -677,6 +734,171 @@ mod tests {
             })
             .collect();
         assert_eq!(deleted.len(), 3, "got {changes:?}");
+    }
+
+    /// IDX-7: a dependent file that cannot be re-read must not break the
+    /// batch (stale edges to symbols about to be replaced used to violate a
+    /// foreign key and roll the whole transaction back).
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_dependent_does_not_fail_the_batch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for i in 0..10 {
+            std_fs::write(root.join(format!("f{i}.ts")), "export const k = 1;\n").unwrap();
+        }
+        std_fs::write(root.join("a.ts"), "export function foo() { return 1; }\n").unwrap();
+        std_fs::write(
+            root.join("b.ts"),
+            "import { foo } from './a';\nexport function run() { return foo(); }\n",
+        )
+        .unwrap();
+        let mut conn = db::open_in_memory().unwrap();
+        let project = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        sync(&mut conn, &project, root).unwrap();
+        let edges: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM relationships WHERE kind = 'calls' AND target_symbol_id IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(edges >= 1, "fixture must produce a call edge into a.ts");
+
+        // Change a.ts so its symbol is replaced; make its dependent unreadable.
+        std_fs::write(root.join("a.ts"), "export function foo() { return 2; }\n").unwrap();
+        std_fs::File::options()
+            .write(true)
+            .open(root.join("a.ts"))
+            .unwrap()
+            .set_modified(SystemTime::now() + std::time::Duration::from_secs(7200))
+            .unwrap();
+        if !deny(&root.join("b.ts")) {
+            return;
+        }
+        let result = sync(&mut conn, &project, root);
+        allow(&root.join("b.ts"));
+
+        assert!(result.is_ok(), "batch failed: {result:?}");
+        let dangling: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM relationships r
+                 WHERE r.target_symbol_id IS NOT NULL
+                   AND NOT EXISTS (SELECT 1 FROM symbols s WHERE s.id = r.target_symbol_id)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dangling, 0);
+    }
+
+    /// IDX-6: bytes and mtime must describe the same version of the file. A
+    /// write landing between the read and the stat used to store the new
+    /// mtime with the old hash, hiding the change from the fast path forever.
+    #[test]
+    fn read_stable_retries_when_the_file_changes_mid_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a.ts");
+        std_fs::write(&path, "export const a = 1;\n").unwrap();
+        let mut writes = 0;
+
+        let read = read_stable_with(&path, || {
+            if writes == 0 {
+                writes += 1;
+                std_fs::write(&path, "export const a = 22;\n").unwrap();
+                std_fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(SystemTime::now() + std::time::Duration::from_secs(10))
+                    .unwrap();
+            }
+        })
+        .unwrap();
+
+        assert_eq!(read.text, "export const a = 22;\n");
+        assert_eq!(
+            read.modified_ns,
+            mtime_ns(&std_fs::metadata(&path).unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn read_stable_gives_up_on_a_file_that_keeps_changing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a.ts");
+        std_fs::write(&path, "x").unwrap();
+        let mut n = 0u64;
+
+        let result = read_stable_with(&path, || {
+            n += 1;
+            std_fs::write(&path, "x".repeat(n as usize + 1)).unwrap();
+        });
+
+        assert!(result.is_err());
+    }
+
+    fn unresolved_modules(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM unresolved_references WHERE reason = 'module not found in project'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// IDX-8: creating the module a file already imports (even a namespace
+    /// import that names no symbol) re-resolves that importer.
+    #[test]
+    fn creating_an_imported_module_re_resolves_its_importers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for i in 0..10 {
+            std_fs::write(root.join(format!("f{i}.ts")), "export const k = 1;\n").unwrap();
+        }
+        std_fs::write(
+            root.join("b.ts"),
+            "import * as M from './missing';\nexport const x = M;\n",
+        )
+        .unwrap();
+        let mut conn = db::open_in_memory().unwrap();
+        let project = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        sync(&mut conn, &project, root).unwrap();
+        assert_eq!(
+            unresolved_modules(&conn),
+            1,
+            "fixture needs the dangling import"
+        );
+
+        std_fs::write(root.join("missing.ts"), "export const unrelated = 1;\n").unwrap();
+        let outcome = sync(&mut conn, &project, root).unwrap();
+
+        assert!(!outcome.fell_back_to_full_reindex, "must stay incremental");
+        assert_eq!(unresolved_modules(&conn), 0, "importer was not re-resolved");
+    }
+
+    /// IDX-8: unrelated new files do not drag every importer of an external
+    /// package into the batch.
+    #[test]
+    fn creating_an_unrelated_file_does_not_re_resolve_package_importers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for i in 0..10 {
+            std_fs::write(root.join(format!("f{i}.ts")), "export const k = 1;\n").unwrap();
+        }
+        std_fs::write(
+            root.join("b.ts"),
+            "import React from 'react';\nexport const x = React;\n",
+        )
+        .unwrap();
+        let mut conn = db::open_in_memory().unwrap();
+        let project = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        sync(&mut conn, &project, root).unwrap();
+
+        std_fs::write(root.join("other.ts"), "export const unrelated = 1;\n").unwrap();
+        let outcome = sync(&mut conn, &project, root).unwrap();
+
+        assert_eq!(outcome.files_changed, 1, "only the new file is reindexed");
     }
 
     /// IDX-10: a touch-only edit (mtime moved, bytes identical) refreshes the
