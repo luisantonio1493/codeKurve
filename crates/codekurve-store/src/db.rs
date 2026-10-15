@@ -59,6 +59,12 @@ fn configure(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Run `PRAGMA optimize` so SQLite refreshes planner statistics for `conn`.
+pub fn optimize(conn: &Connection) -> Result<()> {
+    conn.execute_batch("PRAGMA optimize;")?;
+    Ok(())
+}
+
 /// Whether this SQLite build supports FTS5 (surfaced by `doctor`, §24.1).
 pub fn has_fts5(conn: &Connection) -> bool {
     conn.execute_batch(
@@ -66,6 +72,17 @@ pub fn has_fts5(conn: &Connection) -> bool {
          DROP TABLE temp.__fts5_probe;",
     )
     .is_ok()
+}
+
+#[cfg(test)]
+mod optimize_tests {
+    use super::*;
+
+    #[test]
+    fn optimize_succeeds_on_migrated_connection() {
+        let conn = open_in_memory().unwrap();
+        optimize(&conn).unwrap();
+    }
 }
 
 #[cfg(all(test, unix))]

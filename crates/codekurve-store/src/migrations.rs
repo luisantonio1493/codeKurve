@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::error::{Error, Result};
 
 /// Schema version applied by this build.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 const MIGRATION_0001: &str = r#"
 CREATE TABLE projects (
@@ -180,6 +180,19 @@ const MIGRATION_0006: &str = r#"
 ALTER TABLE projects ADD COLUMN analyzer_version TEXT;
 "#;
 
+/// Migration 0007 (Phase 4 QRY-7): indexes for the per-file and per-symbol
+/// lookups that the 0002 indexes do not cover — relationship/unresolved
+/// rows by `source_file_id` (reindex deletes, file scoping), unresolved rows
+/// by `source_symbol_id`, and project-prefixed `(target|source, kind)`
+/// lookups. Purely additive: no table is rewritten and no row changes.
+const MIGRATION_0007: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_relationships_source_file ON relationships(source_file_id);
+CREATE INDEX IF NOT EXISTS idx_relationships_project_target_kind ON relationships(project_id, target_symbol_id, kind);
+CREATE INDEX IF NOT EXISTS idx_relationships_project_source_kind ON relationships(project_id, source_symbol_id, kind);
+CREATE INDEX IF NOT EXISTS idx_unresolved_source_file ON unresolved_references(source_file_id);
+CREATE INDEX IF NOT EXISTS idx_unresolved_source_symbol ON unresolved_references(source_symbol_id);
+"#;
+
 /// Apply all pending migrations. Idempotent: already-applied versions are
 /// skipped.
 pub fn apply(conn: &Connection) -> Result<()> {
@@ -262,6 +275,17 @@ pub fn apply(conn: &Connection) -> Result<()> {
         tx.commit()?;
     }
 
+    if current < 7 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_0007)
+            .map_err(|e| Error::Migration(format!("0007: {e}")))?;
+        tx.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (7, datetime('now'))",
+            [],
+        )?;
+        tx.commit()?;
+    }
+
     Ok(())
 }
 
@@ -282,13 +306,13 @@ mod tests {
     use crate::db;
 
     /// Spec scenario "Fresh database migration": a fresh DB ends at
-    /// `SCHEMA_VERSION` (6), the pre-existing relationship-graph tables
+    /// `SCHEMA_VERSION` (7), the pre-existing relationship-graph tables
     /// still exist, and Phase 3's `index_state` table (plus the
     /// `files.content_hash`/`modified_ns` columns) is present.
     #[test]
-    fn fresh_database_reaches_schema_version_6() {
+    fn fresh_database_reaches_schema_version_7() {
         let conn = db::open_in_memory().unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 6);
+        assert_eq!(current_version(&conn).unwrap(), 7);
 
         let table_exists = |name: &str| -> bool {
             conn.query_row(
@@ -340,7 +364,7 @@ mod tests {
         // Re-running apply() on an already-migrated connection must be a
         // no-op, not an error (idempotency).
         apply(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 6);
+        assert_eq!(current_version(&conn).unwrap(), 7);
     }
 
     /// Phase 5 PR1 task 1.10 / symbol-index "Schema Migration 0004 ... Without
@@ -362,7 +386,7 @@ mod tests {
              ALTER TABLE symbols DROP COLUMN is_record;
              ALTER TABLE symbols DROP COLUMN roles;
              ALTER TABLE projects DROP COLUMN analyzer_version;
-             DELETE FROM schema_migrations WHERE version IN (4, 5, 6);",
+             DELETE FROM schema_migrations WHERE version >= 4;",
         )
         .unwrap();
         assert_eq!(current_version(&conn).unwrap(), 3);
@@ -395,7 +419,7 @@ mod tests {
             .unwrap();
 
         apply(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 6);
+        assert_eq!(current_version(&conn).unwrap(), 7);
 
         let symbol_count_after: i64 = conn
             .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
@@ -447,7 +471,7 @@ mod tests {
         conn.execute_batch(
             "ALTER TABLE symbols DROP COLUMN roles;
              ALTER TABLE projects DROP COLUMN analyzer_version;
-             DELETE FROM schema_migrations WHERE version IN (5, 6);",
+             DELETE FROM schema_migrations WHERE version >= 5;",
         )
         .unwrap();
         assert_eq!(current_version(&conn).unwrap(), 4);
@@ -482,7 +506,7 @@ mod tests {
             .unwrap();
 
         apply(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 6);
+        assert_eq!(current_version(&conn).unwrap(), 7);
 
         let symbol_count_after: i64 = conn
             .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
@@ -499,5 +523,112 @@ mod tests {
         assert_eq!(id, "sym-1");
         assert_eq!(key, "preexisting-key", "pre-migration symbol_key unchanged");
         assert_eq!(roles, "");
+    }
+
+    /// Phase 4 QRY-7 / S4: a database indexed under `SCHEMA_VERSION = 6`
+    /// upgrades to 7 with its relationship and unresolved-reference rows
+    /// intact and gains the five query indexes from migration 0007.
+    #[test]
+    fn migration_0007_adds_query_indexes_without_wiping_v6_data() {
+        let conn = db::open_in_memory().unwrap();
+        // Roll the ledger back to "as if only 0001-0006 had run" by dropping
+        // the 0007 indexes and downgrading the recorded version.
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_relationships_source_file;
+             DROP INDEX IF EXISTS idx_relationships_project_target_kind;
+             DROP INDEX IF EXISTS idx_relationships_project_source_kind;
+             DROP INDEX IF EXISTS idx_unresolved_source_file;
+             DROP INDEX IF EXISTS idx_unresolved_source_symbol;
+             DELETE FROM schema_migrations WHERE version >= 7;",
+        )
+        .unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 6);
+
+        conn.execute_batch(
+            "INSERT INTO projects(id, name, root_path, config_hash, created_at, updated_at)
+                 VALUES ('prj-1', 'demo', '/tmp/demo', 'hash', '0', '0');
+             INSERT INTO files(id, project_id, relative_path, language, size_bytes,
+                 parse_status, generation, created_at, updated_at)
+                 VALUES ('fil-1', 'prj-1', 'src/a.ts', 'typescript', 10, 'ok', 1, '0', '0');
+             INSERT INTO symbols(id, project_id, file_id, symbol_key, name, qualified_name,
+                 kind, language, start_byte, end_byte, start_line, start_column, end_line,
+                 end_column, provenance, confidence, generation, created_at, updated_at)
+                 VALUES ('sym-1', 'prj-1', 'fil-1', 'preexisting-key', 'Foo', 'src/a.ts::Foo',
+                 'class', 'typescript', 0, 10, 1, 0, 1, 10, 'tree-sitter', 'high', 1, '0', '0');
+             INSERT INTO relationships(id, project_id, source_symbol_id, target_symbol_id,
+                 kind, provenance, confidence, source_file_id, generation, created_at, updated_at)
+                 VALUES ('rel-1', 'prj-1', 'sym-1', 'sym-1', 'calls', 'tree-sitter', 'high',
+                 'fil-1', 1, '0', '0');
+             INSERT INTO unresolved_references(id, project_id, source_symbol_id, source_file_id,
+                 relationship_kind, target_text, reason, confidence, generation, created_at,
+                 updated_at)
+                 VALUES ('unr-1', 'prj-1', 'sym-1', 'fil-1', 'calls', 'Bar', 'not_found', 'low',
+                 1, '0', '0');",
+        )
+        .unwrap();
+
+        apply(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 7);
+
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM relationships WHERE id = 'rel-1'"),
+            1
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM unresolved_references WHERE id = 'unr-1'"),
+            1
+        );
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN (
+                    'idx_relationships_source_file',
+                    'idx_relationships_project_target_kind',
+                    'idx_relationships_project_source_kind',
+                    'idx_unresolved_source_file',
+                    'idx_unresolved_source_symbol')"
+            ),
+            5
+        );
+    }
+
+    /// Returns the `EXPLAIN QUERY PLAN` detail lines for `sql`, joined.
+    fn query_plan(conn: &Connection, sql: &str) -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// QRY-7 / S4: a relationships lookup by `source_file_id` uses the new
+    /// index rather than scanning the table.
+    #[test]
+    fn relationships_by_source_file_uses_index() {
+        let conn = db::open_in_memory().unwrap();
+        let plan = query_plan(
+            &conn,
+            "SELECT id FROM relationships WHERE source_file_id = 'fil-1'",
+        );
+        assert!(
+            plan.contains("idx_relationships_source_file"),
+            "plan was: {plan}"
+        );
+    }
+
+    /// QRY-7 / S4: an unresolved-reference lookup by `source_symbol_id` uses
+    /// the new index rather than scanning the table.
+    #[test]
+    fn unresolved_by_source_symbol_uses_index() {
+        let conn = db::open_in_memory().unwrap();
+        let plan = query_plan(
+            &conn,
+            "SELECT id FROM unresolved_references WHERE source_symbol_id = 'sym-1'",
+        );
+        assert!(
+            plan.contains("idx_unresolved_source_symbol"),
+            "plan was: {plan}"
+        );
     }
 }

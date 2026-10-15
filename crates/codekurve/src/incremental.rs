@@ -296,6 +296,8 @@ pub fn apply_batch(
     // take that back.
     record_unverified(conn, ctx.project_id, unverified)?;
     outcome.unverified = unverified;
+    // Refresh planner statistics after real writes; a hint, never a failure.
+    let _ = codekurve_store::db::optimize(conn);
     Ok(outcome)
 }
 

@@ -40,7 +40,8 @@ pub fn load_adjacency(
     let mut stmt = conn.prepare(
         "SELECT source_symbol_id, target_symbol_id, kind, confidence, provenance
          FROM relationships
-         WHERE project_id = ?1 AND target_symbol_id IS NOT NULL",
+         WHERE project_id = ?1 AND target_symbol_id IS NOT NULL
+         ORDER BY rowid",
     )?;
     let rows = stmt.query_map(params![project_id], |row| {
         Ok((
