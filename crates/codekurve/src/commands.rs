@@ -999,19 +999,6 @@ pub(crate) fn parse_confidence(raw: Option<&str>) -> Result<Option<Confidence>, 
     }
 }
 
-/// ponytail: applies to the four flat relationship-list commands only —
-/// `trace`/`impact`'s BFS result (a path plus a reached-set) isn't a
-/// page-able list in the same sense, so they don't call this.
-pub(crate) fn paginate<T>(rows: &mut Vec<T>, limit: Option<usize>, offset: Option<usize>) {
-    if let Some(offset) = offset {
-        let drop_n = offset.min(rows.len());
-        rows.drain(0..drop_n);
-    }
-    if let Some(limit) = limit {
-        rows.truncate(limit);
-    }
-}
-
 fn relationship_json(r: &repo::StoredRelationship) -> serde_json::Value {
     serde_json::json!({
         "source_symbol_id": r.source_symbol_id,

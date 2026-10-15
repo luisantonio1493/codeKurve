@@ -13,7 +13,9 @@
 use std::path::{Path, PathBuf};
 
 use codekurve_core::{Config, SourceSpan};
-use codekurve_store::repo::{self, StoredRelationship, StoredSymbol, StoredUnresolved};
+use codekurve_store::repo::{
+    self, PageRequest, Paged, StoredRelationship, StoredSymbol, StoredUnresolved,
+};
 use codekurve_store::{db, migrations, traverse, Connection};
 
 use crate::commands::{self, CommandError, QueryArgs};
@@ -137,6 +139,16 @@ pub struct Page<T> {
     pub truncated: bool,
 }
 
+/// A store page as a [`Page`]: `truncated` when rows remain past this page.
+fn page_of<T>(paged: Paged<T>, offset: usize) -> Page<T> {
+    let truncated = paged.total > offset + paged.rows.len();
+    Page {
+        rows: paged.rows,
+        total: paged.total,
+        truncated,
+    }
+}
+
 /// §27.5 JSON envelope. `total` is only emitted when `Some` — every CLI call
 /// site passes `None`, so today's `--json` golden output stays
 /// byte-identical; MCP (PR5+) passes `Some(page.total)`.
@@ -225,7 +237,7 @@ pub fn mcp_envelope(
 
 /// Shared body of `references`/`callers`/`callees`/`implementations`:
 /// resolve the subject symbol, run the single indexed SELECT (§5a.1), then
-/// paginate. Extracted from `commands::relationship_command`.
+/// page it in SQL. Extracted from `commands::relationship_command`.
 pub fn relationships(
     s: &Session,
     kind: RelKind,
@@ -241,16 +253,13 @@ pub fn relationships(
         RelKind::Implementations => repo::implementations,
     };
 
-    let mut rows = query_fn(conn, project_id, &symbol_id, min_confidence)
+    let window = PageRequest {
+        limit: args.limit,
+        offset: args.offset.unwrap_or(0),
+    };
+    let paged = query_fn(conn, project_id, &symbol_id, min_confidence, window)
         .map_err(|e| CommandError::from(e.to_string()))?;
-    let total = rows.len();
-    commands::paginate(&mut rows, args.limit, args.offset);
-    let truncated = total > args.offset.unwrap_or(0) + rows.len();
-    Ok(Page {
-        rows,
-        total,
-        truncated,
-    })
+    Ok(page_of(paged, window.offset))
 }
 
 /// Extracted from `commands::trace`: bounded forward BFS (§26.4) from the
@@ -486,16 +495,19 @@ pub fn unresolved(
         (id, name) => Some(commands::resolve_symbol(conn, project_id, id, name)?),
     };
 
-    let mut rows = repo::unresolved(conn, project_id, filter.target_text, symbol_id.as_deref())
-        .map_err(|e| CommandError::from(e.to_string()))?;
-    let total = rows.len();
-    commands::paginate(&mut rows, filter.limit, filter.offset);
-    let truncated = total > filter.offset.unwrap_or(0) + rows.len();
-    Ok(Page {
-        rows,
-        total,
-        truncated,
-    })
+    let window = PageRequest {
+        limit: filter.limit,
+        offset: filter.offset.unwrap_or(0),
+    };
+    let paged = repo::unresolved(
+        conn,
+        project_id,
+        filter.target_text,
+        symbol_id.as_deref(),
+        window,
+    )
+    .map_err(|e| CommandError::from(e.to_string()))?;
+    Ok(page_of(paged, window.offset))
 }
 
 /// One §28.3 row for a [`StoredUnresolved`] — shared by the CLI's `--json`
@@ -557,16 +569,13 @@ pub fn routes(
     offset: Option<usize>,
 ) -> Result<Page<StoredRelationship>, CommandError> {
     let (conn, project_id) = s.indexed()?;
-    let mut rows = repo::routes(conn, project_id, route_query)
+    let window = PageRequest {
+        limit: Some(limit),
+        offset: offset.unwrap_or(0),
+    };
+    let paged = repo::routes(conn, project_id, route_query, window)
         .map_err(|e| CommandError::from(e.to_string()))?;
-    let total = rows.len();
-    commands::paginate(&mut rows, Some(limit), offset);
-    let truncated = total > offset.unwrap_or(0) + rows.len();
-    Ok(Page {
-        rows,
-        total,
-        truncated,
-    })
+    Ok(page_of(paged, window.offset))
 }
 
 /// A single resolved symbol by id — the shape `get_symbol` needs to chain

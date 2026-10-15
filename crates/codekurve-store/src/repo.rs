@@ -927,7 +927,8 @@ pub fn references(
     project_id: &str,
     symbol_id: &str,
     min_confidence: Option<Confidence>,
-) -> Result<Vec<StoredRelationship>> {
+    page: PageRequest,
+) -> Result<Paged<StoredRelationship>> {
     query_relationships(
         conn,
         "target_symbol_id",
@@ -935,6 +936,7 @@ pub fn references(
         symbol_id,
         &[],
         min_confidence,
+        page,
     )
 }
 
@@ -945,7 +947,8 @@ pub fn callers(
     project_id: &str,
     symbol_id: &str,
     min_confidence: Option<Confidence>,
-) -> Result<Vec<StoredRelationship>> {
+    page: PageRequest,
+) -> Result<Paged<StoredRelationship>> {
     query_relationships(
         conn,
         "target_symbol_id",
@@ -953,6 +956,7 @@ pub fn callers(
         symbol_id,
         &[RelationshipKind::Calls],
         min_confidence,
+        page,
     )
 }
 
@@ -963,7 +967,8 @@ pub fn callees(
     project_id: &str,
     symbol_id: &str,
     min_confidence: Option<Confidence>,
-) -> Result<Vec<StoredRelationship>> {
+    page: PageRequest,
+) -> Result<Paged<StoredRelationship>> {
     query_relationships(
         conn,
         "source_symbol_id",
@@ -971,6 +976,7 @@ pub fn callees(
         symbol_id,
         &[RelationshipKind::Calls],
         min_confidence,
+        page,
     )
 }
 
@@ -981,7 +987,8 @@ pub fn implementations(
     project_id: &str,
     symbol_id: &str,
     min_confidence: Option<Confidence>,
-) -> Result<Vec<StoredRelationship>> {
+    page: PageRequest,
+) -> Result<Paged<StoredRelationship>> {
     query_relationships(
         conn,
         "target_symbol_id",
@@ -989,14 +996,97 @@ pub fn implementations(
         symbol_id,
         &[RelationshipKind::Implements, RelationshipKind::Inherits],
         min_confidence,
+        page,
     )
 }
+
+/// Window of a result list, pushed into SQL as `LIMIT`/`OFFSET` so rows
+/// outside the page are never materialized.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PageRequest {
+    /// `None` returns every row after `offset`.
+    pub limit: Option<usize>,
+    pub offset: usize,
+}
+
+impl PageRequest {
+    /// No windowing: every matching row.
+    pub const ALL: PageRequest = PageRequest {
+        limit: None,
+        offset: 0,
+    };
+}
+
+/// One page of rows plus the number of rows that match the query before
+/// paging (after every filter).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Paged<T> {
+    pub rows: Vec<T>,
+    pub total: usize,
+}
+
+/// Run `rows_sql` (which must end in `LIMIT ? OFFSET ?`) for one page and
+/// `count_sql` for the total. The count is skipped when the page already
+/// proves it: the first page came back short of its limit.
+fn fetch_page<T>(
+    conn: &Connection,
+    count_sql: &str,
+    rows_sql: &str,
+    binds: Vec<rusqlite::types::Value>,
+    page: PageRequest,
+    map: fn(&Row) -> rusqlite::Result<T>,
+) -> Result<Paged<T>> {
+    use rusqlite::types::Value;
+    let to_sql_int = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+    let mut page_binds = binds.clone();
+    page_binds.push(Value::Integer(page.limit.map_or(-1, to_sql_int)));
+    page_binds.push(Value::Integer(to_sql_int(page.offset)));
+
+    let mut stmt = conn.prepare_cached(rows_sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(page_binds), map)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let complete = page.offset == 0 && page.limit.is_none_or(|limit| rows.len() < limit);
+    let total = if complete {
+        rows.len()
+    } else {
+        let mut stmt = conn.prepare_cached(count_sql)?;
+        stmt.query_row(rusqlite::params_from_iter(binds), |row| {
+            row.get::<_, i64>(0)
+        })? as usize
+    };
+    Ok(Paged { rows, total })
+}
+
+/// `AND r.confidence IN (...)` keeping every rank at or above `min` — the
+/// SQL form of `confidence_rank(row) >= confidence_rank(min)`. Empty when
+/// `min` ranks 0 (every row, unrecognized values included, passes).
+fn confidence_filter(min: Option<Confidence>) -> String {
+    let threshold = min.map_or(0, |m| confidence_rank(m.as_str()));
+    let kept: Vec<String> = ["exact", "high", "medium", "low"]
+        .into_iter()
+        .filter(|name| confidence_rank(name) >= threshold)
+        .map(|name| format!("'{name}'"))
+        .collect();
+    if threshold == 0 {
+        String::new()
+    } else {
+        format!(" AND r.confidence IN ({})", kept.join(","))
+    }
+}
+
+/// Columns every relationship listing returns (see [`map_relationship`]).
+const RELATIONSHIP_COLUMNS: &str =
+    "r.source_symbol_id, src.qualified_name, r.target_symbol_id, tgt.qualified_name,
+     r.target_external, r.kind, r.provenance, r.confidence, r.start_line, r.start_column,
+     src_file.relative_path, r.reason";
 
 /// Shared query behind `references`/`callers`/`callees`/`implementations`:
 /// one indexed SELECT (`idx_relationships_source_kind`/`_target_kind` covers
 /// `column = ?` [`AND kind IN (...)`]) joined to both endpoints' symbol rows
-/// for display, then an in-memory `min_confidence` filter (row counts per
-/// symbol are small; no need for a second query or SQL rank `CASE`).
+/// for display. `min_confidence` and the page window are applied in SQL; the
+/// ordering ends in `rowid` so pages never overlap or skip rows on ties.
 fn query_relationships(
     conn: &Connection,
     column: &'static str,
@@ -1004,38 +1094,37 @@ fn query_relationships(
     symbol_id: &str,
     kinds: &[RelationshipKind],
     min_confidence: Option<Confidence>,
-) -> Result<Vec<StoredRelationship>> {
+    page: PageRequest,
+) -> Result<Paged<StoredRelationship>> {
     let kind_filter = if kinds.is_empty() {
         String::new()
     } else {
         let placeholders = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         format!(" AND r.kind IN ({placeholders})")
     };
-    let sql = format!(
-        "SELECT r.source_symbol_id, src.qualified_name, r.target_symbol_id, tgt.qualified_name,
-                r.target_external, r.kind, r.provenance, r.confidence, r.start_line, r.start_column,
-                src_file.relative_path, r.reason
-         FROM relationships r
+    let confidence_filter = confidence_filter(min_confidence);
+    let joins = "FROM relationships r
          JOIN symbols src ON src.id = r.source_symbol_id
          JOIN files src_file ON src_file.id = src.file_id
-         LEFT JOIN symbols tgt ON tgt.id = r.target_symbol_id
-         WHERE r.project_id = ? AND r.{column} = ?{kind_filter}
-         ORDER BY r.start_line"
+         LEFT JOIN symbols tgt ON tgt.id = r.target_symbol_id";
+    let filter =
+        format!("WHERE r.project_id = ? AND r.{column} = ?{kind_filter}{confidence_filter}");
+    let rows_sql = format!(
+        "SELECT {RELATIONSHIP_COLUMNS} {joins} {filter}
+         ORDER BY r.start_line, r.rowid LIMIT ? OFFSET ?"
     );
-    let mut binds: Vec<&str> = vec![project_id, symbol_id];
-    binds.extend(kinds.iter().map(|k| k.as_str()));
+    let count_sql = format!("SELECT COUNT(*) {joins} {filter}");
 
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map(
-        rusqlite::params_from_iter(binds.iter().copied()),
-        map_relationship,
-    )?;
-    let mut result = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-    if let Some(min) = min_confidence {
-        let threshold = confidence_rank(min.as_str());
-        result.retain(|r| confidence_rank(&r.confidence) >= threshold);
-    }
-    Ok(result)
+    let mut binds = vec![
+        rusqlite::types::Value::from(project_id.to_string()),
+        rusqlite::types::Value::from(symbol_id.to_string()),
+    ];
+    binds.extend(
+        kinds
+            .iter()
+            .map(|k| rusqlite::types::Value::from(k.as_str().to_string())),
+    );
+    fetch_page(conn, &count_sql, &rows_sql, binds, page, map_relationship)
 }
 
 /// One `unresolved_references` row read back for display — the query side of
@@ -1076,33 +1165,31 @@ pub fn unresolved(
     project_id: &str,
     target_text: Option<&str>,
     source_symbol_id: Option<&str>,
-) -> Result<Vec<StoredUnresolved>> {
+    page: PageRequest,
+) -> Result<Paged<StoredUnresolved>> {
+    use rusqlite::types::Value;
     let mut filters = String::new();
-    let mut binds: Vec<&str> = vec![project_id];
+    let mut binds = vec![Value::from(project_id.to_string())];
     if let Some(target_text) = target_text {
         filters.push_str(" AND u.target_text = ?");
-        binds.push(target_text);
+        binds.push(Value::from(target_text.to_string()));
     }
     if let Some(source_symbol_id) = source_symbol_id {
         filters.push_str(" AND u.source_symbol_id = ?");
-        binds.push(source_symbol_id);
+        binds.push(Value::from(source_symbol_id.to_string()));
     }
-    let sql = format!(
+    let joins = "FROM unresolved_references u
+         JOIN files f ON f.id = u.source_file_id
+         LEFT JOIN symbols src ON src.id = u.source_symbol_id";
+    let rows_sql = format!(
         "SELECT u.source_symbol_id, src.qualified_name, f.relative_path, u.relationship_kind,
                 u.target_text, u.reason, u.confidence, u.candidate_count
-         FROM unresolved_references u
-         JOIN files f ON f.id = u.source_file_id
-         LEFT JOIN symbols src ON src.id = u.source_symbol_id
+         {joins}
          WHERE u.project_id = ?{filters}
-         ORDER BY f.relative_path, u.target_text"
+         ORDER BY f.relative_path, u.target_text, u.rowid LIMIT ? OFFSET ?"
     );
-
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map(
-        rusqlite::params_from_iter(binds.iter().copied()),
-        map_unresolved,
-    )?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    let count_sql = format!("SELECT COUNT(*) {joins} WHERE u.project_id = ?{filters}");
+    fetch_page(conn, &count_sql, &rows_sql, binds, page, map_unresolved)
 }
 
 fn map_unresolved(row: &Row) -> rusqlite::Result<StoredUnresolved> {
@@ -1279,25 +1366,28 @@ pub fn routes(
     conn: &Connection,
     project_id: &str,
     route_query: Option<&str>,
-) -> Result<Vec<StoredRelationship>> {
+    page: PageRequest,
+) -> Result<Paged<StoredRelationship>> {
     let pattern = format!(
         "%{}%",
         escape_like(&route_query.unwrap_or("").replace('/', "").to_lowercase())
     );
-    let mut stmt = conn.prepare_cached(
-        "SELECT r.source_symbol_id, src.qualified_name, r.target_symbol_id, tgt.qualified_name,
-                r.target_external, r.kind, r.provenance, r.confidence, r.start_line, r.start_column,
-                src_file.relative_path, r.reason
-         FROM relationships r
+    let joins = "FROM relationships r
          JOIN symbols src ON src.id = r.source_symbol_id
          JOIN files src_file ON src_file.id = src.file_id
-         LEFT JOIN symbols tgt ON tgt.id = r.target_symbol_id
-         WHERE r.project_id = ? AND r.kind = 'handlesroute'
-           AND LOWER(REPLACE(COALESCE(r.target_external, ''), '/', '')) LIKE ? ESCAPE '\\'
-         ORDER BY r.target_external, src.qualified_name",
-    )?;
-    let rows = stmt.query_map([project_id, &pattern], map_relationship)?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+         LEFT JOIN symbols tgt ON tgt.id = r.target_symbol_id";
+    let filter = "WHERE r.project_id = ? AND r.kind = 'handlesroute'
+           AND LOWER(REPLACE(COALESCE(r.target_external, ''), '/', '')) LIKE ? ESCAPE '\\'";
+    let rows_sql = format!(
+        "SELECT {RELATIONSHIP_COLUMNS} {joins} {filter}
+         ORDER BY r.target_external, src.qualified_name, r.rowid LIMIT ? OFFSET ?"
+    );
+    let count_sql = format!("SELECT COUNT(*) {joins} {filter}");
+    let binds = vec![
+        rusqlite::types::Value::from(project_id.to_string()),
+        rusqlite::types::Value::from(pattern),
+    ];
+    fetch_page(conn, &count_sql, &rows_sql, binds, page, map_relationship)
 }
 
 /// Look up a project id by its canonical root path.
@@ -1843,7 +1933,11 @@ mod tests {
         let relationships = vec![route("GET /a_b"), route("GET /axb"), route("GET /100%")];
         reindex(&mut conn, &pid, &graph_files(), &relationships, &[]).unwrap();
 
-        let hits = |q: &str| routes(&conn, &pid, Some(q)).unwrap().len();
+        let hits = |q: &str| {
+            routes(&conn, &pid, Some(q), PageRequest::ALL)
+                .unwrap()
+                .total
+        };
         assert_eq!(hits("a_b"), 1, "`_` must not match any character");
         assert_eq!(hits("%"), 1, "`%` must only match a literal percent sign");
         assert_eq!(hits("a"), 2);
@@ -2467,24 +2561,32 @@ mod tests {
         ];
         reindex(&mut conn, &pid, &graph_files(), &relationships, &[]).unwrap();
 
-        let calls_to_function = callers(&conn, &pid, &function, None).unwrap();
+        let calls_to_function = callers(&conn, &pid, &function, None, PageRequest::ALL)
+            .unwrap()
+            .rows;
         assert_eq!(calls_to_function.len(), 2);
         assert!(calls_to_function.iter().all(|r| r.kind == "calls"));
         assert!(calls_to_function.iter().any(|r| r.confidence == "exact"));
         assert!(calls_to_function.iter().any(|r| r.confidence == "low"));
 
-        let calls_from_controller = callees(&conn, &pid, &controller, None).unwrap();
+        let calls_from_controller = callees(&conn, &pid, &controller, None, PageRequest::ALL)
+            .unwrap()
+            .rows;
         assert_eq!(calls_from_controller.len(), 1);
         assert_eq!(calls_from_controller[0].confidence, "exact");
 
-        let implementers = implementations(&conn, &pid, &interface, None).unwrap();
+        let implementers = implementations(&conn, &pid, &interface, None, PageRequest::ALL)
+            .unwrap()
+            .rows;
         assert_eq!(implementers.len(), 1);
         assert_eq!(implementers[0].kind, "implements");
         assert_eq!(implementers[0].source_symbol_id, class);
 
         // `references` is kind-agnostic: the one edge targeting the
         // interface (Implements) comes back even though it's not a call.
-        let refs_to_interface = references(&conn, &pid, &interface, None).unwrap();
+        let refs_to_interface = references(&conn, &pid, &interface, None, PageRequest::ALL)
+            .unwrap()
+            .rows;
         assert_eq!(refs_to_interface.len(), 1);
         assert_eq!(refs_to_interface[0].kind, "implements");
     }
@@ -2525,9 +2627,127 @@ mod tests {
         ];
         reindex(&mut conn, &pid, &graph_files(), &relationships, &[]).unwrap();
 
-        let filtered = callers(&conn, &pid, &function, Some(Confidence::High)).unwrap();
+        let filtered = callers(
+            &conn,
+            &pid,
+            &function,
+            Some(Confidence::High),
+            PageRequest::ALL,
+        )
+        .unwrap()
+        .rows;
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].confidence, "exact");
+    }
+
+    /// QRY-4: paging and the `min_confidence` filter run in SQL, and `total`
+    /// counts the filtered rows (not the page, not the unfiltered set).
+    #[test]
+    fn relationship_pages_are_cut_in_sql_and_total_counts_filtered_rows() {
+        let (mut conn, pid, interface, class, function, controller) = seed_graph();
+        let file_id: String = conn
+            .query_row("SELECT id FROM files LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let call = |source: &str, confidence: Confidence, line: u32| RelationshipInput {
+            source_symbol_id: source.to_string(),
+            target_symbol_id: Some(function.clone()),
+            target_external: None,
+            kind: RelationshipKind::Calls,
+            provenance: Provenance::Extracted,
+            confidence,
+            source_file_id: file_id.clone(),
+            start_line: Some(line),
+            start_column: Some(0),
+            reason: None,
+        };
+        let relationships = vec![
+            call(&controller, Confidence::Exact, 5),
+            call(&interface, Confidence::High, 7),
+            call(&class, Confidence::Low, 9),
+        ];
+        reindex(&mut conn, &pid, &graph_files(), &relationships, &[]).unwrap();
+
+        let page = |min: Option<Confidence>, limit: Option<usize>, offset: usize| {
+            let p = callers(&conn, &pid, &function, min, PageRequest { limit, offset }).unwrap();
+            (
+                p.rows.iter().map(|r| r.start_line).collect::<Vec<_>>(),
+                p.total,
+            )
+        };
+        assert_eq!(page(None, None, 0), (vec![Some(5), Some(7), Some(9)], 3));
+        assert_eq!(page(None, Some(1), 1), (vec![Some(7)], 3));
+        assert_eq!(page(Some(Confidence::High), Some(1), 0), (vec![Some(5)], 2));
+        assert_eq!(page(Some(Confidence::High), Some(5), 1), (vec![Some(7)], 2));
+        assert_eq!(page(Some(Confidence::High), Some(5), 9), (vec![], 2));
+    }
+
+    #[test]
+    fn unresolved_pages_are_cut_in_sql_with_the_filtered_total() {
+        let (conn, pid) = seed_unresolved();
+        let page = |target: Option<&str>, limit: Option<usize>, offset: usize| {
+            let p = unresolved(&conn, &pid, target, None, PageRequest { limit, offset }).unwrap();
+            (
+                p.rows
+                    .into_iter()
+                    .map(|r| r.target_text)
+                    .collect::<Vec<_>>(),
+                p.total,
+            )
+        };
+        assert_eq!(
+            page(None, Some(2), 1),
+            (
+                vec![
+                    "ILogger".to_string(),
+                    "IOpenApiDocumentTransformer".to_string()
+                ],
+                3
+            )
+        );
+        assert_eq!(page(None, Some(2), 3), (vec![], 3));
+        assert_eq!(
+            page(Some("ILogger"), Some(2), 0),
+            (vec!["ILogger".to_string()], 1)
+        );
+    }
+
+    #[test]
+    fn route_pages_are_cut_in_sql_with_the_filtered_total() {
+        let (mut conn, pid, _interface, class, _function, _controller) = seed_graph();
+        let file_id: String = conn
+            .query_row("SELECT id FROM files LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let route = |path: &str| RelationshipInput {
+            source_symbol_id: class.clone(),
+            target_symbol_id: None,
+            target_external: Some(path.to_string()),
+            kind: RelationshipKind::HandlesRoute,
+            provenance: Provenance::Extracted,
+            confidence: Confidence::High,
+            source_file_id: file_id.clone(),
+            start_line: Some(1),
+            start_column: Some(0),
+            reason: None,
+        };
+        let relationships = vec![route("GET /a"), route("GET /b"), route("GET /c")];
+        reindex(&mut conn, &pid, &graph_files(), &relationships, &[]).unwrap();
+
+        let page = |query: Option<&str>, limit: Option<usize>, offset: usize| {
+            let p = routes(&conn, &pid, query, PageRequest { limit, offset }).unwrap();
+            (
+                p.rows
+                    .into_iter()
+                    .filter_map(|r| r.target_external)
+                    .collect::<Vec<_>>(),
+                p.total,
+            )
+        };
+        assert_eq!(
+            page(None, Some(2), 1),
+            (vec!["GET /b".to_string(), "GET /c".to_string()], 3)
+        );
+        assert_eq!(page(Some("b"), Some(2), 0), (vec!["GET /b".to_string()], 1));
+        assert_eq!(page(None, Some(2), 3), (vec![], 3));
     }
 
     /// PR1 task 1.5: BLAKE3-backed ids are stable (same input, same output
@@ -2709,7 +2929,15 @@ mod tests {
     fn unresolved_filters_by_target_text() {
         let (conn, pid) = seed_unresolved();
 
-        let rows = unresolved(&conn, &pid, Some("IOpenApiDocumentTransformer"), None).unwrap();
+        let rows = unresolved(
+            &conn,
+            &pid,
+            Some("IOpenApiDocumentTransformer"),
+            None,
+            PageRequest::ALL,
+        )
+        .unwrap()
+        .rows;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].target_text, "IOpenApiDocumentTransformer");
         assert_eq!(
@@ -2726,9 +2954,12 @@ mod tests {
         );
 
         // Exact match, never substring — a prefix must not match.
-        assert!(unresolved(&conn, &pid, Some("IOpenApi"), None)
-            .unwrap()
-            .is_empty());
+        assert!(
+            unresolved(&conn, &pid, Some("IOpenApi"), None, PageRequest::ALL)
+                .unwrap()
+                .rows
+                .is_empty()
+        );
     }
 
     /// `source_symbol_id` narrows to the rows one symbol owns; the
@@ -2745,15 +2976,19 @@ mod tests {
             )
             .unwrap();
 
-        let mut targets: Vec<String> = unresolved(&conn, &pid, None, Some(&owner))
-            .unwrap()
-            .into_iter()
-            .map(|u| u.target_text)
-            .collect();
+        let mut targets: Vec<String> =
+            unresolved(&conn, &pid, None, Some(&owner), PageRequest::ALL)
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(|u| u.target_text)
+                .collect();
         targets.sort();
         assert_eq!(targets, vec!["ILogger", "IOpenApiDocumentTransformer"]);
 
-        let all = unresolved(&conn, &pid, None, None).unwrap();
+        let all = unresolved(&conn, &pid, None, None, PageRequest::ALL)
+            .unwrap()
+            .rows;
         assert_eq!(all.len(), 3);
         let file_level = all
             .iter()
@@ -2764,11 +2999,20 @@ mod tests {
         assert_eq!(file_level.source_relative_path, "src/member.ts");
 
         // Both filters compose in the same SELECT.
-        let both = unresolved(&conn, &pid, Some("ILogger"), Some(&owner)).unwrap();
-        assert_eq!(both.len(), 1);
-        assert!(unresolved(&conn, &pid, Some("ExternalThing"), Some(&owner))
+        let both = unresolved(&conn, &pid, Some("ILogger"), Some(&owner), PageRequest::ALL)
             .unwrap()
-            .is_empty());
+            .rows;
+        assert_eq!(both.len(), 1);
+        assert!(unresolved(
+            &conn,
+            &pid,
+            Some("ExternalThing"),
+            Some(&owner),
+            PageRequest::ALL
+        )
+        .unwrap()
+        .rows
+        .is_empty());
     }
 
     /// A project with nothing unresolved is an empty result, never an error —
@@ -2777,10 +3021,16 @@ mod tests {
     fn unresolved_empty_project_returns_no_rows() {
         let conn = seed();
         let pid = project_id(&conn);
-        assert!(unresolved(&conn, &pid, None, None).unwrap().is_empty());
-        assert!(unresolved(&conn, &pid, Some("Anything"), None)
+        assert!(unresolved(&conn, &pid, None, None, PageRequest::ALL)
             .unwrap()
+            .rows
             .is_empty());
+        assert!(
+            unresolved(&conn, &pid, Some("Anything"), None, PageRequest::ALL)
+                .unwrap()
+                .rows
+                .is_empty()
+        );
     }
 
     /// Task 4.6, `unresolved_references` side: `c.ts` has an unresolved
