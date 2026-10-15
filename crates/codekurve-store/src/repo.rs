@@ -1754,6 +1754,62 @@ pub fn dependents_by_unresolved_target(
     )
 }
 
+/// `(relative_path, name)` of every namespace symbol the stored index holds
+/// for `relative_paths` — what those files declared before a batch replaces
+/// them.
+pub fn namespace_declarations_for_files(
+    conn: &Connection,
+    project_id: &str,
+    relative_paths: &[String],
+) -> Result<std::collections::HashSet<(String, String)>> {
+    let file_ids: Vec<String> = relative_paths
+        .iter()
+        .map(|p| file_id(project_id, p))
+        .collect();
+    let rows = strings_in_chunks(
+        conn,
+        project_id,
+        "SELECT f.relative_path || char(31) || s.name
+         FROM symbols s JOIN files f ON f.id = s.file_id
+         WHERE s.project_id = ? AND s.kind = 'namespace' AND s.file_id",
+        &file_ids,
+    )?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            row.split_once('\u{1f}')
+                .map(|(path, name)| (path.to_string(), name.to_string()))
+        })
+        .collect())
+}
+
+/// Dependent-set query 3: files (outside `changed_files`) with an `imports`
+/// edge into a namespace symbol named like one of `namespace_names`. A batch
+/// file newly declaring `namespace N` adds a namespace symbol that every
+/// `using N;` importer must now link to as well (C# `using` imports the namespace, not
+/// a file), though none of those importers targets a symbol the batch changed.
+pub fn dependents_by_namespace(
+    conn: &Connection,
+    project_id: &str,
+    namespace_names: &[String],
+    changed_files: &[String],
+) -> Result<Vec<String>> {
+    let mut out = strings_in_chunks(
+        conn,
+        project_id,
+        "SELECT DISTINCT f.relative_path
+         FROM relationships r
+         JOIN symbols t ON t.id = r.target_symbol_id AND t.kind = 'namespace'
+         JOIN files f ON f.id = r.source_file_id
+         WHERE r.project_id = ? AND r.kind = 'imports' AND t.name",
+        namespace_names,
+    )?;
+    let changed: std::collections::HashSet<&str> =
+        changed_files.iter().map(String::as_str).collect();
+    out.retain(|path| !changed.contains(path.as_str()));
+    Ok(out)
+}
+
 /// Files holding a relative import that did not resolve to any project file
 /// (`reason = 'module not found in project'`) and whose specifier ends in one
 /// of `stems` — i.e. imports a newly created module may now satisfy, even
@@ -2963,6 +3019,59 @@ mod tests {
         // `x` still reads b.Name.
         assert_eq!(count(&conn, "relationships"), 1);
         assert!(count(&conn, "unresolved_references") >= 1);
+    }
+
+    #[test]
+    fn namespace_declarations_and_importers_are_found_by_namespace_name() {
+        let (mut conn, pid, _run, file_x) = inbound_fixture();
+        // a.ts declares a namespace symbol `NS`; x.ts imports it.
+        let files = || {
+            let mut a = file_with("a.ts", &["Name"]);
+            a.symbols[0].qualified_name = "a.ts::Name".to_string();
+            a.symbols.push(symbol("NS", SymbolKind::Namespace, 500));
+            a.symbols[1].qualified_name = "a.ts::NS".to_string();
+            [a, named_file("b", "Name"), named_file("x", "run")]
+        };
+        reindex(&mut conn, &pid, &files(), &[], &[]).unwrap();
+        let sym = |name: &str| -> String {
+            conn.query_row(
+                "SELECT id FROM symbols WHERE name = ?1",
+                params![name],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let edge = RelationshipInput {
+            source_symbol_id: sym("run"),
+            target_symbol_id: Some(sym("NS")),
+            target_external: None,
+            kind: RelationshipKind::Imports,
+            provenance: Provenance::Heuristic,
+            confidence: Confidence::Low,
+            source_file_id: file_x,
+            start_line: Some(1),
+            start_column: Some(0),
+            reason: None,
+        };
+        reindex(&mut conn, &pid, &files(), &[edge], &[]).unwrap();
+
+        let declared = namespace_declarations_for_files(
+            &conn,
+            &pid,
+            &["a.ts".to_string(), "b.ts".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            declared,
+            std::collections::HashSet::from([("a.ts".to_string(), "NS".to_string())])
+        );
+        let importers = dependents_by_namespace(&conn, &pid, &["NS".to_string()], &[]).unwrap();
+        assert_eq!(importers, vec!["x.ts".to_string()]);
+        assert!(
+            dependents_by_namespace(&conn, &pid, &["NS".to_string()], &["x.ts".to_string()])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// QRY-5 follow-up: equal names order by qualified name, never by insertion

@@ -12,7 +12,7 @@ use codekurve_analysis::discovery::{self, DiscoveredFile, DiscoveryOptions, Disc
 use codekurve_analysis::extract;
 use codekurve_analysis::ir::{EdgeTarget, FileAnalysis};
 use codekurve_analysis::resolve::{self, TsconfigAliases};
-use codekurve_core::LanguageId;
+use codekurve_core::{LanguageId, SymbolKind};
 use codekurve_store::repo;
 use codekurve_store::Connection;
 
@@ -504,6 +504,29 @@ fn apply_incremental_changes(
         repo::dependents_by_unresolved_target(conn, ctx.project_id, &new_names)
             .map_err(|e| e.to_string())?,
     );
+    // `using N;` links to every namespace symbol named `N`: a batch file that
+    // newly declares `namespace N` adds one, so N's importers are dependents.
+    // A file that already declared N keeps its symbol (same id), and its
+    // importers keep their edge: re-analyzing them on every edit would be
+    // wasted work for a popular namespace.
+    let old_declarations =
+        repo::namespace_declarations_for_files(conn, ctx.project_id, &changed_and_deleted)
+            .map_err(|e| e.to_string())?;
+    let namespace_names: Vec<String> = analyses
+        .iter()
+        .flat_map(|a| {
+            a.symbols
+                .iter()
+                .filter(|s| s.kind == SymbolKind::Namespace)
+                .map(move |s| (a.file.clone(), s.name.clone()))
+        })
+        .filter(|declaration| !old_declarations.contains(declaration))
+        .map(|(_, name)| name)
+        .collect();
+    dependents.extend(
+        repo::dependents_by_namespace(conn, ctx.project_id, &namespace_names, &changed_and_deleted)
+            .map_err(|e| e.to_string())?,
+    );
     // A newly created module can satisfy a relative import that named no
     // symbol, so by-name matching never sees it: match the import specifiers
     // against the new files' module names (`foo.ts` -> `foo`, `a/index.ts`
@@ -650,7 +673,7 @@ mod tests {
             follow_symlinks: false,
             max_file_size_bytes: 2_097_152,
             max_total_files: 0,
-            languages: vec![LanguageId::TypeScript],
+            languages: vec![LanguageId::TypeScript, LanguageId::CSharp],
             ignore_patterns: Vec::new(),
         }
     }
@@ -1204,6 +1227,19 @@ mod tests {
         assert_incremental_equals_clean(
             &[("util.ts", UTIL), ("main.ts", MAIN)],
             &[("main.ts", MAIN)],
+        );
+    }
+
+    /// A new C# file in an existing namespace adds a namespace symbol that
+    /// unchanged files with `using <namespace>;` must now import too.
+    #[test]
+    fn equivalence_new_file_in_existing_csharp_namespace() {
+        const A: &str = "namespace App.Services;\npublic class A { }\n";
+        const B: &str = "namespace App.Services;\npublic class B { }\n";
+        const CTL: &str = "namespace App.Web;\nusing App.Services;\npublic class Ctl { }\n";
+        assert_incremental_equals_clean(
+            &[("Svc/A.cs", A), ("Web/Ctl.cs", CTL)],
+            &[("Svc/A.cs", A), ("Svc/B.cs", B), ("Web/Ctl.cs", CTL)],
         );
     }
 
