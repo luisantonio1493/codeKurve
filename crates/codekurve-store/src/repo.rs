@@ -1349,6 +1349,43 @@ pub fn find_symbol_by_id(
         .optional()?)
 }
 
+/// Ids per `IN (...)` list — well under SQLite's bound-variable limit.
+const ID_CHUNK: usize = 500;
+
+/// Many symbols by storage id in one chunked lookup per [`ID_CHUNK`] ids
+/// (replaces a `find_symbol_by_id` per node when rendering BFS results).
+/// Duplicate ids collapse; ids unknown to `project_id` are simply absent.
+pub fn find_symbols_by_ids(
+    conn: &Connection,
+    project_id: &str,
+    ids: &[&str],
+) -> Result<HashMap<String, StoredSymbol>> {
+    let mut unique: Vec<&str> = ids.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+
+    let mut found = HashMap::with_capacity(unique.len().min(ID_CHUNK));
+    for chunk in unique.chunks(ID_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT s.id, s.name, s.qualified_name, s.kind, s.language, f.relative_path,
+                    s.start_byte, s.end_byte, s.start_line, s.start_column, s.end_line, s.end_column,
+                    s.visibility, s.is_partial, s.is_record, s.roles
+             FROM symbols s
+             JOIN files f ON f.id = s.file_id
+             WHERE s.project_id = ? AND s.id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let binds = std::iter::once(project_id).chain(chunk.iter().copied());
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds), map_stored)?;
+        for row in rows {
+            let symbol = row?;
+            found.insert(symbol.id.clone(), symbol);
+        }
+    }
+    Ok(found)
+}
+
 /// Per-language file counts for `project_overview` (PR3 store addition) —
 /// `files.language` is nullable (parse failures/unrecognized extensions),
 /// grouped under `"unknown"` rather than dropped.
@@ -1842,6 +1879,28 @@ mod tests {
         assert!(find_symbol_by_id(&conn, "other-project", &id)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn find_symbols_by_ids_batches_dedupes_and_scopes_to_the_project() {
+        let conn = seed();
+        let pid = project_id(&conn);
+        let id = search(&conn, &pid, "MemberService", 50).unwrap()[0]
+            .id
+            .clone();
+
+        // Past SQLite's bound-variable limit: only chunking keeps this working.
+        let mut ids: Vec<&str> = (0..40_000).map(|_| "missing-id").collect();
+        ids.push(&id);
+        ids.push(&id);
+
+        let found = find_symbols_by_ids(&conn, &pid, &ids).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[&id].name, "MemberService");
+        assert!(find_symbols_by_ids(&conn, "other-project", &ids)
+            .unwrap()
+            .is_empty());
+        assert!(find_symbols_by_ids(&conn, &pid, &[]).unwrap().is_empty());
     }
 
     #[test]

@@ -306,24 +306,36 @@ pub fn impact(s: &Session, args: &QueryArgs) -> Result<traverse::BfsOutcome, Com
 /// One §28.3 row (path, line range, confidence, provenance) for a
 /// [`traverse::Reached`] node — `trace_path`/`analyze_impact`'s shared row
 /// shape (MCP-only; the CLI's `trace_json`/`reached_json` stay unchanged).
-/// One extra lookup per node (`find_symbol_by_id`) — `Reached` only carries
-/// the id, not the node's own file/span; fixture-sized result sets make this
-/// an acceptable cost rather than a second joined query.
-pub fn reached_row(s: &Session, r: &traverse::Reached) -> Result<serde_json::Value, CommandError> {
-    let (conn, project_id) = s.indexed()?;
-    let sym = repo::find_symbol_by_id(conn, project_id, &r.symbol_id)
-        .map_err(|e| CommandError::from(e.to_string()))?;
-    Ok(prune_nulls(serde_json::json!({
+/// `sym` is the node's own symbol row, looked up for all nodes at once by
+/// [`reached_rows`] (`Reached` only carries the id).
+fn reached_row(r: &traverse::Reached, sym: Option<&StoredSymbol>) -> serde_json::Value {
+    prune_nulls(serde_json::json!({
         "symbol_id": r.symbol_id,
-        "qualified_name": sym.as_ref().map(|sym| sym.qualified_name.clone()),
+        "qualified_name": sym.map(|sym| sym.qualified_name.clone()),
         "depth": r.depth,
-        "start_line": sym.as_ref().map(|sym| sym.span.start_line),
-        "end_line": sym.as_ref().map(|sym| sym.span.end_line),
+        "start_line": sym.map(|sym| sym.span.start_line),
+        "end_line": sym.map(|sym| sym.span.end_line),
         "confidence": r.via.as_ref().map(|e| e.confidence.clone()),
         "provenance": r.via.as_ref().map(|e| e.provenance.clone()),
         "via_kind": r.via.as_ref().map(|e| e.kind.clone()),
         "predecessor": r.predecessor,
-    })))
+    }))
+}
+
+/// Rows for `nodes`, in order, from one batched symbol lookup (not one query
+/// per node).
+fn reached_rows(
+    s: &Session,
+    nodes: &[&traverse::Reached],
+) -> Result<Vec<serde_json::Value>, CommandError> {
+    let (conn, project_id) = s.indexed()?;
+    let ids: Vec<&str> = nodes.iter().map(|r| r.symbol_id.as_str()).collect();
+    let symbols = repo::find_symbols_by_ids(conn, project_id, &ids)
+        .map_err(|e| CommandError::from(e.to_string()))?;
+    Ok(nodes
+        .iter()
+        .map(|r| reached_row(r, symbols.get(&r.symbol_id)))
+        .collect())
 }
 
 /// Every reached node as a §28.3 row (see [`reached_row`]), for `trace_path`/
@@ -332,7 +344,8 @@ pub fn bfs_rows(
     s: &Session,
     outcome: &traverse::BfsOutcome,
 ) -> Result<Vec<serde_json::Value>, CommandError> {
-    outcome.reached.iter().map(|r| reached_row(s, r)).collect()
+    let nodes: Vec<&traverse::Reached> = outcome.reached.iter().collect();
+    reached_rows(s, &nodes)
 }
 
 /// `trace_path`'s answer: only the nodes on the found path, start first, in
@@ -354,10 +367,9 @@ pub fn path_rows(
         ids.push(start.symbol_id.as_str());
     }
     ids.extend(path.iter().map(|edge| edge.neighbor_symbol_id.as_str()));
-    ids.iter()
-        .filter_map(|id| by_id.get(id))
-        .map(|r| reached_row(s, r))
-        .collect()
+    let nodes: Vec<&traverse::Reached> =
+        ids.iter().filter_map(|id| by_id.get(id).copied()).collect();
+    reached_rows(s, &nodes)
 }
 
 /// One §28.3 row (path, line range, confidence, provenance) for a
