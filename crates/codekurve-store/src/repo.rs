@@ -1296,7 +1296,7 @@ pub fn search(
          JOIN files f ON f.id = s.file_id
          WHERE s.project_id = ?2
            AND s.id IN (SELECT symbol_id FROM symbols_fts WHERE symbols_fts MATCH ?1)
-         ORDER BY LOWER(s.name) = LOWER(?4) DESC, s.name
+         ORDER BY LOWER(s.name) = LOWER(?4) DESC, s.name, s.qualified_name, s.id
          LIMIT ?3",
     )?;
     let rows = stmt.query_map(params![fts_query, project_id, limit, query], map_stored)?;
@@ -2751,6 +2751,42 @@ mod tests {
             .map(|s| s.name)
             .collect();
         assert_eq!(names, vec!["Zed", "Apple"]);
+    }
+
+    /// QRY-5 follow-up: equal names order by qualified name, never by insertion
+    /// order, so a limited page is the same for a fresh and an incrementally
+    /// built index.
+    #[test]
+    fn search_orders_equal_names_independently_of_index_order() {
+        let save = |dir: &str| {
+            let mut f = file_with(&format!("{dir}/save.ts"), &["Save"]);
+            f.symbols[0].qualified_name = format!("{dir}/save.ts::Save");
+            f
+        };
+        let names = |conn: &Connection, pid: &str| -> Vec<String> {
+            search(conn, pid, "Save", 50)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.qualified_name)
+                .collect()
+        };
+
+        let mut fresh = db::open_in_memory().unwrap();
+        let pid = upsert_project(&fresh, "demo", "/tmp/demo", "hash").unwrap();
+        reindex(&mut fresh, &pid, &[save("a"), save("b")], &[], &[]).unwrap();
+
+        let mut grown = db::open_in_memory().unwrap();
+        let pid2 = upsert_project(&grown, "demo", "/tmp/demo", "hash").unwrap();
+        reindex(&mut grown, &pid2, &[save("b")], &[], &[]).unwrap();
+        let tx = grown.transaction().unwrap();
+        apply_incremental(&tx, &pid2, &now_ts(), &[save("a")], &[], &[], &[]).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(
+            names(&fresh, &pid),
+            vec!["a/save.ts::Save", "b/save.ts::Save"]
+        );
+        assert_eq!(names(&grown, &pid2), names(&fresh, &pid));
     }
 
     /// QRY-5: a name prefix finds longer names through the FTS index.
