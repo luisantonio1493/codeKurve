@@ -698,16 +698,12 @@ pub fn symbol_ids_for_files(
         .iter()
         .map(|p| file_id(project_id, p))
         .collect();
-    let placeholders = file_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql =
-        format!("SELECT id FROM symbols WHERE project_id = ? AND file_id IN ({placeholders})");
-    let mut binds: Vec<&str> = vec![project_id];
-    binds.extend(file_ids.iter().map(String::as_str));
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter().copied()), |row| {
-        row.get::<_, String>(0)
-    })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    strings_in_chunks(
+        conn,
+        project_id,
+        "SELECT id FROM symbols WHERE project_id = ? AND file_id",
+        &file_ids,
+    )
 }
 
 /// Every stored symbol id for a set of `(relative_path, qualified_name)`
@@ -1469,6 +1465,33 @@ pub fn find_symbol_by_id(
 /// Ids per `IN (...)` list — well under SQLite's bound-variable limit.
 const ID_CHUNK: usize = 500;
 
+/// Distinct first-column strings of `sql_before_list` + `IN (<chunk>)` run
+/// once per [`ID_CHUNK`] of the deduplicated `values`, with `project_id`
+/// bound first. Keeps long lists under SQLite's bound-variable limit;
+/// results are merged across chunks, sorted.
+fn strings_in_chunks(
+    conn: &Connection,
+    project_id: &str,
+    sql_before_list: &str,
+    values: &[String],
+) -> Result<Vec<String>> {
+    let unique: std::collections::BTreeSet<&str> = values.iter().map(String::as_str).collect();
+    let unique: Vec<&str> = unique.into_iter().collect();
+    let mut found = std::collections::BTreeSet::new();
+    for chunk in unique.chunks(ID_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let mut stmt = conn.prepare_cached(&format!("{sql_before_list} IN ({placeholders})"))?;
+        let binds = std::iter::once(project_id).chain(chunk.iter().copied());
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds), |row| {
+            row.get::<_, String>(0)
+        })?;
+        for row in rows {
+            found.insert(row?);
+        }
+    }
+    Ok(found.into_iter().collect())
+}
+
 /// Many symbols by storage id in one chunked lookup per [`ID_CHUNK`] ids
 /// (replaces a `find_symbol_by_id` per node when rendering BFS results).
 /// Duplicate ids collapse; ids unknown to `project_id` are simply absent.
@@ -1622,26 +1645,18 @@ pub fn dependents_by_target_symbol(
     if target_symbol_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = target_symbol_ids
-        .iter()
-        .map(|_| "?")
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
+    let mut out = strings_in_chunks(
+        conn,
+        project_id,
         "SELECT DISTINCT f.relative_path
          FROM relationships r
          JOIN files f ON f.id = r.source_file_id
-         WHERE r.project_id = ? AND r.target_symbol_id IN ({placeholders})"
-    );
-    let mut binds: Vec<&str> = vec![project_id];
-    binds.extend(target_symbol_ids.iter().map(String::as_str));
-
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter().copied()), |row| {
-        row.get::<_, String>(0)
-    })?;
-    let mut out = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-    out.retain(|path| !changed_files.iter().any(|f| f == path));
+         WHERE r.project_id = ? AND r.target_symbol_id",
+        target_symbol_ids,
+    )?;
+    let changed: std::collections::HashSet<&str> =
+        changed_files.iter().map(String::as_str).collect();
+    out.retain(|path| !changed.contains(path.as_str()));
     Ok(out)
 }
 
@@ -1659,25 +1674,15 @@ pub fn dependents_by_unresolved_target(
     if target_texts.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = target_texts
-        .iter()
-        .map(|_| "?")
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
+    strings_in_chunks(
+        conn,
+        project_id,
         "SELECT DISTINCT f.relative_path
          FROM unresolved_references u
          JOIN files f ON f.id = u.source_file_id
-         WHERE u.project_id = ? AND u.target_text IN ({placeholders})"
-    );
-    let mut binds: Vec<&str> = vec![project_id];
-    binds.extend(target_texts.iter().map(String::as_str));
-
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter().copied()), |row| {
-        row.get::<_, String>(0)
-    })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+         WHERE u.project_id = ? AND u.target_text",
+        target_texts,
+    )
 }
 
 /// Files holding a relative import that did not resolve to any project file
@@ -2665,6 +2670,35 @@ mod tests {
         .rows;
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].confidence, "exact");
+    }
+
+    /// QRY-10: lookups keyed by a long list (a big batch's symbols, targets
+    /// or names) are chunked, so they never exceed SQLite's bound-variable
+    /// limit, and still find the real entries among the bogus ones.
+    #[test]
+    fn long_in_lists_are_chunked() {
+        let (conn, pid) = seed_unresolved();
+        let bogus =
+            |prefix: &str| -> Vec<String> { (0..40_000).map(|i| format!("{prefix}{i}")).collect() };
+
+        let mut paths = bogus("missing/");
+        paths.push("src/member.ts".to_string());
+        assert!(!symbol_ids_for_files(&conn, &pid, &paths)
+            .unwrap()
+            .is_empty());
+
+        assert!(
+            dependents_by_target_symbol(&conn, &pid, &bogus("sym-"), &[])
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut texts = bogus("Nope");
+        texts.push("ILogger".to_string());
+        assert_eq!(
+            dependents_by_unresolved_target(&conn, &pid, &texts).unwrap(),
+            vec!["src/member.ts".to_string()]
+        );
     }
 
     /// QRY-8: the batched FTS/symbol delete in `apply_incremental` replaces
