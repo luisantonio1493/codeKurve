@@ -13,6 +13,8 @@ All notable changes to this project are documented here. Format follows
 
 ### Fixed
 
+- Index: an incremental `index` no longer fails with `UNIQUE constraint failed: unresolved_references.id` when several changed files define same-named symbols that another file references
+- Index: an incremental pass keeps edges from untouched files into symbols of re-analyzed files instead of demoting them to unresolved, so the result equals a clean rebuild (on a 350-file C# project, 5 changed files used to lose 1,509 edges)
 - Index: editing a file with named imports no longer leaves them unresolved ("not exported by target module"): an incremental pass now equals a clean rebuild (covered by six equivalence tests)
 - Index: files that cannot be read or walked keep their rows but leave the index marked stale (`status` pending count, stderr warning) until they can be verified again
 - Watch: edits to the root `tsconfig.json` or `.codekurve/config.toml` reload the configuration and reconcile

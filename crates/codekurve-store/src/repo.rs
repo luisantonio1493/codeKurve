@@ -435,59 +435,80 @@ fn delete_symbols_of_files(tx: &Transaction, file_ids: &[String]) -> Result<()> 
 /// `unresolved_references` row (target text = the symbol's bare name), so
 /// the symbols can be deleted without a dangling foreign key and without
 /// silently dropping the reference.
-fn convert_inbound_to_unresolved(
+/// An edge from one file into a symbol of another, read before that symbol
+/// is deleted (the name is gone afterwards).
+struct InboundEdge {
+    rel_id: String,
+    source_symbol_id: String,
+    source_file_id: String,
+    kind: String,
+    target_symbol_id: String,
+    target_name: String,
+}
+
+fn collect_inbound_edges(
     tx: &Transaction,
     project_id: &str,
-    ts: &str,
     file_ids: &[String],
-    reason: &str,
-) -> Result<()> {
-    // One unresolved row per parked edge, persisted in a single call: ids are
-    // `stable_id`s keyed by (file, symbol, kind, target name), so edges from
-    // one outside file into same-named symbols of different batch files
-    // (`x.Name`) share a key and rely on the ordinal that only one call's
-    // `seen` map can hand out.
-    let mut unresolved = Vec::new();
+) -> Result<Vec<InboundEdge>> {
+    let mut edges = Vec::new();
     for file_id in file_ids {
         let mut stmt = tx.prepare_cached(
-            "SELECT r.id, r.source_symbol_id, r.source_file_id, r.kind, s.name
+            "SELECT r.id, r.source_symbol_id, r.source_file_id, r.kind, r.target_symbol_id, s.name
              FROM relationships r
              JOIN symbols s ON s.id = r.target_symbol_id
              WHERE r.project_id = ?1 AND s.file_id = ?2 AND r.source_file_id != ?2",
         )?;
-        let inbound: Vec<(String, String, String, String, String)> = stmt
-            .query_map(params![project_id, file_id], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt);
-
-        for (rel_id, source_symbol_id, source_file_id, kind, target_name) in inbound {
-            exec(
-                tx,
-                "DELETE FROM relationships WHERE id = ?1",
-                params![rel_id],
-            )?;
-            unresolved.push(UnresolvedReferenceInput {
-                source_symbol_id: Some(source_symbol_id),
-                source_file_id,
-                relationship_kind: parse_relationship_kind(&kind),
-                target_text: target_name,
-                context_json: None,
-                candidate_count: 0,
-                reason: reason.to_string(),
-                confidence: Confidence::Unresolved,
-            });
+        let rows = stmt.query_map(params![project_id, file_id], |row| {
+            Ok(InboundEdge {
+                rel_id: row.get(0)?,
+                source_symbol_id: row.get(1)?,
+                source_file_id: row.get(2)?,
+                kind: row.get(3)?,
+                target_symbol_id: row.get(4)?,
+                target_name: row.get(5)?,
+            })
+        })?;
+        for row in rows {
+            edges.push(row?);
         }
     }
-    // An identical reference may already be parked from an earlier pass
-    // (e.g. an "ambiguous" row for the same name); keep that one.
+    Ok(edges)
+}
+
+/// Replace each edge with an `unresolved_references` row (target text = the
+/// target symbol's bare name). One unresolved row per edge, persisted in a
+/// single call: ids are `stable_id`s keyed by (file, symbol, kind, target
+/// name), so edges from one outside file into same-named symbols of
+/// different files (`x.Name`) share a key and rely on the ordinal that only
+/// one call's `seen` map can hand out. An identical reference may already be
+/// parked from an earlier pass (e.g. an "ambiguous" row for the same name);
+/// that one is kept.
+fn park_inbound_edges(
+    tx: &Transaction,
+    project_id: &str,
+    ts: &str,
+    edges: &[InboundEdge],
+    reason: &str,
+) -> Result<()> {
+    let mut unresolved = Vec::with_capacity(edges.len());
+    for edge in edges {
+        exec(
+            tx,
+            "DELETE FROM relationships WHERE id = ?1",
+            params![edge.rel_id],
+        )?;
+        unresolved.push(UnresolvedReferenceInput {
+            source_symbol_id: Some(edge.source_symbol_id.clone()),
+            source_file_id: edge.source_file_id.clone(),
+            relationship_kind: parse_relationship_kind(&edge.kind),
+            target_text: edge.target_name.clone(),
+            context_json: None,
+            candidate_count: 0,
+            reason: reason.to_string(),
+            confidence: Confidence::Unresolved,
+        });
+    }
     persist_unresolved_rows(tx, project_id, ts, &unresolved, true)
 }
 
@@ -506,11 +527,12 @@ pub fn delete_file(
     relative_path: &str,
 ) -> Result<()> {
     let file_id = file_id(project_id, relative_path);
-    convert_inbound_to_unresolved(
+    let inbound = collect_inbound_edges(tx, project_id, std::slice::from_ref(&file_id))?;
+    park_inbound_edges(
         tx,
         project_id,
         ts,
-        std::slice::from_ref(&file_id),
+        &inbound,
         "target symbol's file was deleted",
     )?;
 
@@ -550,27 +572,42 @@ pub fn apply_incremental(
     for file in files {
         delete_file_owned_relationships(tx, project_id, &file_id(project_id, &file.relative_path))?;
     }
-    // An edge still pointing into a batch file's symbols now comes from a
-    // file outside the batch (e.g. a dependent that could not be re-read);
-    // park it as unresolved rather than let the symbol delete violate the
-    // foreign key and roll the whole batch back.
+    // An edge still pointing into a batch file's symbols comes from a file
+    // outside the batch (a dependent of a dependent, or one that could not be
+    // re-read). The batch's symbols are deleted and re-inserted, almost
+    // always with the same ids, so those edges stay valid: remember them,
+    // let the foreign-key check wait for the commit, and afterwards park as
+    // unresolved only the edges whose target symbol is really gone.
     let batch_file_ids: Vec<String> = files
         .iter()
         .map(|file| file_id(project_id, &file.relative_path))
         .collect();
-    convert_inbound_to_unresolved(
-        tx,
-        project_id,
-        ts,
-        &batch_file_ids,
-        "target symbol was replaced; this file was not re-analyzed",
-    )?;
+    let inbound = collect_inbound_edges(tx, project_id, &batch_file_ids)?;
+    tx.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
     delete_symbols_of_files(tx, &batch_file_ids)?;
 
     let mut count = 0;
     for file in files {
         count += insert_file_and_symbols(tx, project_id, ts, file)?;
     }
+    let mut gone = Vec::new();
+    for edge in inbound {
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM symbols WHERE id = ?1)",
+            params![edge.target_symbol_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            gone.push(edge);
+        }
+    }
+    park_inbound_edges(
+        tx,
+        project_id,
+        ts,
+        &gone,
+        "target symbol was removed; this file was not re-analyzed",
+    )?;
     persist_relationships(tx, project_id, ts, relationships)?;
     persist_unresolved(tx, project_id, ts, unresolved)?;
     Ok(count)
@@ -2840,25 +2877,46 @@ mod tests {
             .unwrap()
     }
 
+    fn named_file(dir: &str, name: &str) -> FileInput {
+        let mut f = file_with(&format!("{dir}.ts"), &[name]);
+        f.symbols[0].qualified_name = format!("{dir}.ts::{name}");
+        f
+    }
+
+    /// A batch file's symbols are deleted and re-inserted with the same ids;
+    /// an outside file's edge into one that survives must stay an edge (it
+    /// used to be demoted to unresolved, so an incremental index drifted from
+    /// a clean rebuild: 1,509 edges lost on the real C# project).
     #[test]
-    fn inbound_edges_into_same_named_symbols_of_two_batch_files_do_not_collide() {
+    fn inbound_edges_into_surviving_symbols_of_batch_files_are_kept() {
         let (mut conn, pid, _run, _x) = inbound_fixture();
-        let named = |dir: &str| {
-            let mut f = file_with(&format!("{dir}.ts"), &["Name"]);
-            f.symbols[0].qualified_name = format!("{dir}.ts::Name");
-            f
-        };
         let tx = conn.transaction().unwrap();
-        apply_incremental(
-            &tx,
-            &pid,
-            &now_ts(),
-            &[named("a"), named("b")],
-            &[],
-            &[],
-            &[],
-        )
-        .unwrap();
+        let batch = [named_file("a", "Name"), named_file("b", "Name")];
+        apply_incremental(&tx, &pid, &now_ts(), &batch, &[], &[], &[]).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(count(&conn, "relationships"), 2);
+        assert_eq!(count(&conn, "unresolved_references"), 0);
+        let dangling: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM relationships r
+                 WHERE NOT EXISTS (SELECT 1 FROM symbols s WHERE s.id = r.target_symbol_id)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dangling, 0);
+    }
+
+    /// Edges into symbols the batch removed are parked as unresolved. Two
+    /// edges from one outside file into same-named symbols of two batch files
+    /// share an unresolved-id key; their ids must not collide.
+    #[test]
+    fn inbound_edges_into_removed_same_named_symbols_do_not_collide() {
+        let (mut conn, pid, _run, _x) = inbound_fixture();
+        let tx = conn.transaction().unwrap();
+        let batch = [named_file("a", "Other"), named_file("b", "Other")];
+        apply_incremental(&tx, &pid, &now_ts(), &batch, &[], &[], &[]).unwrap();
         tx.commit().unwrap();
 
         assert_eq!(count(&conn, "relationships"), 0);
@@ -2888,13 +2946,21 @@ mod tests {
         .unwrap();
         tx.commit().unwrap();
 
-        let mut a = file_with("a.ts", &["Name"]);
-        a.symbols[0].qualified_name = "a.ts::Name".to_string();
+        // `a` loses `Name`: x's edge into it is parked next to the old row.
         let tx = conn.transaction().unwrap();
-        apply_incremental(&tx, &pid, &now_ts(), &[a], &[], &[], &[]).unwrap();
+        apply_incremental(
+            &tx,
+            &pid,
+            &now_ts(),
+            &[named_file("a", "Other")],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
         tx.commit().unwrap();
 
-        // `x` still reads b.Name; its edge into a.Name became unresolved.
+        // `x` still reads b.Name.
         assert_eq!(count(&conn, "relationships"), 1);
         assert!(count(&conn, "unresolved_references") >= 1);
     }
