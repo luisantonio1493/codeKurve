@@ -716,6 +716,43 @@ fn not_indexed_session_answers_degraded_without_auto_indexing() {
     session.finish();
 }
 
+/// QRY-11: a server started before the first `codekurve index` recovers on
+/// its own once the index exists, instead of answering "not indexed" until
+/// the client restarts it.
+#[test]
+fn not_indexed_session_picks_up_an_index_created_later() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    codekurve_core::project::init(root).unwrap();
+    let mut session = McpSession::start(root);
+
+    let before = session.call(
+        "codekurve_search_symbols",
+        serde_json::json!({"query": "getEligibility"}),
+    );
+    assert!(before["error"]["message"].as_str().is_some(), "{before}");
+
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src").join("a.ts"), A_TS).unwrap();
+    AssertCommand::cargo_bin("codekurve")
+        .unwrap()
+        .arg("index")
+        .arg("--root")
+        .arg(root)
+        .assert()
+        .success();
+
+    let after = session.call(
+        "codekurve_search_symbols",
+        serde_json::json!({"query": "getEligibility"}),
+    );
+    assert!(after["error"].is_null(), "{after}");
+    let envelope = envelope_of(&after);
+    assert!(!envelope["result"].as_array().unwrap().is_empty());
+
+    session.finish();
+}
+
 /// Task 6.6: stale index (`pending_files > 0`) is served as-is, warning set
 /// — a query tool call must never trigger a reindex on its own.
 #[test]

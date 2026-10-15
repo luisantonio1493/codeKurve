@@ -5,6 +5,7 @@
 use std::sync::Mutex;
 
 use codekurve::query::Session;
+use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::model::{
     CallToolRequestMethod, CallToolRequestParams, CallToolResult, ListToolsResult,
@@ -26,6 +27,39 @@ const REINDEX_TOOL_NAME: &str = "codekurve_reindex";
 pub struct CodeKurve {
     pub(crate) session: Mutex<Session>,
     pub(crate) allow_reindex: bool,
+    /// Built once: `tool_router()` regenerates every tool's JSON schema.
+    pub(crate) router: ToolRouter<CodeKurve>,
+}
+
+impl CodeKurve {
+    pub(crate) fn new(session: Session, allow_reindex: bool) -> Self {
+        CodeKurve {
+            session: Mutex::new(session),
+            allow_reindex,
+            router: Self::tool_router(),
+        }
+    }
+
+    /// A server started before the first `codekurve index` holds a
+    /// `NotIndexed` session; retry opening it so a later index is picked up
+    /// without restarting the server. An indexed session is left alone.
+    fn reopen_if_not_indexed(&self) {
+        let mut session = self
+            .session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(*session, Session::Indexed { .. }) {
+            return;
+        }
+        if let Ok(mut fresh) = Session::open(session.root()) {
+            if matches!(fresh, Session::Indexed { .. }) {
+                if !self.allow_reindex {
+                    let _ = fresh.set_read_only();
+                }
+                *session = fresh;
+            }
+        }
+    }
 }
 
 #[tool_handler]
@@ -38,7 +72,7 @@ impl ServerHandler for CodeKurve {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let mut tools = Self::tool_router().list_all();
+        let mut tools = self.router.list_all();
         if !self.allow_reindex {
             tools.retain(|tool| tool.name != REINDEX_TOOL_NAME);
         }
@@ -62,8 +96,9 @@ impl ServerHandler for CodeKurve {
         if request.name == REINDEX_TOOL_NAME && !self.allow_reindex {
             return Err(McpError::method_not_found::<CallToolRequestMethod>());
         }
+        self.reopen_if_not_indexed();
         let tcc = ToolCallContext::new(self, request, context);
-        Self::tool_router().call(tcc).await
+        self.router.call(tcc).await
     }
 
     fn get_info(&self) -> ServerInfo {

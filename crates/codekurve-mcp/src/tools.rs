@@ -647,17 +647,14 @@ impl CodeKurve {
 #[cfg(test)]
 mod lock_tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     #[test]
     fn poisoned_session_lock_is_recovered() {
         let dir = tempfile::tempdir().unwrap();
         codekurve_core::project::init(dir.path()).unwrap();
         let session = query::Session::open(dir.path()).unwrap();
-        let server = Arc::new(CodeKurve {
-            session: Mutex::new(session),
-            allow_reindex: false,
-        });
+        let server = Arc::new(CodeKurve::new(session, false));
 
         let poisoner = Arc::clone(&server);
         let _ = std::thread::spawn(move || {
