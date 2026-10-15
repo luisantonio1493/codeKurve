@@ -1321,7 +1321,9 @@ pub fn search(
          JOIN files f ON f.id = s.file_id
          WHERE s.project_id = ?2
            AND s.id IN (SELECT symbol_id FROM symbols_fts WHERE symbols_fts MATCH ?1)
-         ORDER BY LOWER(s.name) = LOWER(?4) DESC, s.name, s.qualified_name, s.id
+         ORDER BY LOWER(s.name) = LOWER(?4) DESC,
+                  SUBSTR(LOWER(s.name), 1, LENGTH(?4)) = LOWER(?4) DESC,
+                  s.name, s.qualified_name, s.id
          LIMIT ?3",
     )?;
     let rows = stmt.query_map(params![fts_query, project_id, limit, query], map_stored)?;
@@ -2931,6 +2933,26 @@ mod tests {
             vec!["a/save.ts::Save", "b/save.ts::Save"]
         );
         assert_eq!(names(&grown, &pid2), names(&fresh, &pid));
+    }
+
+    /// QRY-5 follow-up (real C# project): a symbol whose own name starts with
+    /// the query ranks ahead of symbols that only match through their file path.
+    #[test]
+    fn search_ranks_own_name_prefix_before_path_matches() {
+        let mut conn = db::open_in_memory().unwrap();
+        let pid = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        let mut in_path = file_with("src/RegisterManager.ts", &["Apple"]);
+        in_path.symbols[0].qualified_name = "src/RegisterManager.ts::Apple".to_string();
+        let mut own = file_with("src/other.ts", &["RegisterManager"]);
+        own.symbols[0].qualified_name = "src/other.ts::RegisterManager".to_string();
+        reindex(&mut conn, &pid, &[in_path, own], &[], &[]).unwrap();
+
+        let names: Vec<String> = search(&conn, &pid, "RegisterMan", 50)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, vec!["RegisterManager", "Apple"]);
     }
 
     /// QRY-5: a name prefix finds longer names through the FTS index.
