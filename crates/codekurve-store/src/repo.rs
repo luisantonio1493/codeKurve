@@ -406,6 +406,31 @@ fn delete_file_owned_symbols(tx: &Transaction, file_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// [`delete_file_owned_symbols`] for a whole batch. `symbols_fts` can only be
+/// matched by its unindexed `symbol_id`, so every FTS delete scans the whole
+/// table: one statement per [`ID_CHUNK`] files instead of one per file turns
+/// N full scans into one (measured 72 ms -> 5 ms for 50 files of a 5.5k
+/// symbol index).
+fn delete_symbols_of_files(tx: &Transaction, file_ids: &[String]) -> Result<()> {
+    for chunk in file_ids.chunks(ID_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        exec(
+            tx,
+            &format!(
+                "DELETE FROM symbols_fts WHERE symbol_id IN
+                     (SELECT id FROM symbols WHERE file_id IN ({placeholders}))"
+            ),
+            rusqlite::params_from_iter(chunk.iter()),
+        )?;
+        exec(
+            tx,
+            &format!("DELETE FROM symbols WHERE file_id IN ({placeholders})"),
+            rusqlite::params_from_iter(chunk.iter()),
+        )?;
+    }
+    Ok(())
+}
+
 /// Every relationship from ANOTHER file into `file_id`'s symbols becomes an
 /// `unresolved_references` row (target text = the symbol's bare name), so
 /// the symbols can be deleted without a dangling foreign key and without
@@ -529,9 +554,11 @@ pub fn apply_incremental(
             "target symbol was replaced; this file was not re-analyzed",
         )?;
     }
-    for file in files {
-        delete_file_owned_symbols(tx, &file_id(project_id, &file.relative_path))?;
-    }
+    let batch_file_ids: Vec<String> = files
+        .iter()
+        .map(|file| file_id(project_id, &file.relative_path))
+        .collect();
+    delete_symbols_of_files(tx, &batch_file_ids)?;
 
     let mut count = 0;
     for file in files {
@@ -2638,6 +2665,47 @@ mod tests {
         .rows;
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].confidence, "exact");
+    }
+
+    /// QRY-8: the batched FTS/symbol delete in `apply_incremental` replaces
+    /// exactly the batch files' rows and leaves every other file's search
+    /// entries alone.
+    #[test]
+    fn apply_incremental_replaces_fts_rows_for_the_whole_batch_only() {
+        let file = |path: &str, name: &str| FileInput {
+            relative_path: path.to_string(),
+            language: "typescript".to_string(),
+            content_hash: format!("hash-{name}"),
+            modified_ns: 0,
+            size_bytes: 10,
+            symbols: vec![symbol(name, SymbolKind::Function, 0)],
+        };
+        let mut conn = db::open_in_memory().unwrap();
+        let pid = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        let before = [
+            file("a.ts", "quokka"),
+            file("b.ts", "emu"),
+            file("c.ts", "tapir"),
+        ];
+        reindex(&mut conn, &pid, &before, &[], &[]).unwrap();
+
+        let tx = conn.transaction().unwrap();
+        let batch = [file("a.ts", "walrus"), file("b.ts", "ibex")];
+        apply_incremental(&tx, &pid, &now_ts(), &batch, &[], &[], &[]).unwrap();
+        tx.commit().unwrap();
+
+        let names = |q: &str| search(&conn, &pid, q, 50).unwrap().len();
+        assert_eq!(names("quokka"), 0);
+        assert_eq!(names("emu"), 0);
+        assert_eq!(names("walrus"), 1);
+        assert_eq!(names("ibex"), 1);
+        assert_eq!(names("tapir"), 1);
+        let count = |table: &str| -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count("symbols_fts"), count("symbols"));
+        assert_eq!(count("symbols"), 3);
     }
 
     /// QRY-4: paging and the `min_confidence` filter run in SQL, and `total`
