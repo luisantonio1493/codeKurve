@@ -183,12 +183,13 @@ ALTER TABLE projects ADD COLUMN analyzer_version TEXT;
 /// Migration 0007 (Phase 4 QRY-7): indexes for the per-file and per-symbol
 /// lookups that the 0002 indexes do not cover — relationship/unresolved
 /// rows by `source_file_id` (reindex deletes, file scoping), unresolved rows
-/// by `source_symbol_id`, and project-prefixed `(target|source, kind)`
-/// lookups. Purely additive: no table is rewritten and no row changes.
+/// by `source_symbol_id`. Purely additive: no table is rewritten and no row
+/// changes. Project-prefixed `(project_id, target|source, kind)` composites
+/// are deliberately not created: on a real 350-file C# project the traversal
+/// queries never chose them (they pin the per-symbol indexes) while the
+/// five-index set added +15 MB of database and +29% index time.
 const MIGRATION_0007: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_relationships_source_file ON relationships(source_file_id);
-CREATE INDEX IF NOT EXISTS idx_relationships_project_target_kind ON relationships(project_id, target_symbol_id, kind);
-CREATE INDEX IF NOT EXISTS idx_relationships_project_source_kind ON relationships(project_id, source_symbol_id, kind);
 CREATE INDEX IF NOT EXISTS idx_unresolved_source_file ON unresolved_references(source_file_id);
 CREATE INDEX IF NOT EXISTS idx_unresolved_source_symbol ON unresolved_references(source_symbol_id);
 "#;
@@ -527,7 +528,7 @@ mod tests {
 
     /// Phase 4 QRY-7 / S4: a database indexed under `SCHEMA_VERSION = 6`
     /// upgrades to 7 with its relationship and unresolved-reference rows
-    /// intact and gains the five query indexes from migration 0007.
+    /// intact and gains the three query indexes from migration 0007.
     #[test]
     fn migration_0007_adds_query_indexes_without_wiping_v6_data() {
         let conn = db::open_in_memory().unwrap();
@@ -535,8 +536,6 @@ mod tests {
         // the 0007 indexes and downgrading the recorded version.
         conn.execute_batch(
             "DROP INDEX IF EXISTS idx_relationships_source_file;
-             DROP INDEX IF EXISTS idx_relationships_project_target_kind;
-             DROP INDEX IF EXISTS idx_relationships_project_source_kind;
              DROP INDEX IF EXISTS idx_unresolved_source_file;
              DROP INDEX IF EXISTS idx_unresolved_source_symbol;
              DELETE FROM schema_migrations WHERE version >= 7;",
@@ -583,12 +582,10 @@ mod tests {
             count(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN (
                     'idx_relationships_source_file',
-                    'idx_relationships_project_target_kind',
-                    'idx_relationships_project_source_kind',
                     'idx_unresolved_source_file',
                     'idx_unresolved_source_symbol')"
             ),
-            5
+            3
         );
     }
 
