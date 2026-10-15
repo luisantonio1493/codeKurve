@@ -1,6 +1,16 @@
 # audit-hardening
-Objective: fix security, index-correctness, token-efficiency and speed findings from the audit. Plan: /Users/luissuarez/.claude/plans/zesty-cuddling-hamming.md (IDs SEC/IDX/TOK/QRY/PERF).
+Objective: fix security, index-correctness, token-efficiency and speed findings from the audit. Plan: odd/plans/audit-hardening-plan.md (IDs SEC/IDX/TOK/QRY/PERF).
 Branch: fix/audit-hardening. Delivery: ask-on-risk (chained PRs per phase). Test runner: cargo test --workspace.
+
+## RESUME HERE (written for the next chat; read this first)
+State: branch fix/audit-hardening, all work committed, `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` green at the last commit. Plan with all finding IDs (SEC/IDX/TOK/QRY/PERF): odd/plans/audit-hardening-plan.md (copy of ~/.claude/plans/zesty-cuddling-hamming.md). Engram project `codekurve`: observation #491 (task state), #505 (last session summary).
+Do next, in order:
+1. T28 duplicate symbol key crash: a C# file with the same block namespace twice (`namespace A.B { } namespace A.B { }`) fails the WHOLE index with `UNIQUE constraint failed: symbols.project_id, symbols.symbol_key` (also in baseline). Write the RED test first (store test + minimal CLI repro: `codekurve init` + `index` on a one-file project), then collapse duplicate keys inside one file in `insert_file_and_symbols` (repo.rs; skip the FTS insert too; ids are shared by qualified name in commands::build_file_inputs).
+2. Independent verification of the T27 fix (new C# file in an existing namespace re-links importers) — use a real C# project, not only fixtures: both earlier verifiers missed bugs the real project exposed.
+3. Decisions the user still owes: keep `PRAGMA cache_size = -32768` in db.rs (recommended: full index 26% faster, +41 MB peak RSS) or remove; PR split strategy (branch is >400 lines; delivery strategy `ask-on-risk`; use skills `work-unit-commits` and `chained-pr`).
+4. Remaining plan items: PERF-1 (rayon parallel parsing, biggest speed win), PERF-3..8, TOK-8, TOK-9, Phase 1 advisories (A1 follow_symlinks indexes outside root, A2 depth-capped file skipped silently, A4 stray .bak, A5 cargo install not --version pinned). Left on purpose: stale `candidate_count` in ambiguous unresolved rows (cosmetic), unreadable dependent stays stale while status says fresh.
+How we work here: user's CLAUDE.md = no Co-Authored-By/AI attribution in commits, conventional commits, short answers, one question at a time. Subagents: model haiku, effort high. A peer Claude session named `dotnetapi` (check `ListAgents`) owns a real C# API project and runs benchmarks/repros when asked via SendMessage (ask for the reply as a message to this session; do not run heavy builds meanwhile). Real-project check recipe for index changes: index a copy at a fixed path with the old and new binary, modify N files, `codekurve index`, then index a clean copy and compare relationship/unresolved/symbol sets by symbol_key (hash the sqlite3 output).
+Privacy: never publish the real C# project's name, source or paths. NOTE: `main` ALREADY contains mentions of it in benchmarks/agent-context/corpora.lock.json, benchmarks/agent-context/tasks.json and docs/PERFORMANCE.md (not added by this branch) — ask the user whether to remove them.
 
 ## Specs
 S1 Phase 1 security: SEC-1..SEC-12 as written in the plan file.
