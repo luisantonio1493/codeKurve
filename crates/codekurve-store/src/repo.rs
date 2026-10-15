@@ -439,47 +439,56 @@ fn convert_inbound_to_unresolved(
     tx: &Transaction,
     project_id: &str,
     ts: &str,
-    file_id: &str,
+    file_ids: &[String],
     reason: &str,
 ) -> Result<()> {
-    let mut stmt = tx.prepare_cached(
-        "SELECT r.id, r.source_symbol_id, r.source_file_id, r.kind, s.name
-         FROM relationships r
-         JOIN symbols s ON s.id = r.target_symbol_id
-         WHERE r.project_id = ?1 AND s.file_id = ?2 AND r.source_file_id != ?2",
-    )?;
-    let inbound: Vec<(String, String, String, String, String)> = stmt
-        .query_map(params![project_id, file_id], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(stmt);
-
-    let mut unresolved = Vec::with_capacity(inbound.len());
-    for (rel_id, source_symbol_id, source_file_id, kind, target_name) in &inbound {
-        exec(
-            tx,
-            "DELETE FROM relationships WHERE id = ?1",
-            params![rel_id],
+    // One unresolved row per parked edge, persisted in a single call: ids are
+    // `stable_id`s keyed by (file, symbol, kind, target name), so edges from
+    // one outside file into same-named symbols of different batch files
+    // (`x.Name`) share a key and rely on the ordinal that only one call's
+    // `seen` map can hand out.
+    let mut unresolved = Vec::new();
+    for file_id in file_ids {
+        let mut stmt = tx.prepare_cached(
+            "SELECT r.id, r.source_symbol_id, r.source_file_id, r.kind, s.name
+             FROM relationships r
+             JOIN symbols s ON s.id = r.target_symbol_id
+             WHERE r.project_id = ?1 AND s.file_id = ?2 AND r.source_file_id != ?2",
         )?;
-        unresolved.push(UnresolvedReferenceInput {
-            source_symbol_id: Some(source_symbol_id.clone()),
-            source_file_id: source_file_id.clone(),
-            relationship_kind: parse_relationship_kind(kind),
-            target_text: target_name.clone(),
-            context_json: None,
-            candidate_count: 0,
-            reason: reason.to_string(),
-            confidence: Confidence::Unresolved,
-        });
+        let inbound: Vec<(String, String, String, String, String)> = stmt
+            .query_map(params![project_id, file_id], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        for (rel_id, source_symbol_id, source_file_id, kind, target_name) in inbound {
+            exec(
+                tx,
+                "DELETE FROM relationships WHERE id = ?1",
+                params![rel_id],
+            )?;
+            unresolved.push(UnresolvedReferenceInput {
+                source_symbol_id: Some(source_symbol_id),
+                source_file_id,
+                relationship_kind: parse_relationship_kind(&kind),
+                target_text: target_name,
+                context_json: None,
+                candidate_count: 0,
+                reason: reason.to_string(),
+                confidence: Confidence::Unresolved,
+            });
+        }
     }
-    persist_unresolved(tx, project_id, ts, &unresolved)
+    // An identical reference may already be parked from an earlier pass
+    // (e.g. an "ambiguous" row for the same name); keep that one.
+    persist_unresolved_rows(tx, project_id, ts, &unresolved, true)
 }
 
 /// Task 5.2 (spec "Per-File Delete Removes Symbols and Converts Inbound
@@ -501,7 +510,7 @@ pub fn delete_file(
         tx,
         project_id,
         ts,
-        &file_id,
+        std::slice::from_ref(&file_id),
         "target symbol's file was deleted",
     )?;
 
@@ -545,19 +554,17 @@ pub fn apply_incremental(
     // file outside the batch (e.g. a dependent that could not be re-read);
     // park it as unresolved rather than let the symbol delete violate the
     // foreign key and roll the whole batch back.
-    for file in files {
-        convert_inbound_to_unresolved(
-            tx,
-            project_id,
-            ts,
-            &file_id(project_id, &file.relative_path),
-            "target symbol was replaced; this file was not re-analyzed",
-        )?;
-    }
     let batch_file_ids: Vec<String> = files
         .iter()
         .map(|file| file_id(project_id, &file.relative_path))
         .collect();
+    convert_inbound_to_unresolved(
+        tx,
+        project_id,
+        ts,
+        &batch_file_ids,
+        "target symbol was replaced; this file was not re-analyzed",
+    )?;
     delete_symbols_of_files(tx, &batch_file_ids)?;
 
     let mut count = 0;
@@ -852,6 +859,22 @@ fn persist_unresolved(
     ts: &str,
     unresolved: &[UnresolvedReferenceInput],
 ) -> Result<()> {
+    persist_unresolved_rows(tx, project_id, ts, unresolved, false)
+}
+
+/// `or_ignore` skips a row whose id already exists instead of failing.
+fn persist_unresolved_rows(
+    tx: &Transaction,
+    project_id: &str,
+    ts: &str,
+    unresolved: &[UnresolvedReferenceInput],
+    or_ignore: bool,
+) -> Result<()> {
+    let insert = if or_ignore {
+        "INSERT OR IGNORE INTO"
+    } else {
+        "INSERT INTO"
+    };
     let mut seen = HashMap::new();
     for u in unresolved {
         let source_symbol = u.source_symbol_id.as_deref().unwrap_or("");
@@ -868,10 +891,12 @@ fn persist_unresolved(
         );
         exec(
             tx,
-            "INSERT INTO unresolved_references(id, project_id, source_symbol_id, source_file_id,
+            &format!(
+                "{insert} unresolved_references(id, project_id, source_symbol_id, source_file_id,
                  relationship_kind, target_text, context_json, candidate_count, reason,
                  confidence, generation, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?11)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?11)"
+            ),
             params![
                 id,
                 project_id,
@@ -2751,6 +2776,125 @@ mod tests {
             .map(|s| s.name)
             .collect();
         assert_eq!(names, vec!["Zed", "Apple"]);
+    }
+
+    /// A file outside the batch with edges into same-named symbols of two
+    /// batch files (C# `x.Name`) has both edges parked as unresolved rows;
+    /// their ids must not collide across the per-file conversions.
+    fn inbound_fixture() -> (Connection, String, String, String) {
+        let named = |dir: &str, name: &str| {
+            let mut f = file_with(&format!("{dir}.ts"), &[name]);
+            f.symbols[0].qualified_name = format!("{dir}.ts::{name}");
+            f
+        };
+        let mut conn = db::open_in_memory().unwrap();
+        let pid = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        let files = [named("x", "run"), named("a", "Name"), named("b", "Name")];
+        reindex(&mut conn, &pid, &files, &[], &[]).unwrap();
+        let sym = |path: &str| -> String {
+            conn.query_row(
+                "SELECT s.id FROM symbols s JOIN files f ON f.id = s.file_id
+                 WHERE f.relative_path = ?1",
+                params![path],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let fid = |path: &str| -> String {
+            conn.query_row(
+                "SELECT id FROM files WHERE relative_path = ?1",
+                params![path],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let (run, a_name, b_name) = (sym("x.ts"), sym("a.ts"), sym("b.ts"));
+        let file_x = fid("x.ts");
+        let reads = |target: &str| RelationshipInput {
+            source_symbol_id: run.clone(),
+            target_symbol_id: Some(target.to_string()),
+            target_external: None,
+            kind: RelationshipKind::Reads,
+            provenance: Provenance::Heuristic,
+            confidence: Confidence::Low,
+            source_file_id: file_x.clone(),
+            start_line: Some(1),
+            start_column: Some(0),
+            reason: None,
+        };
+        reindex(
+            &mut conn,
+            &pid,
+            &files,
+            &[reads(&a_name), reads(&b_name)],
+            &[],
+        )
+        .unwrap();
+        (conn, pid, run, file_x)
+    }
+
+    fn count(conn: &Connection, table: &str) -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn inbound_edges_into_same_named_symbols_of_two_batch_files_do_not_collide() {
+        let (mut conn, pid, _run, _x) = inbound_fixture();
+        let named = |dir: &str| {
+            let mut f = file_with(&format!("{dir}.ts"), &["Name"]);
+            f.symbols[0].qualified_name = format!("{dir}.ts::Name");
+            f
+        };
+        let tx = conn.transaction().unwrap();
+        apply_incremental(
+            &tx,
+            &pid,
+            &now_ts(),
+            &[named("a"), named("b")],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(count(&conn, "relationships"), 0);
+        assert_eq!(count(&conn, "unresolved_references"), 2);
+    }
+
+    #[test]
+    fn inbound_edge_matching_an_existing_unresolved_row_does_not_collide() {
+        let (mut conn, pid, run, file_x) = inbound_fixture();
+        // The same logical reference is already parked as unresolved.
+        let tx = conn.transaction().unwrap();
+        persist_unresolved(
+            &tx,
+            &pid,
+            "ts0",
+            &[UnresolvedReferenceInput {
+                source_symbol_id: Some(run),
+                source_file_id: file_x,
+                relationship_kind: RelationshipKind::Reads,
+                target_text: "Name".to_string(),
+                context_json: None,
+                candidate_count: 9,
+                reason: "ambiguous: 9 candidates".to_string(),
+                confidence: Confidence::Unresolved,
+            }],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let mut a = file_with("a.ts", &["Name"]);
+        a.symbols[0].qualified_name = "a.ts::Name".to_string();
+        let tx = conn.transaction().unwrap();
+        apply_incremental(&tx, &pid, &now_ts(), &[a], &[], &[], &[]).unwrap();
+        tx.commit().unwrap();
+
+        // `x` still reads b.Name; its edge into a.Name became unresolved.
+        assert_eq!(count(&conn, "relationships"), 1);
+        assert!(count(&conn, "unresolved_references") >= 1);
     }
 
     /// QRY-5 follow-up: equal names order by qualified name, never by insertion
