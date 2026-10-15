@@ -1280,9 +1280,14 @@ pub fn search(
     query: &str,
     limit: u32,
 ) -> Result<Vec<StoredSymbol>> {
-    // ponytail: quote as a phrase to neutralize FTS5 operators; richer
-    // tokenization/prefix search can come later.
-    let fts_query = format!("\"{}\"", query.replace('"', "\"\""));
+    // The query is quoted as one phrase to neutralize FTS5 operators; the
+    // trailing `*` makes its last token a prefix (`RegisterMan` finds
+    // `RegisterManager` without a table scan) and the column filter keeps
+    // `kind`/`relative_path` out of it (`class` must not match every class).
+    let fts_query = format!(
+        "{{name qualified_name}}: \"{}\"*",
+        query.replace('"', "\"\"")
+    );
     let mut stmt = conn.prepare_cached(
         "SELECT s.id, s.name, s.qualified_name, s.kind, s.language, f.relative_path,
                 s.start_byte, s.end_byte, s.start_line, s.start_column, s.end_line, s.end_column,
@@ -1291,10 +1296,10 @@ pub fn search(
          JOIN files f ON f.id = s.file_id
          WHERE s.project_id = ?2
            AND s.id IN (SELECT symbol_id FROM symbols_fts WHERE symbols_fts MATCH ?1)
-         ORDER BY s.name
+         ORDER BY LOWER(s.name) = LOWER(?4) DESC, s.name
          LIMIT ?3",
     )?;
-    let rows = stmt.query_map(params![fts_query, project_id, limit], map_stored)?;
+    let rows = stmt.query_map(params![fts_query, project_id, limit, query], map_stored)?;
     let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     if !rows.is_empty() {
         return Ok(rows);
@@ -2699,6 +2704,72 @@ mod tests {
             dependents_by_unresolved_target(&conn, &pid, &texts).unwrap(),
             vec!["src/member.ts".to_string()]
         );
+    }
+
+    fn file_with(path: &str, names: &[&str]) -> FileInput {
+        FileInput {
+            relative_path: path.to_string(),
+            language: "typescript".to_string(),
+            content_hash: format!("hash-{path}"),
+            modified_ns: 0,
+            size_bytes: 10,
+            symbols: names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| symbol(n, SymbolKind::Function, i * 100))
+                .collect(),
+        }
+    }
+
+    /// QRY-5: the symbol kind is not searchable text, so a query that equals
+    /// a kind ("function", "class") no longer returns every symbol of it.
+    #[test]
+    fn search_does_not_match_the_kind_column() {
+        let mut conn = db::open_in_memory().unwrap();
+        let pid = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        reindex(&mut conn, &pid, &[file_with("a.ts", &["walrus"])], &[], &[]).unwrap();
+
+        assert!(search(&conn, &pid, "function", 50).unwrap().is_empty());
+        assert_eq!(search(&conn, &pid, "walrus", 50).unwrap().len(), 1);
+    }
+
+    /// QRY-5: an exact name match ranks ahead of symbols that only match
+    /// through their qualified name (here: `src/zed.ts::Apple`).
+    #[test]
+    fn search_ranks_exact_name_matches_first() {
+        let mut conn = db::open_in_memory().unwrap();
+        let pid = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        let mut zed_file = file_with("src/zed.ts", &["Apple"]);
+        zed_file.symbols[0].qualified_name = "src/zed.ts::Apple".to_string();
+        let mut other = file_with("src/other.ts", &["Zed"]);
+        other.symbols[0].qualified_name = "src/other.ts::Zed".to_string();
+        reindex(&mut conn, &pid, &[zed_file, other], &[], &[]).unwrap();
+
+        let names: Vec<String> = search(&conn, &pid, "zed", 50)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, vec!["Zed", "Apple"]);
+    }
+
+    /// QRY-5: a name prefix finds longer names through the FTS index.
+    #[test]
+    fn search_matches_name_prefixes() {
+        let mut conn = db::open_in_memory().unwrap();
+        let pid = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        reindex(
+            &mut conn,
+            &pid,
+            &[file_with("a.ts", &["RegisterManager", "Other"])],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let hits = search(&conn, &pid, "RegisterMan", 50).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "RegisterManager");
     }
 
     /// QRY-8: the batched FTS/symbol delete in `apply_incremental` replaces

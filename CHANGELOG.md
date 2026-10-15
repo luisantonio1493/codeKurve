@@ -9,6 +9,7 @@ All notable changes to this project are documented here. Format follows
 
 - MCP responses use `schema_version` 2: `null` fields and an empty `warnings` are omitted; `trace_path` returns only the nodes on the found path (plus `reached_count`) instead of every visited node; `analyze_impact`/`trace_path` rows carry `qualified_name`; rows no longer carry `path`/`name` (derivable from `qualified_name`) or the constant `confidence`/`provenance` on symbol rows; tool descriptions and schema text are about 23% shorter; `truncated_reason` is reported; `search_symbols` reports `truncated` when more matches exist. The CLI `--json` output is unchanged (version 1)
 - Store: schema version 7 adds indexes on `source_file_id` (relationships, unresolved references) and `source_symbol_id` (unresolved references), applied automatically on the next open. `find_references`/`find_callers`/`find_callees`/`find_implementations`/`find_unresolved`/`find_routes` page and filter by confidence in SQL (`total` unchanged); rows that tie on the sort key now come back in a stable order. `analyze_impact`/`trace_path` look up node names in one batched query
+- Search: `search_symbols` matches name prefixes through the full-text index (`RegisterMan` finds `RegisterManager`), ranks an exact name match first, and no longer matches the symbol kind or file path columns (`class` used to return every class; a path still matches through the qualified name)
 
 ### Fixed
 
