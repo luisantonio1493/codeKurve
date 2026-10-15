@@ -30,8 +30,12 @@ pub(crate) fn log(msg: &str) {
 /// tokio runtime until the client disconnects. `tokio` is confined to this
 /// crate — `codekurve-core`/`-store`/`-analysis` stay sync.
 pub fn run(root: &Path) -> Result<(), String> {
-    let session = Session::open(root).map_err(|e| e.message)?;
+    let mut session = Session::open(root).map_err(|e| e.message)?;
     let allow_reindex = session.config().mcp.allow_reindex;
+    if !allow_reindex {
+        // Nothing this server runs may write the index; enforce it.
+        session.set_read_only().map_err(|e| e.message)?;
+    }
     codekurve::commands::warn_elevated_settings(session.config());
 
     tokio::runtime::Builder::new_current_thread()

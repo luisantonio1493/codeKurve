@@ -54,8 +54,20 @@ fn configure(conn: &Connection) -> Result<()> {
         "PRAGMA foreign_keys = ON;
          PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
-         PRAGMA busy_timeout = 5000;",
+         PRAGMA busy_timeout = 5000;
+         PRAGMA cache_size = -32768;
+         PRAGMA temp_store = MEMORY;",
     )?;
+    // No `mmap_size`: another process truncating a mapped database file
+    // (e.g. a deleted and rebuilt index while `mcp`/`watch` runs) would
+    // SIGBUS this one, and the page cache already covers the working set.
+    Ok(())
+}
+
+/// Refuse every write on `conn` (`PRAGMA query_only`), for sessions that
+/// must only read the index.
+pub fn set_read_only(conn: &Connection) -> Result<()> {
+    conn.execute_batch("PRAGMA query_only = ON;")?;
     Ok(())
 }
 
@@ -77,6 +89,17 @@ pub fn has_fts5(conn: &Connection) -> bool {
 #[cfg(test)]
 mod optimize_tests {
     use super::*;
+
+    #[test]
+    fn configure_enlarges_the_page_cache_and_keeps_temp_data_in_memory() {
+        let conn = open_in_memory().unwrap();
+        let pragma = |name: &str| -> i64 {
+            conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(pragma("cache_size"), -32_768, "32 MiB page cache");
+        assert_eq!(pragma("temp_store"), 2, "MEMORY");
+    }
 
     #[test]
     fn optimize_succeeds_on_migrated_connection() {

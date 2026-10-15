@@ -75,6 +75,15 @@ impl Session {
         }
     }
 
+    /// Make the session's connection refuse writes — for servers that never
+    /// reindex. A `NotIndexed` session has no connection and stays as is.
+    pub fn set_read_only(&mut self) -> Result<(), CommandError> {
+        if let Session::Indexed { conn, .. } = self {
+            db::set_read_only(conn).map_err(|e| CommandError::from(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     pub fn root(&self) -> &Path {
         match self {
             Session::Indexed { root, .. } | Session::NotIndexed { root, .. } => root,
@@ -1042,6 +1051,31 @@ mod tests {
             via_session,
             vec!["index is stale (2 pending file(s)); run `codekurve index`".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod read_only_tests {
+    use super::*;
+
+    /// QRY-9: a session made read-only (MCP with `allow_reindex` off) can
+    /// still query, and any write through its connection is refused.
+    #[test]
+    fn read_only_session_still_reads_but_refuses_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        codekurve_core::project::init(tmp.path()).unwrap();
+        std::fs::write(tmp.path().join("a.ts"), "export const a = 1;\n").unwrap();
+        commands::index(tmp.path()).unwrap();
+
+        let mut session = Session::open(tmp.path()).unwrap();
+        session.set_read_only().unwrap();
+
+        let (conn, project_id) = session.indexed().unwrap();
+        assert!(repo::pending_files(conn, project_id).is_ok());
+        let err = conn
+            .execute("UPDATE index_state SET pending_files = 9", [])
+            .unwrap_err();
+        assert!(err.to_string().contains("readonly"), "{err}");
     }
 }
 
