@@ -102,23 +102,21 @@ fn event_paths(root: &Path, res: notify::Result<Event>) -> Vec<PathBuf> {
 }
 
 /// PERF-3: a path that cannot change what is indexed and would only re-trigger
-/// a rescan: the project's `.codekurve/` (the index database and its journal
-/// are written on every batch) and `.git/`. `.codekurve/config.toml` is a
-/// config input and stays queued.
+/// a rescan: any `.codekurve/` or `.git/` component below the root, at any
+/// depth (the index database and its journal are written on every batch, and a
+/// submodule carries its own `.git`). Components match exactly, so `git_utils.ts`
+/// is not noise. The root `.codekurve/config.toml` is a config input and stays
+/// queued.
 fn is_index_noise(root: &Path, path: &Path) -> bool {
     if path == root.join(".codekurve").join("config.toml") {
         return false;
     }
-    let Some(Component::Normal(first)) = path
-        .strip_prefix(root)
-        .ok()
-        .and_then(|rel| rel.components().next())
-    else {
+    let Ok(rel) = path.strip_prefix(root) else {
         return false;
     };
-    first
-        .to_str()
-        .is_some_and(|name| name == ".codekurve" || name == ".git")
+    rel.components().any(|component| {
+        matches!(component, Component::Normal(name) if name == ".codekurve" || name == ".git")
+    })
 }
 
 /// An event on the root itself (or the full-sweep marker) means "look at
@@ -619,6 +617,27 @@ mod tests {
         assert_eq!(
             event_paths(root, event("/proj/src/a.ts")),
             vec![PathBuf::from("/proj/src/a.ts")]
+        );
+    }
+
+    /// `.git` and `.codekurve` are matched by path component at any depth, so a
+    /// submodule's `.git` or a nested project's index is dropped too. Substring
+    /// matches (`git_utils.ts`, `.gitignore-like.ts`) are not noise.
+    #[test]
+    fn watch_drops_git_and_index_components_at_any_depth() {
+        let root = Path::new("/proj");
+        let event = |p: &str| -> notify::Result<Event> {
+            Ok(Event::new(notify::EventKind::Any).add_path(PathBuf::from(p)))
+        };
+        assert!(event_paths(root, event("/proj/vendor/lib/.git/index")).is_empty());
+        assert!(event_paths(root, event("/proj/pkg/.codekurve/index.db")).is_empty());
+        assert_eq!(
+            event_paths(root, event("/proj/src/.gitignore-like.ts")),
+            vec![PathBuf::from("/proj/src/.gitignore-like.ts")]
+        );
+        assert_eq!(
+            event_paths(root, event("/proj/src/git_utils.ts")),
+            vec![PathBuf::from("/proj/src/git_utils.ts")]
         );
     }
 }
