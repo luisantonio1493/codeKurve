@@ -10,20 +10,20 @@ use tree_sitter::Node;
 use codekurve_core::SourceSpan;
 
 use crate::ir::FileAnalysis;
-use crate::languages::analyzer_for;
+use crate::languages::{analyzer_for, parse_tree};
 
 /// Parse `source` for the given language and extract its symbols plus
 /// intra-file relationships into a per-file `FileAnalysis`. Keeps its public
 /// signature; every existing caller (`commands.rs`, `incremental.rs`) is
 /// untouched by the seam refactor (design "Technical Approach").
 ///
-/// D3: `frameworks::recognize` runs here, immediately after the per-language
-/// analyzer returns — this is the single entry point every caller already
-/// routes through, and the only place holding both the source text and the
-/// finished per-file symbol list.
+/// PERF-4: the file is parsed exactly once here. The same tree feeds the
+/// language analyzer and then `frameworks::recognize` (D3: the framework pass
+/// runs immediately after the analyzer, on the source it was given).
 pub fn analyze(source: &str, language: LanguageId, relative_path: &str) -> Result<FileAnalysis> {
-    let mut analysis = analyzer_for(language).analyze(source, relative_path)?;
-    crate::frameworks::recognize(source, language, &mut analysis);
+    let tree = parse_tree(language, relative_path, source)?;
+    let mut analysis = analyzer_for(language).analyze(source, &tree, relative_path)?;
+    crate::frameworks::recognize(source, &tree, language, &mut analysis);
     Ok(analysis)
 }
 

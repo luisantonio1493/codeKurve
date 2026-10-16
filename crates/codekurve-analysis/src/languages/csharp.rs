@@ -14,16 +14,16 @@
 
 use std::collections::HashMap;
 
-use codekurve_core::error::{Error, Result};
+use codekurve_core::error::Result;
 use codekurve_core::{
     Confidence, LanguageId, Provenance, RelationshipKind, SourceSpan, SymbolKind, Visibility,
 };
-use tree_sitter::Node;
+use tree_sitter::{Node, Tree};
 
 use crate::extract::{find_child, span_of};
 use crate::ir::{EdgeTarget, ExtractedRelationship, ExtractedSymbol, FileAnalysis};
 use crate::languages::{
-    analyzer_for, new_parser, push_unresolved_edge, resolve_pending, LanguageAnalyzer, PendingRel,
+    analyzer_for, push_unresolved_edge, resolve_pending, LanguageAnalyzer, PendingRel,
     BASE_LIST_REASON, MAX_AST_DEPTH, PROPERTY_TYPE_REASON,
 };
 
@@ -42,8 +42,8 @@ impl LanguageAnalyzer for CSharpAnalyzer {
         LanguageId::CSharp
     }
 
-    fn analyze(&self, source: &str, relative_path: &str) -> Result<FileAnalysis> {
-        analyze(source, relative_path)
+    fn analyze(&self, source: &str, tree: &Tree, relative_path: &str) -> Result<FileAnalysis> {
+        analyze_tree(source, tree, relative_path)
     }
 
     fn kind_matches(&self, rel: RelationshipKind, sym: SymbolKind) -> bool {
@@ -92,16 +92,16 @@ struct CsCtx<'a> {
     pending: Vec<PendingRel>,
 }
 
+/// Test-only convenience: parses `source` the way `extract::analyze` does and
+/// runs the analyzer on that tree.
+#[cfg(test)]
 fn analyze(source: &str, relative_path: &str) -> Result<FileAnalysis> {
-    let mut parser = new_parser();
-    parser
-        .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
-        .map_err(|e| Error::Parse(e.to_string()))?;
+    let tree = crate::languages::parse_tree(LanguageId::CSharp, relative_path, source)?;
+    analyze_tree(source, &tree, relative_path)
+}
 
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| Error::Parse("parser returned no tree".to_string()))?;
-
+/// Extracts symbols and edges from an already-parsed `tree` (PERF-4).
+fn analyze_tree(source: &str, tree: &Tree, relative_path: &str) -> Result<FileAnalysis> {
     let mut ctx = CsCtx {
         source: source.as_bytes(),
         relative_path,

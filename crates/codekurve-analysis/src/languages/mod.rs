@@ -35,25 +35,70 @@ pub(crate) fn new_parser() -> tree_sitter::Parser {
     parser
 }
 
-/// TypeScript-family grammar for one file (IDX-9). `.tsx` needs the TSX
-/// grammar: the plain TypeScript grammar turns JSX into ERROR nodes. `.ts`
-/// keeps the plain grammar, since TSX reads `<T,>(x: T)` as a JSX tag. JS
-/// always uses TSX, which covers JSX.
-pub(crate) fn typescript_grammar(
-    language: LanguageId,
-    relative_path: &str,
-) -> tree_sitter::Language {
-    match language {
-        LanguageId::TypeScript if relative_path.ends_with(".tsx") => {
-            tree_sitter_typescript::LANGUAGE_TSX.into()
-        }
-        LanguageId::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        LanguageId::JavaScript => tree_sitter_typescript::LANGUAGE_TSX.into(),
-        LanguageId::CSharp => unreachable!("TypeScript grammar requested for C#"),
-    }
+// Test-only count of every tree-sitter parse the pipeline runs (PERF-4).
+// Thread-local, so parallel test threads never see each other's parses.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PARSE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-use codekurve_core::error::Result;
+thread_local! {
+    // PERF-4: one parser per grammar and thread, reused across files. A
+    // rayon worker (PERF-1) keeps its own three parsers for its lifetime.
+    static TS_PARSER: RefCell<Option<Parser>> = const { RefCell::new(None) };
+    static TSX_PARSER: RefCell<Option<Parser>> = const { RefCell::new(None) };
+    static CS_PARSER: RefCell<Option<Parser>> = const { RefCell::new(None) };
+}
+
+/// Parses `source` once for the whole analysis pipeline (PERF-4). The tree
+/// is handed to the language analyzer and then to the framework pass, so no
+/// later stage re-parses the file. The TypeScript-family grammar is picked
+/// per file (IDX-9): `.tsx` needs the TSX grammar, since the plain grammar
+/// turns JSX into ERROR nodes; `.ts` keeps the plain grammar, since TSX reads
+/// `<T,>(x: T)` as a JSX tag; JS always uses TSX, which covers JSX.
+pub(crate) fn parse_tree(language: LanguageId, relative_path: &str, source: &str) -> Result<Tree> {
+    #[cfg(test)]
+    PARSE_CALLS.with(|c| c.set(c.get() + 1));
+
+    let (slot, grammar): (
+        &'static LocalKey<RefCell<Option<Parser>>>,
+        tree_sitter::Language,
+    ) = match language {
+        LanguageId::CSharp => (&CS_PARSER, tree_sitter_c_sharp::LANGUAGE.into()),
+        LanguageId::TypeScript if relative_path.ends_with(".tsx") => {
+            (&TSX_PARSER, tree_sitter_typescript::LANGUAGE_TSX.into())
+        }
+        LanguageId::TypeScript => (
+            &TS_PARSER,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        ),
+        LanguageId::JavaScript => (&TSX_PARSER, tree_sitter_typescript::LANGUAGE_TSX.into()),
+    };
+
+    slot.with(|cell: &RefCell<Option<Parser>>| -> Result<Tree> {
+        let mut parser = cell.borrow_mut();
+        if parser.is_none() {
+            let mut fresh = new_parser();
+            fresh
+                .set_language(&grammar)
+                .map_err(|e| Error::Parse(e.to_string()))?;
+            *parser = Some(fresh);
+        }
+        let active = parser
+            .as_mut()
+            .ok_or_else(|| Error::Parse("parser unavailable".to_string()))?;
+        active
+            .parse(source, None)
+            .ok_or_else(|| Error::Parse("parser returned no tree".to_string()))
+    })
+}
+
+use std::cell::RefCell;
+use std::thread::LocalKey;
+
+use tree_sitter::{Parser, Tree};
+
+use codekurve_core::error::{Error, Result};
 use codekurve_core::{
     Confidence, LanguageId, Provenance, RelationshipKind, SourceSpan, SymbolKind,
 };
@@ -66,7 +111,8 @@ use crate::ir::{EdgeTarget, ExtractedRelationship, ExtractedSymbol, FileAnalysis
 /// fixed — a fourth needs a real TS or C# need, not speculative width.
 pub trait LanguageAnalyzer {
     fn language(&self) -> LanguageId;
-    fn analyze(&self, source: &str, relative_path: &str) -> Result<FileAnalysis>;
+    /// `tree` is the file's parse, produced once by `parse_tree` (PERF-4).
+    fn analyze(&self, source: &str, tree: &Tree, relative_path: &str) -> Result<FileAnalysis>;
     fn kind_matches(&self, rel: RelationshipKind, sym: SymbolKind) -> bool;
 }
 

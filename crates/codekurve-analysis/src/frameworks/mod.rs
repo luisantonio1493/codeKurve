@@ -1,15 +1,15 @@
 //! Framework recognition pass (design "Architecture Decisions" D1-D6,
 //! D8-D10; "Module Layout"; "Data Flow"). Runs *inside* `extract::analyze`,
-//! immediately after the per-language analyzer returns (D3), and does its
-//! own marker-gated tree-sitter re-parse of the same source text (D1) —
-//! it never consumes `languages/`'s already-extracted edges, because
+//! immediately after the per-language analyzer returns (D3), and walks the
+//! tree that analyzer already parsed (PERF-4: one parse per file, no
+//! re-parse) — it never consumes `languages/`'s already-extracted edges, because
 //! `cs_simple_type_name`/`cs_callee_name` drop type arguments and call
 //! receivers, and TypeScript extracts no parameter symbols at all. Every
 //! edge this pass appends carries `Provenance::Heuristic` and is always
 //! `EdgeTarget::Unresolved(<name as written>)` (D4) — `resolve.rs` binds it
 //! through the existing cross-file resolver, never a second resolver here.
 //!
-//! PR3 scaffolds the pass end to end (marker prefilter, own parse,
+//! PR3 scaffolds the pass end to end (marker prefilter, tree handoff,
 //! `kind_matches`, the pattern-matcher/array-literal helpers PR4-6 will
 //! consume) with **empty catalogues** — `angular.rs`/`dotnet.rs` don't exist
 //! yet, so `recognize` always appends zero edges and zero roles. The
@@ -28,19 +28,11 @@ use tree_sitter::{Node, Tree};
 
 use crate::extract::span_of;
 use crate::ir::FileAnalysis;
-use crate::languages::{new_parser, MAX_AST_DEPTH};
+use crate::languages::MAX_AST_DEPTH;
 
 mod angular;
 
 mod dotnet;
-
-// ponytail: thread-local, not a global `AtomicUsize` — `cargo test` runs
-// each test function on its own thread, so this stays race-free without any
-// reset/lock ceremony. Only compiled into test builds.
-#[cfg(test)]
-thread_local! {
-    static PARSE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
 
 /// D2 marker prefilter, split by resolution domain (TS/JS share one list,
 /// C# has its own) — a repo with no framework usage pays one substring scan
@@ -77,46 +69,25 @@ fn markers_for(language: LanguageId) -> &'static [&'static str] {
 }
 
 /// True if `source` contains at least one of `language`'s markers — the
-/// gate that keeps a framework-free file from ever being re-parsed (D2).
+/// gate that keeps a framework-free file from ever running the pass (D2).
 pub(crate) fn has_marker(source: &str, language: LanguageId) -> bool {
     markers_for(language).iter().any(|m| source.contains(m))
-}
-
-/// Marker-gated re-parse (D1). Returns `None` on a grammar setup failure;
-/// callers already gate this behind `has_marker`, so this is only ever
-/// invoked for a file that has at least one framework marker.
-fn parse(source: &str, language: LanguageId, relative_path: &str) -> Option<Tree> {
-    #[cfg(test)]
-    PARSE_CALLS.with(|c| c.set(c.get() + 1));
-
-    let grammar = match language {
-        LanguageId::TypeScript | LanguageId::JavaScript => {
-            crate::languages::typescript_grammar(language, relative_path)
-        }
-        LanguageId::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
-    };
-    let mut parser = new_parser();
-    parser.set_language(&grammar).ok()?;
-    parser.parse(source, None)
 }
 
 /// The recognition pass entry point (design "Data Flow"). Appends
 /// framework-level edges to `analysis.relationships` and sets `roles` on
 /// matching `analysis.symbols` entries; never removes or mutates an
-/// existing edge or symbol. PR3's catalogues are empty — `angular.rs` and
-/// `dotnet.rs` land in PR4-6 — so this always leaves `analysis` untouched
-/// once the marker prefilter and own re-parse have run.
-pub fn recognize(source: &str, language: LanguageId, analysis: &mut FileAnalysis) {
+/// existing edge or symbol. `tree` is the file's own parse (PERF-4), so the
+/// pass never re-parses. The marker prefilter returns before `tree` is read
+/// for a file with no marker.
+pub fn recognize(source: &str, tree: &Tree, language: LanguageId, analysis: &mut FileAnalysis) {
     if !has_marker(source, language) {
         return;
     }
-    let Some(tree) = parse(source, language, &analysis.file) else {
-        return;
-    };
     match language {
         LanguageId::TypeScript | LanguageId::JavaScript => {
             let relative_path = analysis.file.clone();
-            angular::recognize(&tree, source, &relative_path, analysis);
+            angular::recognize(tree, source, &relative_path, analysis);
         }
         LanguageId::CSharp => dotnet::recognize(tree.root_node(), source.as_bytes(), analysis),
     }
@@ -449,35 +420,59 @@ mod tests {
 
     #[test]
     fn marker_prefilter_never_parses_a_file_with_no_marker() {
-        let before = PARSE_CALLS.with(|c| c.get());
+        let before = crate::languages::PARSE_CALLS.with(|c| c.get());
         let analysis = extract::analyze(
             "export class Plain {}",
             LanguageId::TypeScript,
             "src/plain.ts",
         )
         .unwrap();
-        let after = PARSE_CALLS.with(|c| c.get());
+        let after = crate::languages::PARSE_CALLS.with(|c| c.get());
 
-        assert_eq!(before, after, "no marker present, parse must never run");
+        assert_eq!(
+            after - before,
+            1,
+            "no marker present: only the language analyzer parses, the framework adds none"
+        );
         assert!(analysis.symbols.iter().all(|s| s.roles.is_empty()));
     }
 
     #[test]
     fn marker_prefilter_parses_when_a_marker_is_present() {
-        let before = PARSE_CALLS.with(|c| c.get());
+        let before = crate::languages::PARSE_CALLS.with(|c| c.get());
         extract::analyze(
             "@Injectable()\nexport class Svc {}",
             LanguageId::TypeScript,
             "src/svc.ts",
         )
         .unwrap();
-        let after = PARSE_CALLS.with(|c| c.get());
+        let after = crate::languages::PARSE_CALLS.with(|c| c.get());
 
         assert_eq!(
             after,
             before + 1,
-            "a marker is present, parse must run exactly once"
+            "a marker is present, the file must be parsed exactly once"
         );
+    }
+
+    // --- PERF-4: one parse per file ------------------------------------------
+
+    /// C# files that hit the broad `CS_MARKERS` (`[ApiController]`, `.Use`,
+    /// `.Add`) go through the framework pass; the whole pipeline must still
+    /// parse each of them exactly once.
+    #[test]
+    fn broad_marker_csharp_file_is_parsed_exactly_once() {
+        let sources = [
+            "[ApiController]\npublic class OrdersController { }",
+            "public class Startup { void Configure(object app) { app.UseCors(); } }",
+            "public class Repo { public void Save(List<int> xs) { xs.Add(1); } }",
+        ];
+        for source in sources {
+            let before = crate::languages::PARSE_CALLS.with(|c| c.get());
+            extract::analyze(source, LanguageId::CSharp, "src/file.cs").unwrap();
+            let after = crate::languages::PARSE_CALLS.with(|c| c.get());
+            assert_eq!(after - before, 1, "parse count for {source:?}");
+        }
     }
 
     // --- object_literal_entries (task 3.12) --------------------------------
