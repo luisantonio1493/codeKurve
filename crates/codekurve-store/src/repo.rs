@@ -286,6 +286,9 @@ fn insert_file_and_symbols(
     )?;
 
     let mut count = 0;
+    // Same-named blocks (`namespace A.B { } namespace A.B { }`) share a key;
+    // keep the first so one such file cannot fail the whole index.
+    let mut seen_keys = std::collections::HashSet::new();
     for symbol in &file.symbols {
         let symbol_key = symbol_key(
             symbol.language.as_str(),
@@ -295,6 +298,9 @@ fn insert_file_and_symbols(
             &symbol.signature_fingerprint,
             symbol.partial_ordinal,
         );
+        if !seen_keys.insert(symbol_key.clone()) {
+            continue;
+        }
         let symbol_id = symbol_id(&file_id, &symbol_key);
         let qualified = &symbol.qualified_name;
         let mut roles = symbol.roles.clone();
@@ -2227,6 +2233,35 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM symbols_fts", [], |r| r.get(0))
             .unwrap();
         assert_eq!(fts_total, 1);
+    }
+
+    /// `namespace A.B { } namespace A.B { }` in one C# file yields two symbols
+    /// with the same `symbol_key`. They must not fail the whole index.
+    #[test]
+    fn reindex_collapses_duplicate_symbol_keys_within_one_file() {
+        let mut conn = db::open_in_memory().unwrap();
+        let project = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        let first = symbol("Shared", SymbolKind::Class, 0);
+        let second = symbol("Shared", SymbolKind::Class, 100);
+        let files = vec![FileInput {
+            relative_path: "src/shared.ts".to_string(),
+            language: "typescript".to_string(),
+            content_hash: "test-hash".to_string(),
+            modified_ns: 0,
+            size_bytes: 42,
+            symbols: vec![first, second],
+        }];
+
+        let outcome = reindex(&mut conn, &project, &files, &[], &[]).unwrap();
+        assert_eq!(outcome.symbols, 1);
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+            .unwrap();
+        let fts_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbols_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(fts_rows, 1);
     }
 
     /// Spec scenario "Reindex after unrelated edit" (§16.3): a later edit
