@@ -153,7 +153,13 @@ pub fn detect(
     filter: Option<&HashSet<String>>,
     force_full: bool,
 ) -> Result<Vec<FileChange>, String> {
-    let report = discovery::discover_report(root, opts).map_err(|e| e.to_string())?;
+    // A batch names the entries it may touch, so only those are walked (PERF-3);
+    // a sweep walks the whole project.
+    let report = match filter {
+        Some(paths) => discovery::discover_report_for(root, opts, paths),
+        None => discovery::discover_report(root, opts),
+    }
+    .map_err(|e| e.to_string())?;
     let discovered = report.files.clone();
     let snapshot = repo::file_snapshot(conn, project_id).map_err(|e| e.to_string())?;
     // `force_full` re-reads everything (every file looks new) but deletions
@@ -235,11 +241,16 @@ fn filter_matches(filter: &HashSet<String>, relative_path: &str) -> bool {
     if filter.contains(relative_path) {
         return true;
     }
-    filter.iter().any(|f| {
-        relative_path.len() > f.len()
-            && relative_path.starts_with(f.as_str())
-            && relative_path.as_bytes()[f.len()] == b'/'
-    })
+    // Ancestor directories, nearest first: one hash lookup per path segment
+    // instead of a scan over every filter entry.
+    let mut rest = relative_path;
+    while let Some(slash) = rest.rfind('/') {
+        rest = &rest[..slash];
+        if filter.contains(rest) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Task 5.3/5.4 (design "Batch Atomicity" + "Oversized Batch Falls Back to
@@ -1464,5 +1475,114 @@ mod tests {
         let exact: HashSet<String> = ["top.ts".to_string()].into_iter().collect();
         assert!(filter_matches(&exact, "top.ts"));
         assert!(!filter_matches(&exact, "top.ts.bak"));
+    }
+
+    /// PERF-3: an event naming one file must not walk the whole project. A
+    /// project over `max_total_files` fails a full walk, so a precise-path
+    /// batch on it must still succeed.
+    #[test]
+    fn precise_filter_does_not_walk_the_whole_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std_fs::create_dir(root.join("src")).unwrap();
+        std_fs::write(root.join("src/a.ts"), "export const a = 1;\n").unwrap();
+        for name in ["b.ts", "c.ts", "d.ts", "e.ts"] {
+            std_fs::write(root.join(name), "export const x = 1;\n").unwrap();
+        }
+        let mut conn = db::open_in_memory().unwrap();
+        let project = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        seed_indexed(
+            &mut conn,
+            &project,
+            root,
+            &["src/a.ts", "b.ts", "c.ts", "d.ts", "e.ts"],
+        );
+        std_fs::write(root.join("src/a.ts"), "export const a = 2;\n").unwrap();
+        std_fs::File::options()
+            .write(true)
+            .open(root.join("src/a.ts"))
+            .unwrap()
+            .set_modified(SystemTime::now() + std::time::Duration::from_secs(7200))
+            .unwrap();
+
+        let mut opts = discovery_opts();
+        opts.max_total_files = 2;
+        let filter: HashSet<String> = ["src/a.ts".to_string()].into_iter().collect();
+        let changes = detect(&conn, &project, root, &opts, Some(&filter), false);
+
+        assert_eq!(changes.unwrap().len(), 1);
+    }
+
+    fn change_path(change: &FileChange) -> &str {
+        match change {
+            FileChange::Created(f) | FileChange::Modified(f) => &f.relative_path,
+            FileChange::Deleted { relative_path }
+            | FileChange::Touched { relative_path, .. }
+            | FileChange::Unverified { relative_path } => relative_path,
+        }
+    }
+
+    /// PERF-3 output guard: for a set of changes, a filtered detect reports
+    /// exactly what a full sweep reports for the same paths, for file and
+    /// directory entries, gitignored files and deletions.
+    #[test]
+    fn filtered_detect_matches_full_sweep_for_the_same_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std_fs::create_dir_all(root.join("src/nested")).unwrap();
+        std_fs::create_dir(root.join("build")).unwrap();
+        std_fs::write(root.join(".gitignore"), "src/ignored.ts\nbuild/\n").unwrap();
+        std_fs::write(root.join("build/out.ts"), "export const o = 1;\n").unwrap();
+        std_fs::write(root.join("src/a.ts"), "export const a = 1;\n").unwrap();
+        std_fs::write(root.join("src/ignored.ts"), "export const i = 1;\n").unwrap();
+        std_fs::write(root.join("src/nested/n.ts"), "export const n = 1;\n").unwrap();
+        std_fs::write(root.join("top.ts"), "export const t = 1;\n").unwrap();
+        let mut conn = db::open_in_memory().unwrap();
+        let project = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        seed_indexed(
+            &mut conn,
+            &project,
+            root,
+            &["src/a.ts", "src/nested/n.ts", "top.ts"],
+        );
+
+        let later = SystemTime::now() + std::time::Duration::from_secs(7200);
+        std_fs::write(root.join("src/a.ts"), "export const a = 2;\n").unwrap();
+        std_fs::File::options()
+            .write(true)
+            .open(root.join("src/a.ts"))
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        std_fs::remove_file(root.join("src/nested/n.ts")).unwrap();
+        std_fs::remove_file(root.join("top.ts")).unwrap();
+        std_fs::write(root.join("src/new.ts"), "export const w = 1;\n").unwrap();
+        std_fs::write(root.join("src/nested/m.ts"), "export const m = 1;\n").unwrap();
+
+        let options = discovery_opts();
+        let sorted = |mut v: Vec<FileChange>| {
+            v.sort_by_key(|c| format!("{c:?}"));
+            v
+        };
+        let full = detect(&conn, &project, root, &options, None, false).unwrap();
+        for entries in [
+            vec!["src/a.ts"],
+            vec!["src"],
+            vec!["src/nested"],
+            vec!["top.ts"],
+            vec!["src/new.ts"],
+            vec!["src/ignored.ts"],
+            vec!["build"],
+            vec!["src/a.ts", "top.ts", "src/nested/m.ts"],
+        ] {
+            let filter: HashSet<String> = entries.iter().map(|e| e.to_string()).collect();
+            let expected: Vec<FileChange> = full
+                .iter()
+                .filter(|c| filter_matches(&filter, change_path(c)))
+                .cloned()
+                .collect();
+            let scoped = detect(&conn, &project, root, &options, Some(&filter), false).unwrap();
+            assert_eq!(sorted(scoped), sorted(expected), "filter {entries:?}");
+        }
     }
 }

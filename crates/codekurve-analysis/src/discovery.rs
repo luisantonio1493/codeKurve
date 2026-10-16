@@ -2,6 +2,7 @@
 //! source files eligible for indexing. See CODEKURVE_MASTER_PLAN.md §15
 //! (discovery) and §15.1 (file rules).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use codekurve_core::LanguageId;
@@ -98,6 +99,29 @@ pub fn discover_report(
     root: &Path,
     options: &DiscoveryOptions,
 ) -> Result<DiscoveryReport, codekurve_core::Error> {
+    walk(root, options, None)
+}
+
+/// [`discover_report`] restricted to `paths`: root-relative `/`-separated
+/// entries, each a file (listed when it exists) or a directory (its whole
+/// subtree is listed). The walk enters only the directories on the way to
+/// those entries and the subtrees under them, so one changed file costs a
+/// listing of its ancestors instead of a walk of the project. Ignore rules,
+/// hidden-file and size limits apply exactly as in [`discover_report`]; the
+/// `max_total_files` cap counts only what this walk returns.
+pub fn discover_report_for(
+    root: &Path,
+    options: &DiscoveryOptions,
+    paths: &HashSet<String>,
+) -> Result<DiscoveryReport, codekurve_core::Error> {
+    walk(root, options, Some(paths.iter().cloned().collect()))
+}
+
+fn walk(
+    root: &Path,
+    options: &DiscoveryOptions,
+    wanted: Option<Vec<String>>,
+) -> Result<DiscoveryReport, codekurve_core::Error> {
     let mut builder = WalkBuilder::new(root);
     if !options.ignore_patterns.is_empty() {
         builder.overrides(build_ignore_overrides(root, &options.ignore_patterns)?);
@@ -112,6 +136,17 @@ pub fn discover_report(
         .require_git(false)
         .follow_links(options.follow_symlinks)
         .max_filesize(Some(options.max_file_size_bytes));
+    // Directories off the way to a wanted entry are pruned inside the walker,
+    // so ignore and hidden rules still decide what a wanted subtree contains.
+    // The walker does not apply this predicate to files when a size limit is
+    // set, so files are checked against `wanted` below as well.
+    let wanted_files = wanted.clone();
+    if let Some(wanted) = wanted {
+        let root = root.to_path_buf();
+        builder.filter_entry(move |entry| {
+            relative_slash_path(&root, entry.path()).is_some_and(|rel| on_the_way(&wanted, &rel))
+        });
+    }
 
     let mut files = Vec::new();
     let mut unreadable = Vec::new();
@@ -147,6 +182,12 @@ pub fn discover_report(
         let Some(relative_path) = relative_slash_path(root, path) else {
             continue;
         };
+        if wanted_files
+            .as_ref()
+            .is_some_and(|wanted| !on_the_way(wanted, &relative_path))
+        {
+            continue;
+        }
         files.push(DiscoveredFile {
             absolute_path: path.to_path_buf(),
             relative_path,
@@ -165,6 +206,22 @@ pub fn discover_report(
         unreadable,
         incomplete,
     })
+}
+
+/// Whether a walk restricted to `wanted` must enter or yield `rel`: it is a
+/// wanted entry, an ancestor of one (the walk has to pass through it), or lies
+/// under a wanted directory.
+fn on_the_way(wanted: &[String], rel: &str) -> bool {
+    rel.is_empty()
+        || wanted
+            .iter()
+            .any(|w| w.is_empty() || rel == w || is_below(rel, w) || is_below(w, rel))
+}
+
+/// `path` lies strictly below the directory `dir` (both root-relative).
+fn is_below(path: &str, dir: &str) -> bool {
+    path.strip_prefix(dir)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Compile `ignore.patterns` into walk overrides. Override globs are a
@@ -391,5 +448,67 @@ mod tests {
         assert!(report.is_unverified("locked/b.ts"));
         assert!(!report.is_unverified("ok.ts"));
         assert!(!report.is_unverified("lockedx/b.ts"));
+    }
+
+    fn listed(report: &DiscoveryReport) -> Vec<&str> {
+        report
+            .files
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect()
+    }
+
+    /// PERF-3: a restricted walk never reads siblings of what it was asked
+    /// for, so a cap the whole project exceeds is not hit by one file.
+    #[test]
+    fn restricted_walk_lists_only_the_named_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("src").join("a.ts"), "").unwrap();
+        fs::write(root.join("src").join("b.ts"), "").unwrap();
+        for name in ["c", "d", "e"] {
+            fs::write(root.join(format!("{name}.ts")), "").unwrap();
+        }
+        let mut opts = options();
+        opts.max_total_files = 2;
+        let paths = HashSet::from(["src/a.ts".to_string()]);
+
+        let report = discover_report_for(root, &opts, &paths).unwrap();
+
+        assert_eq!(listed(&report), vec!["src/a.ts"]);
+    }
+
+    /// PERF-3: a named directory yields its whole subtree, and only that.
+    #[test]
+    fn restricted_walk_lists_a_named_directory_subtree_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("src").join("nested")).unwrap();
+        fs::create_dir(root.join("other")).unwrap();
+        fs::write(root.join("src").join("a.ts"), "").unwrap();
+        fs::write(root.join("src").join("nested").join("n.ts"), "").unwrap();
+        fs::write(root.join("other").join("o.ts"), "").unwrap();
+        let paths = HashSet::from(["src".to_string()]);
+
+        let report = discover_report_for(root, &options(), &paths).unwrap();
+
+        assert_eq!(listed(&report), vec!["src/a.ts", "src/nested/n.ts"]);
+    }
+
+    /// PERF-3 guard: a named file inside a gitignored directory is not listed,
+    /// exactly as the full walk would not list it.
+    #[test]
+    fn restricted_walk_keeps_ignore_rules_for_named_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("build")).unwrap();
+        fs::write(root.join("build").join("out.ts"), "").unwrap();
+        fs::write(root.join(".gitignore"), "build/\n").unwrap();
+        let paths = HashSet::from(["build/out.ts".to_string(), "build".to_string()]);
+
+        let report = discover_report_for(root, &options(), &paths).unwrap();
+
+        assert!(listed(&report).is_empty(), "got {:?}", listed(&report));
     }
 }

@@ -5,7 +5,7 @@
 //! "apply a batch" implementation (design "Technical Approach").
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -89,12 +89,36 @@ fn full_sweep_marker() -> PathBuf {
 fn event_paths(root: &Path, res: notify::Result<Event>) -> Vec<PathBuf> {
     match res {
         Ok(event) if event.need_rescan() => vec![root.to_path_buf()],
-        Ok(event) => event.paths,
+        Ok(event) => event
+            .paths
+            .into_iter()
+            .filter(|p| !is_index_noise(root, p))
+            .collect(),
         Err(err) => {
             eprintln!("warning: watcher error ({err}); scheduling a full sweep");
             vec![root.to_path_buf()]
         }
     }
+}
+
+/// PERF-3: a path that cannot change what is indexed and would only re-trigger
+/// a rescan: the project's `.codekurve/` (the index database and its journal
+/// are written on every batch) and `.git/`. `.codekurve/config.toml` is a
+/// config input and stays queued.
+fn is_index_noise(root: &Path, path: &Path) -> bool {
+    if path == root.join(".codekurve").join("config.toml") {
+        return false;
+    }
+    let Some(Component::Normal(first)) = path
+        .strip_prefix(root)
+        .ok()
+        .and_then(|rel| rel.components().next())
+    else {
+        return false;
+    };
+    first
+        .to_str()
+        .is_some_and(|name| name == ".codekurve" || name == ".git")
 }
 
 /// An event on the root itself (or the full-sweep marker) means "look at
@@ -574,5 +598,27 @@ mod tests {
             "only the root one is loaded"
         );
         assert!(!hit("/other/tsconfig.json"));
+    }
+
+    /// PERF-3: events under `.codekurve/` (index DB and WAL) and `.git/` are
+    /// dropped before they are queued, so a DB write cannot re-trigger a
+    /// rescan. `.codekurve/config.toml` is a config input and stays queued.
+    #[test]
+    fn watch_drops_codekurve_and_git_events_before_queuing() {
+        let root = Path::new("/proj");
+        let event = |p: &str| -> notify::Result<Event> {
+            Ok(Event::new(notify::EventKind::Any).add_path(PathBuf::from(p)))
+        };
+        assert!(event_paths(root, event("/proj/.codekurve/index.db")).is_empty());
+        assert!(event_paths(root, event("/proj/.codekurve/index.db-wal")).is_empty());
+        assert!(event_paths(root, event("/proj/.git/index")).is_empty());
+        assert_eq!(
+            event_paths(root, event("/proj/.codekurve/config.toml")),
+            vec![PathBuf::from("/proj/.codekurve/config.toml")]
+        );
+        assert_eq!(
+            event_paths(root, event("/proj/src/a.ts")),
+            vec![PathBuf::from("/proj/src/a.ts")]
+        );
     }
 }
