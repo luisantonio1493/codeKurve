@@ -54,6 +54,11 @@ pub struct DiscoveryReport {
     pub unreadable: Vec<String>,
     /// A walk error carried no usable path: nothing can be ruled deleted.
     pub incomplete: bool,
+    /// Root-relative `/`-separated paths reached through a symlink (with
+    /// `follow_symlinks`) whose target lies outside the canonical root. They
+    /// are never listed in `files`; this is not a walk failure, so it does not
+    /// make anything unverified.
+    pub outside_root: Vec<String>,
 }
 
 impl DiscoveryReport {
@@ -148,8 +153,15 @@ fn walk(
         });
     }
 
+    // Canonical root for the containment check (A1). `None` when the root
+    // cannot be resolved: then every followed file fails closed as outside.
+    let canonical_root = options
+        .follow_symlinks
+        .then(|| root.canonicalize().ok())
+        .flatten();
     let mut files = Vec::new();
     let mut unreadable = Vec::new();
+    let mut outside_root = Vec::new();
     let mut incomplete = false;
     for entry in builder.build() {
         let entry = match entry {
@@ -188,6 +200,10 @@ fn walk(
         {
             continue;
         }
+        if options.follow_symlinks && !resolves_under(canonical_root.as_deref(), path) {
+            outside_root.push(relative_path);
+            continue;
+        }
         files.push(DiscoveredFile {
             absolute_path: path.to_path_buf(),
             relative_path,
@@ -201,11 +217,22 @@ fn walk(
     }
 
     files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    outside_root.sort();
     Ok(DiscoveryReport {
         files,
         unreadable,
         incomplete,
+        outside_root,
     })
+}
+
+/// Whether `path`, after resolving every symlink on the way, lies under the
+/// canonical project root. An unresolvable path is not contained (A1).
+fn resolves_under(canonical_root: Option<&Path>, path: &Path) -> bool {
+    match (canonical_root, path.canonicalize()) {
+        (Some(root), Ok(target)) => target.starts_with(root),
+        _ => false,
+    }
 }
 
 /// Whether a walk restricted to `wanted` must enter or yield `rel`: it is a
@@ -510,5 +537,39 @@ mod tests {
         let report = discover_report_for(root, &options(), &paths).unwrap();
 
         assert!(listed(&report).is_empty(), "got {:?}", listed(&report));
+    }
+
+    /// A1 (SEC): with `follow_symlinks` on, a symlink whose target lies outside
+    /// the project root must not be indexed. A symlink that stays inside the
+    /// root keeps indexing.
+    #[cfg(unix)]
+    #[test]
+    fn follow_symlinks_does_not_index_targets_outside_the_root() {
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("secret.ts"), "export const s = 1;\n").unwrap();
+        fs::create_dir(outside.path().join("outdir")).unwrap();
+        fs::write(outside.path().join("outdir").join("o.ts"), "").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("a.ts"), "export const a = 1;\n").unwrap();
+        fs::write(root.path().join("inner.ts"), "export const i = 1;\n").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.ts"),
+            root.path().join("link.ts"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path().join("outdir"), root.path().join("linkdir"))
+            .unwrap();
+        std::os::unix::fs::symlink(root.path().join("inner.ts"), root.path().join("inlink.ts"))
+            .unwrap();
+        let mut opts = options();
+        opts.follow_symlinks = true;
+
+        let report = discover_report(root.path(), &opts).unwrap();
+
+        assert_eq!(listed(&report), vec!["a.ts", "inlink.ts", "inner.ts"]);
+        assert_eq!(
+            report.outside_root,
+            vec!["link.ts".to_string(), "linkdir/o.ts".to_string()]
+        );
     }
 }
