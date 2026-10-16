@@ -25,7 +25,7 @@ use tree_sitter::Node;
 use crate::extract::{find_child, span_of};
 use crate::frameworks::AttrPattern;
 use crate::ir::{EdgeTarget, ExtractedRelationship, ExtractedSymbol, FileAnalysis};
-use crate::languages::MAX_AST_DEPTH;
+use crate::languages::{note_depth_limit, MAX_AST_DEPTH};
 
 /// design "Q2 — .NET split" PR5 table: attribute name -> HTTP verb text.
 const HTTP_VERB_ATTRS: &[(&str, &str)] = &[
@@ -206,6 +206,7 @@ fn walk(
     depth: usize,
 ) {
     if depth > MAX_AST_DEPTH {
+        note_depth_limit();
         return;
     }
     let mut next_method: Option<String> = None;
@@ -1738,5 +1739,26 @@ public class AppDbContext : DbContext
         assert!(!call_driven_rel(&analysis, RelationshipKind::RegisteredAs).is_empty());
         assert!(!call_driven_rel(&analysis, RelationshipKind::HandlesRoute).is_empty());
         assert!(!call_driven_rel(&analysis, RelationshipKind::PersistsTo).is_empty());
+    }
+
+    // --- A2: the framework walk reports its depth truncation ----------------
+
+    /// A field initializer nested past `MAX_AST_DEPTH` is walked only by this
+    /// pass (`languages/csharp.rs` does not descend into it). The walk stops
+    /// there, so the truncation must be recorded the same way the other
+    /// walkers record it.
+    #[test]
+    fn field_initializer_nested_past_the_depth_limit_reports_the_truncation() {
+        let nesting = MAX_AST_DEPTH * 2;
+        let source = format!(
+            "// Http\npublic class Shallow {{ public int Field = {open}1{close}; }}\n",
+            open = "(".repeat(nesting),
+            close = ")".repeat(nesting),
+        );
+        let analysis = analyze(&source);
+        assert!(
+            extract::truncated_at_depth_limit(&analysis),
+            "a dotnet walk stopped at the depth limit must be recorded"
+        );
     }
 }
