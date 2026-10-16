@@ -374,8 +374,10 @@ fn resolve_one(
     unresolved: &mut Vec<UnresolvedReference>,
     report: &mut ResolutionReport,
 ) {
-    let text = match &rel.target {
-        EdgeTarget::Unresolved(t) => t.clone(),
+    // Borrowed from `rel`: every dispatch arm only reads it, so the name
+    // lookups take a `&str` without an owned copy per relationship.
+    let text: &str = match &rel.target {
+        EdgeTarget::Unresolved(t) => t.as_str(),
         _ => {
             new_rels.push(rel);
             return;
@@ -384,12 +386,12 @@ fn resolve_one(
 
     match rel.kind {
         RelationshipKind::Imports if source_language == LanguageId::CSharp => {
-            resolve_using(&rel, &text, table, new_rels, report)
+            resolve_using(&rel, text, table, new_rels, report)
         }
         RelationshipKind::Imports => resolve_import(
             file,
             &rel,
-            &text,
+            text,
             table,
             known_files,
             aliases,
@@ -400,7 +402,7 @@ fn resolve_one(
         RelationshipKind::Exports => resolve_export(
             file,
             &rel,
-            &text,
+            text,
             table,
             known_files,
             aliases,
@@ -412,7 +414,7 @@ fn resolve_one(
             resolve_base_entry(
                 source_language,
                 &rel,
-                &text,
+                text,
                 table,
                 new_rels,
                 unresolved,
@@ -428,7 +430,7 @@ fn resolve_one(
             resolve_property_type(
                 source_language,
                 &rel,
-                &text,
+                text,
                 table,
                 new_rels,
                 unresolved,
@@ -443,7 +445,7 @@ fn resolve_one(
         | RelationshipKind::Reads => resolve_by_name(
             source_language,
             &rel,
-            &text,
+            text,
             table,
             new_rels,
             unresolved,
@@ -461,7 +463,7 @@ fn resolve_one(
         | RelationshipKind::PersistsTo => resolve_framework_edge(
             source_language,
             &rel,
-            &text,
+            text,
             table,
             new_rels,
             unresolved,
@@ -1437,6 +1439,68 @@ mod tests {
     /// Zero candidates anywhere in the project -> `UnresolvedReference`,
     /// never dropped and never left as a relationships-table row (spec
     /// "Zero-candidate import" principle applies equally to calls).
+    /// PERF-7 (d) equivalence pin: unresolved edges keep their target text,
+    /// kind and reason, and resolved edges keep their targets, in the file's
+    /// relationship order.
+    #[test]
+    fn unresolved_targets_keep_text_kind_and_reason() {
+        let mut files = vec![
+            analyzed("src/a.ts", "export function helper() { return 1; }\n"),
+            analyzed(
+                "src/b.ts",
+                "import { helper } from './a';\nimport { gone } from './missing';\nfunction run() { helper(); missingCall(); }\n",
+            ),
+        ];
+        resolve(&mut files, &TsconfigAliases::new());
+
+        let unresolved: Vec<(RelationshipKind, String, String)> = files[1]
+            .unresolved
+            .iter()
+            .map(|u| (u.relationship_kind, u.target_text.clone(), u.reason.clone()))
+            .collect();
+        assert_eq!(
+            unresolved,
+            vec![
+                (
+                    RelationshipKind::Imports,
+                    "./missing".to_string(),
+                    "module not found in project".to_string(),
+                ),
+                (
+                    RelationshipKind::Calls,
+                    "missingCall".to_string(),
+                    "no matching symbol in project".to_string(),
+                ),
+            ]
+        );
+        let targets: Vec<(RelationshipKind, String, String)> = files[1]
+            .relationships
+            .iter()
+            .filter_map(|r| match &r.target {
+                EdgeTarget::Global {
+                    file,
+                    qualified_name,
+                } => Some((r.kind, file.clone(), qualified_name.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            targets,
+            vec![
+                (
+                    RelationshipKind::Imports,
+                    "src/a.ts".to_string(),
+                    "src/a.ts::helper".to_string(),
+                ),
+                (
+                    RelationshipKind::Calls,
+                    "src/a.ts".to_string(),
+                    "src/a.ts::helper".to_string(),
+                ),
+            ]
+        );
+    }
+
     #[test]
     fn zero_candidate_call_becomes_unresolved_reference() {
         let mut files = vec![analyzed(
