@@ -437,6 +437,12 @@ fn delete_symbols_of_files(tx: &Transaction, file_ids: &[String]) -> Result<()> 
     Ok(())
 }
 
+// Test-only count of the DELETE statements `park_inbound_edges` runs.
+#[cfg(test)]
+thread_local! {
+    static PARK_DELETE_STATEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Every relationship from ANOTHER file into `file_id`'s symbols becomes an
 /// `unresolved_references` row (target text = the symbol's bare name), so
 /// the symbols can be deleted without a dangling foreign key and without
@@ -497,13 +503,21 @@ fn park_inbound_edges(
     edges: &[InboundEdge],
     reason: &str,
 ) -> Result<()> {
-    let mut unresolved = Vec::with_capacity(edges.len());
-    for edge in edges {
+    // One DELETE per ID_CHUNK edges: the parked rows are the same set, and
+    // only the parked rows' ids are needed, so statement count is the only
+    // thing that changes.
+    for chunk in edges.chunks(ID_CHUNK) {
+        #[cfg(test)]
+        PARK_DELETE_STATEMENTS.with(|c| c.set(c.get() + 1));
+        let placeholders = vec!["?"; chunk.len()].join(",");
         exec(
             tx,
-            "DELETE FROM relationships WHERE id = ?1",
-            params![edge.rel_id],
+            &format!("DELETE FROM relationships WHERE id IN ({placeholders})"),
+            rusqlite::params_from_iter(chunk.iter().map(|edge| edge.rel_id.as_str())),
         )?;
+    }
+    let mut unresolved = Vec::with_capacity(edges.len());
+    for edge in edges {
         unresolved.push(UnresolvedReferenceInput {
             source_symbol_id: Some(edge.source_symbol_id.clone()),
             source_file_id: edge.source_file_id.clone(),
@@ -2972,6 +2986,106 @@ mod tests {
         let mut f = file_with(&format!("{dir}.ts"), &[name]);
         f.symbols[0].qualified_name = format!("{dir}.ts::{name}");
         f
+    }
+
+    /// `x.ts`'s `run` reads three symbols of `t.ts`; deleting `t.ts` parks
+    /// all three edges as unresolved rows (PERF-7 (b) fixture).
+    fn parked_edges_fixture() -> (Connection, String) {
+        let mut conn = db::open_in_memory().unwrap();
+        let pid = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        let mut target = file_with("t.ts", &["Alpha", "Beta", "Gamma"]);
+        for sym in &mut target.symbols {
+            sym.qualified_name = format!("t.ts::{}", sym.name);
+        }
+        let mut caller = file_with("x.ts", &["run"]);
+        caller.symbols[0].qualified_name = "x.ts::run".to_string();
+        let files = [caller, target];
+        reindex(&mut conn, &pid, &files, &[], &[]).unwrap();
+
+        let symbol_id = |conn: &Connection, path: &str, name: &str| -> String {
+            conn.query_row(
+                "SELECT s.id FROM symbols s JOIN files f ON f.id = s.file_id
+                 WHERE f.relative_path = ?1 AND s.name = ?2",
+                params![path, name],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let run = symbol_id(&conn, "x.ts", "run");
+        let file_x: String = conn
+            .query_row(
+                "SELECT id FROM files WHERE relative_path = 'x.ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let edges: Vec<RelationshipInput> = ["Alpha", "Beta", "Gamma"]
+            .iter()
+            .map(|name| RelationshipInput {
+                source_symbol_id: run.clone(),
+                target_symbol_id: Some(symbol_id(&conn, "t.ts", name)),
+                target_external: None,
+                kind: RelationshipKind::Reads,
+                provenance: Provenance::Heuristic,
+                confidence: Confidence::Low,
+                source_file_id: file_x.clone(),
+                start_line: Some(1),
+                start_column: Some(0),
+                reason: None,
+            })
+            .collect();
+        reindex(&mut conn, &pid, &files, &edges, &[]).unwrap();
+        (conn, pid)
+    }
+
+    /// PERF-7 (b) equivalence pin: deleting a file with inbound edges leaves
+    /// exactly one parked unresolved row per edge (target text, reason, kind,
+    /// confidence) and no relationship pointing at the deleted file.
+    #[test]
+    fn delete_file_parks_each_inbound_edge_with_its_reason() {
+        let (mut conn, pid) = parked_edges_fixture();
+        let tx = conn.transaction().unwrap();
+        delete_file(&tx, &pid, &now_ts(), "t.ts").unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(count(&conn, "relationships"), 0);
+        let mut stmt = conn
+            .prepare(
+                "SELECT target_text, reason, relationship_kind, confidence, candidate_count
+                 FROM unresolved_references ORDER BY target_text",
+            )
+            .unwrap();
+        let rows: Vec<(String, String, String, String, i64)> = stmt
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        let parked = "target symbol's file was deleted";
+        let row = |target: &str| {
+            (
+                target.to_string(),
+                parked.to_string(),
+                "reads".to_string(),
+                "unresolved".to_string(),
+                0,
+            )
+        };
+        assert_eq!(rows, vec![row("Alpha"), row("Beta"), row("Gamma")]);
+    }
+
+    /// PERF-7 (b): three inbound edges are parked by one DELETE statement,
+    /// not one statement per edge.
+    #[test]
+    fn parking_inbound_edges_deletes_them_in_one_statement() {
+        let (mut conn, pid) = parked_edges_fixture();
+        PARK_DELETE_STATEMENTS.with(|c| c.set(0));
+        let tx = conn.transaction().unwrap();
+        delete_file(&tx, &pid, &now_ts(), "t.ts").unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(PARK_DELETE_STATEMENTS.with(|c| c.get()), 1);
     }
 
     /// A batch file's symbols are deleted and re-inserted with the same ids;
