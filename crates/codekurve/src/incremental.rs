@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use codekurve_analysis::discovery::{self, DiscoveredFile, DiscoveryOptions, DiscoveryReport};
 use codekurve_analysis::extract;
@@ -19,12 +20,25 @@ use rayon::prelude::*;
 
 use crate::commands::{self, FileMeta};
 
+/// Test-only log of every content read the engine performs, so a test can
+/// count how many times one file is read across detect and apply.
+#[cfg(test)]
+pub(crate) static READ_LOG: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn note_read(path: &Path) {
+    READ_LOG.lock().unwrap().push(path.to_path_buf());
+}
+
 /// One file's classification against the shared change-detection engine
 /// (design "Interfaces").
 #[derive(Debug, Clone, PartialEq)]
 pub enum FileChange {
     Created(DiscoveredFile),
-    Modified(DiscoveredFile),
+    /// Carries the bytes `detect` already read and hashed, so `apply_batch`
+    /// analyzes that same read instead of reading the file again (PERF-7).
+    Modified(DiscoveredFile, Arc<StableRead>),
     Deleted {
         relative_path: String,
     },
@@ -87,7 +101,8 @@ pub struct BatchOutcome {
 /// by callers that detected an analyzer-version mismatch (new extraction
 /// logic, unchanged source files — content hashes alone can't see that).
 /// A file read whose bytes and mtime describe the same version of it.
-struct StableRead {
+#[derive(Debug, PartialEq)]
+pub struct StableRead {
     bytes: Vec<u8>,
     text: String,
     modified_ns: i64,
@@ -106,6 +121,16 @@ fn read_and_analyze(
     language: LanguageId,
 ) -> Result<(FileMeta, FileAnalysis), String> {
     let read = read_stable(absolute)?;
+    analyze_read(&read, relative_path, language)
+}
+
+/// [`read_and_analyze`] for bytes that were already read: the analysis and
+/// the stored metadata both come from that one read.
+fn analyze_read(
+    read: &StableRead,
+    relative_path: &str,
+    language: LanguageId,
+) -> Result<(FileMeta, FileAnalysis), String> {
     let analysis =
         extract::analyze(&read.text, language, relative_path).map_err(|e| e.to_string())?;
     let meta = FileMeta {
@@ -124,6 +149,8 @@ fn read_and_analyze(
 /// instead of failing the batch. `between` runs after the read, before the
 /// second stat (a test seam; a no-op in production).
 fn read_stable_with(path: &Path, mut between: impl FnMut()) -> Result<StableRead, String> {
+    #[cfg(test)]
+    note_read(path);
     for _ in 0..3 {
         let before = fs::metadata(path).map_err(|e| e.to_string())?;
         let bytes = fs::read(path).map_err(|e| e.to_string())?;
@@ -192,13 +219,15 @@ pub fn detect(
             continue; // fast path: unchanged
         }
 
-        let Ok(bytes) = fs::read(&file.absolute_path) else {
+        // One stable read serves the hash check here and, through
+        // `FileChange::Modified`, the analysis in `apply_batch`.
+        let Ok(read) = read_stable(&file.absolute_path) else {
             changes.push(FileChange::Unverified {
                 relative_path: file.relative_path.clone(),
             });
             continue;
         };
-        if prior.content_hash.as_deref() == Some(repo::content_hash(&bytes).as_str()) {
+        if prior.content_hash.as_deref() == Some(repo::content_hash(&read.bytes).as_str()) {
             // touch-only: mtime moved, content didn't
             changes.push(FileChange::Touched {
                 relative_path: file.relative_path.clone(),
@@ -206,7 +235,7 @@ pub fn detect(
             });
             continue;
         }
-        changes.push(FileChange::Modified(file));
+        changes.push(FileChange::Modified(file, Arc::new(read)));
     }
 
     for path in snapshot.keys() {
@@ -474,18 +503,22 @@ fn apply_incremental_changes(
     changes: &[FileChange],
     ts: &str,
 ) -> Result<BatchOutcome, String> {
-    let mut created_or_modified: Vec<DiscoveredFile> = Vec::new();
+    // A modified file carries the read `detect` made; a created one is read here.
+    let mut created_or_modified: Vec<(DiscoveredFile, Option<Arc<StableRead>>)> = Vec::new();
     let mut deleted: Vec<String> = Vec::new();
     for change in changes {
         match change {
-            FileChange::Created(f) | FileChange::Modified(f) => created_or_modified.push(f.clone()),
+            FileChange::Created(f) => created_or_modified.push((f.clone(), None)),
+            FileChange::Modified(f, read) => {
+                created_or_modified.push((f.clone(), Some(Arc::clone(read))))
+            }
             FileChange::Deleted { relative_path } => deleted.push(relative_path.clone()),
             FileChange::Touched { .. } | FileChange::Unverified { .. } => {} // handled in `apply_batch`
         }
     }
     let b_paths: HashSet<String> = created_or_modified
         .iter()
-        .map(|f| f.relative_path.clone())
+        .map(|(f, _)| f.relative_path.clone())
         .collect();
     let deleted_set: HashSet<String> = deleted.iter().cloned().collect();
 
@@ -494,7 +527,10 @@ fn apply_incremental_changes(
     // failure"), unlike the fallback path's lenient skip-on-error.
     let parsed: Vec<Result<(FileMeta, FileAnalysis), String>> = created_or_modified
         .par_iter()
-        .map(|file| read_and_analyze(&file.absolute_path, &file.relative_path, file.language))
+        .map(|(file, read)| match read {
+            Some(read) => analyze_read(read, &file.relative_path, file.language),
+            None => read_and_analyze(&file.absolute_path, &file.relative_path, file.language),
+        })
         .collect();
     let mut analyses: Vec<FileAnalysis> = Vec::new();
     let mut file_meta: Vec<FileMeta> = Vec::new();
@@ -777,14 +813,14 @@ mod tests {
         let changes = detect(&conn, &project, root, &discovery_opts(), None, false).unwrap();
 
         assert!(
-            !changes
-                .iter()
-                .any(|c| matches!(c, FileChange::Modified(f) if f.relative_path == "touched.ts")),
+            !changes.iter().any(
+                |c| matches!(c, FileChange::Modified(f, _) if f.relative_path == "touched.ts")
+            ),
             "touch-only edit must not be classified as changed"
         );
         assert!(changes
             .iter()
-            .any(|c| matches!(c, FileChange::Modified(f) if f.relative_path == "changed.ts")));
+            .any(|c| matches!(c, FileChange::Modified(f, _) if f.relative_path == "changed.ts")));
         assert!(changes
             .iter()
             .any(|c| matches!(c, FileChange::Created(f) if f.relative_path == "added.ts")));
@@ -821,6 +857,97 @@ mod tests {
         let aliases = TsconfigAliases::new();
         let changes = detect(conn, project, root, &options, None, false)?;
         apply_batch(conn, &ctx(root, project, &aliases, &options), &changes)
+    }
+
+    /// PERF-7 (a) equivalence pin: an edited file that goes through `detect`
+    /// and `apply_batch` is stored exactly as a clean index of the same tree
+    /// stores it (size, content hash, mtime and symbol ids).
+    #[test]
+    fn modified_file_indexed_incrementally_matches_clean_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Six files: one edit stays under the 25% full-reindex threshold.
+        let names = ["a.ts", "b.ts", "c.ts", "d.ts", "e.ts", "f.ts"];
+        for name in names {
+            std_fs::write(root.join(name), "export const x = 1;\n").unwrap();
+        }
+
+        let mut incremental = db::open_in_memory().unwrap();
+        let project = upsert_project(&incremental, "demo", "/tmp/demo", "hash").unwrap();
+        seed_indexed(&mut incremental, &project, root, &names);
+
+        let edited = "export const a = 2;\nexport function extra() {}\n";
+        std_fs::write(root.join("a.ts"), edited).unwrap();
+        std_fs::File::options()
+            .write(true)
+            .open(root.join("a.ts"))
+            .unwrap()
+            .set_modified(SystemTime::now() + std::time::Duration::from_secs(3600))
+            .unwrap();
+        let outcome = sync(&mut incremental, &project, root).unwrap();
+        assert_eq!(outcome.files_changed, 1);
+        assert!(!outcome.fell_back_to_full_reindex);
+
+        let mut clean = db::open_in_memory().unwrap();
+        let clean_project = upsert_project(&clean, "demo", "/tmp/demo", "hash").unwrap();
+        sync(&mut clean, &clean_project, root).unwrap();
+
+        let stored_meta = |conn: &Connection, project: &str| {
+            repo::file_snapshot(conn, project)
+                .unwrap()
+                .into_iter()
+                .map(|(path, meta)| (path, (meta.size_bytes, meta.content_hash, meta.modified_ns)))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        assert_eq!(
+            stored_meta(&incremental, &project),
+            stored_meta(&clean, &clean_project)
+        );
+        let mut incremental_ids =
+            repo::symbol_ids_for_files(&incremental, &project, &["a.ts".to_string()]).unwrap();
+        let mut clean_ids =
+            repo::symbol_ids_for_files(&clean, &clean_project, &["a.ts".to_string()]).unwrap();
+        incremental_ids.sort();
+        clean_ids.sort();
+        assert!(!clean_ids.is_empty());
+        assert_eq!(incremental_ids, clean_ids);
+        assert_eq!(
+            stored_meta(&incremental, &project)["a.ts"].0,
+            edited.len() as u64
+        );
+    }
+
+    /// PERF-7 (a): an edited file's bytes are read once per batch, by
+    /// `detect`, and `apply_batch` reuses them instead of reading it again.
+    #[test]
+    fn modified_file_is_read_once_across_detect_and_apply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let names = ["read-once.ts", "b.ts", "c.ts", "d.ts", "e.ts", "f.ts"];
+        for name in names {
+            std_fs::write(root.join(name), "export const x = 1;\n").unwrap();
+        }
+        let mut conn = db::open_in_memory().unwrap();
+        let project = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        seed_indexed(&mut conn, &project, root, &names);
+        std_fs::write(root.join("read-once.ts"), "export const x = 2;\n").unwrap();
+        std_fs::File::options()
+            .write(true)
+            .open(root.join("read-once.ts"))
+            .unwrap()
+            .set_modified(SystemTime::now() + std::time::Duration::from_secs(3600))
+            .unwrap();
+
+        READ_LOG.lock().unwrap().clear();
+        sync(&mut conn, &project, root).unwrap();
+
+        let reads = READ_LOG
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.file_name().is_some_and(|n| n == "read-once.ts"))
+            .count();
+        assert_eq!(reads, 1, "a changed file must be read once per batch");
     }
 
     /// IDX-2: `force_full` treats every discovered file as new, but files
@@ -1429,16 +1556,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            changes,
-            vec![FileChange::Modified(
-                discovery::discover(root, &discovery_opts())
-                    .unwrap()
-                    .into_iter()
-                    .find(|f| f.relative_path == "src/a.ts")
-                    .unwrap()
-            )]
-        );
+        match changes.as_slice() {
+            [FileChange::Modified(file, read)] => {
+                assert_eq!(file.relative_path, "src/a.ts");
+                assert_eq!(read.text, "export const a = 2;\n");
+            }
+            other => panic!("expected one Modified change, got {other:?}"),
+        }
     }
 
     /// Task 5.4 (design "Oversized Batch Falls Back to Full Reindex"):
@@ -1515,7 +1639,7 @@ mod tests {
 
     fn change_path(change: &FileChange) -> &str {
         match change {
-            FileChange::Created(f) | FileChange::Modified(f) => &f.relative_path,
+            FileChange::Created(f) | FileChange::Modified(f, _) => &f.relative_path,
             FileChange::Deleted { relative_path }
             | FileChange::Touched { relative_path, .. }
             | FileChange::Unverified { relative_path } => relative_path,
