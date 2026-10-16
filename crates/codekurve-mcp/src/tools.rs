@@ -116,7 +116,7 @@ pub struct TracePathInput {
 
 /// `analyze_impact` (§28.2): same subject resolution as [`RelationshipInput`]
 /// plus `--depth`; no `to` (reverse BFS explores everything reachable, no
-/// single target).
+/// single target). `limit`/`offset` page the reached rows in BFS order.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct AnalyzeImpactInput {
     pub symbol_id: Option<String>,
@@ -125,6 +125,10 @@ pub struct AnalyzeImpactInput {
     pub min_confidence: Option<String>,
     /// Max hops (default 10).
     pub depth: Option<u32>,
+    /// Max reached rows returned (default: all).
+    pub limit: Option<u32>,
+    /// Reached rows to skip before `limit` (default 0). `total` is the full reached count.
+    pub offset: Option<u32>,
 }
 
 #[tool_router(vis = "pub(crate)")]
@@ -468,7 +472,14 @@ impl CodeKurve {
         let warnings = session.warnings();
         let project = session.config().project.name.clone();
         let total = rows.len();
-        let truncated = outcome.truncated;
+        // Without `limit`/`offset` the window is the whole reached set, so the
+        // output is unchanged. A window that leaves reached rows out is
+        // reported as truncated.
+        let offset = input.offset.unwrap_or(0) as usize;
+        let limit = input.limit.map_or(usize::MAX, |limit| limit as usize);
+        let window_cut = offset.saturating_add(limit) < total;
+        let rows: Vec<serde_json::Value> = rows.into_iter().skip(offset).take(limit).collect();
+        let truncated = outcome.truncated || window_cut;
         let truncated_reason = outcome
             .truncated_reason
             .map(commands::truncation_reason_str);

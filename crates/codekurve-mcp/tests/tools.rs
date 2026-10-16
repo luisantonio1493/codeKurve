@@ -519,6 +519,48 @@ fn all_read_tools_return_the_28_3_envelope() {
     assert_envelope_shape(&envelope);
     assert!(!envelope["result"]["reached"].as_array().unwrap().is_empty());
 
+    // analyze_impact pages its reached rows in BFS order with `limit`/`offset`.
+    // Without them the output is the full reached set, and `total` is that
+    // full count in every page.
+    let impact_all = envelope_of(&session.call(
+        "codekurve_analyze_impact",
+        serde_json::json!({"symbol_name": "src/a.ts::getEligibility"}),
+    ));
+    let all_rows = impact_all["result"]["reached"].as_array().unwrap().clone();
+    assert!(all_rows.len() >= 2, "{impact_all}");
+    assert_eq!(impact_all["total"], all_rows.len(), "{impact_all}");
+    assert_eq!(impact_all["truncated"], false, "{impact_all}");
+
+    let first = envelope_of(&session.call(
+        "codekurve_analyze_impact",
+        serde_json::json!({"symbol_name": "src/a.ts::getEligibility", "limit": 1}),
+    ));
+    assert_eq!(
+        first["result"]["reached"].as_array().unwrap().len(),
+        1,
+        "{first}"
+    );
+    assert_eq!(first["result"]["reached"][0], all_rows[0], "{first}");
+    assert_eq!(first["total"], all_rows.len(), "{first}");
+    assert_eq!(first["truncated"], true, "{first}");
+
+    let second = envelope_of(&session.call(
+        "codekurve_analyze_impact",
+        serde_json::json!({"symbol_name": "src/a.ts::getEligibility", "limit": 1, "offset": 1}),
+    ));
+    assert_eq!(second["result"]["reached"][0], all_rows[1], "{second}");
+
+    let past_end = envelope_of(&session.call(
+        "codekurve_analyze_impact",
+        serde_json::json!({"symbol_name": "src/a.ts::getEligibility", "offset": all_rows.len()}),
+    ));
+    assert_eq!(
+        past_end["result"]["reached"].as_array().unwrap().len(),
+        0,
+        "{past_end}"
+    );
+    assert_eq!(past_end["truncated"], false, "{past_end}");
+
     session.finish();
 }
 

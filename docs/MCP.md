@@ -47,7 +47,11 @@ Every response is one JSON envelope:
 first), `result.path_found` and `result.reached_count` (how many nodes the
 search visited) — never the whole visited frontier. `analyze_impact` rows
 carry `qualified_name`, so a node can be read without a follow-up
-`get_symbol`. `codekurve_search_symbols` sets `truncated` when
+`get_symbol`. `analyze_impact` takes optional `limit` and `offset` over its
+reached rows (BFS order); without them every reached row is returned, as
+before. `total` is always the full reached count, and `truncated` is set when
+a `limit`/`offset` window leaves reached rows out. `trace_path` has no paging:
+its answer is one path. `codekurve_search_symbols` sets `truncated` when
 more matches exist than `limit` (which is capped at `queries.max_limit`).
 `get_symbol` omits `source_truncated` unless the snippet was cut at
 `queries.max_snippet_bytes`.
