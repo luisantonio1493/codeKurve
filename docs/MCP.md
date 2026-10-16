@@ -37,7 +37,7 @@ Every response is one JSON envelope:
 | `result` | the tool's data |
 | `truncated` | `true` when more results exist than were returned |
 | `truncated_reason` | present on `trace_path`/`analyze_impact` when truncated: `max_depth`, `max_nodes`, `max_edges` or `max_duration` |
-| `total` | paginated tools only: rows returned in this page |
+| `total` | paginated tools only: full count of matching or reached rows, not just this page |
 | `warnings` | present only when non-empty (e.g. a stale-index notice) |
 
 **Absent means none.** Fields whose value would be `null`, and an empty
