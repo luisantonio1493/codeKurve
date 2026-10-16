@@ -80,7 +80,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
 
       - name: install cargo-cyclonedx
-        run: cargo install cargo-cyclonedx --locked
+        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
 
       - name: generate CycloneDX SBOM
         run: cargo cyclonedx --format json --all
@@ -103,7 +103,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
 
       - name: install cargo-about
-        run: cargo install cargo-about --locked --features cli
+        run: cargo install cargo-about --version 0.9.2 --locked --features cli
 
       - name: generate third-party NOTICE report
         run: cargo about generate about.hbs > NOTICE-3rdparty.md

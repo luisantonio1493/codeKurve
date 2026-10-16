@@ -66,7 +66,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
 
       - name: install cargo-about
-        run: cargo install cargo-about --locked --features cli
+        run: cargo install cargo-about --version 0.9.2 --locked --features cli
 
       - name: generate third-party NOTICE report
         run: cargo about generate about.hbs > NOTICE-3rdparty.md
