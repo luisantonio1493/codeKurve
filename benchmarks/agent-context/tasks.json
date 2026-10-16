@@ -40,47 +40,6 @@
         ],
         "forbidden_evidence": []
       }
-    },
-    {
-      "id": "route-flow",
-      "corpus": "csharp-iungo-provider-api",
-      "prompt": "Trace the POST /api/Register flow: identify the controller method, the registration manager method it calls, and the domain entity collection used by that manager to check active provider contracts.",
-      "expected": {
-        "required_evidence": [
-          {"path": "IUNGO.Provider.API/Controllers/ProviderAcount/RegisterController.cs", "symbol": "RegisterController.Post", "relationship": "calls"},
-          {"path": "IUNGO.Provider.BL/RegisterManager.cs", "symbol": "RegisterManager.ValidHealthCareEntity", "relationship": "uses"},
-          {"path": "IUNGO.Provider.DAL/Models/HealthCareNetworkAssociation.cs", "symbol": "HealthCareNetworkAssociation", "relationship": "defines"}
-        ],
-        "forbidden_evidence": []
-      }
-    },
-    {
-      "id": "symbol-ambiguity",
-      "corpus": "csharp-iungo-provider-api",
-      "prompt": "Which RegisterManager method is invoked by RegisterController.Post for current registration validation? Distinguish it from the similarly named legacy ValidHealthCareEntity1 and ValidHealthCareEntity2 methods.",
-      "expected": {
-        "required_evidence": [
-          {"path": "IUNGO.Provider.API/Controllers/ProviderAcount/RegisterController.cs", "symbol": "RegisterController.Post", "relationship": "calls"},
-          {"path": "IUNGO.Provider.BL/RegisterManager.cs", "symbol": "RegisterManager.ValidHealthCareEntity", "relationship": "defines"}
-        ],
-        "forbidden_evidence": [
-          {"path": "IUNGO.Provider.BL/RegisterManager.cs", "symbol": "RegisterManager.ValidHealthCareEntity1", "relationship": "calls"},
-          {"path": "IUNGO.Provider.BL/RegisterManager.cs", "symbol": "RegisterManager.ValidHealthCareEntity2", "relationship": "calls"}
-        ]
-      }
-    },
-    {
-      "id": "impact-radius",
-      "corpus": "csharp-iungo-provider-api",
-      "prompt": "If HealthCareEntity.BlockRegistration changes, identify the entity member, the manager method that reads it during validation, and the API endpoint that reaches that method.",
-      "expected": {
-        "required_evidence": [
-          {"path": "IUNGO.Provider.DAL/Models/HealthCareEntity.cs", "symbol": "HealthCareEntity.BlockRegistration", "relationship": "defines"},
-          {"path": "IUNGO.Provider.BL/RegisterManager.cs", "symbol": "RegisterManager.ValidHealthCareEntity", "relationship": "reads"},
-          {"path": "IUNGO.Provider.API/Controllers/ProviderAcount/RegisterController.cs", "symbol": "RegisterController.Post", "relationship": "calls"}
-        ],
-        "forbidden_evidence": []
-      }
     }
   ]
 }

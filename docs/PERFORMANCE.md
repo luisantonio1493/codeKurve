@@ -82,7 +82,7 @@ separately. It never clones or downloads a corpus.
 The versioned corpus lock and questions live in
 `benchmarks/agent-context/`. The Angular checkout is pinned to
 `66665aa669b3ab466bb5945572685f11cb08f439`. The local-only C# corpus,
-`iungo-provider-api`, is pinned with a deterministic SHA-256 source-tree
+the private C# API, is pinned with a deterministic SHA-256 source-tree
 snapshot instead of Git. The snapshot excludes VCS metadata and generated
 output (`bin`, `obj`, `node_modules`, and local indexes), and changes to an
 included file stop the benchmark before a model call. It is never cloned,
@@ -93,7 +93,7 @@ Override either local location when necessary:
 ```sh
 cargo build --release -p codekurve-bin
 python3 scripts/bench_agent_context.py \
-  --corpus csharp-iungo-provider-api=/path/to/iungo-provider-api
+  --corpus csharp-private-api=/path/to/private-csharp-api
 ```
 
 ### Measurements and decision rule
