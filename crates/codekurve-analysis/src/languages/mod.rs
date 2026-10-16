@@ -94,6 +94,7 @@ pub(crate) fn parse_tree(language: LanguageId, relative_path: &str, source: &str
 }
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::thread::LocalKey;
 
 use tree_sitter::{Parser, Tree};
@@ -175,6 +176,13 @@ pub(crate) struct PendingRel {
     pub(crate) span: SourceSpan,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: symbol candidates `resolve_pending` examined on this thread.
+    pub(crate) static RESOLVE_CANDIDATE_CHECKS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Resolves every deferred heritage/call/construct/local-export target
 /// against the file's full symbol list, now that forward references are
 /// visible. A same-file name+kind match becomes `EdgeTarget::Local`; zero
@@ -189,10 +197,27 @@ pub(crate) fn resolve_pending(
     out: &mut Vec<ExtractedRelationship>,
     analyzer: &dyn LanguageAnalyzer,
 ) {
+    // PERF-6: one name -> symbols map per file, built in symbol order so each
+    // bucket keeps the candidate order the full scan produced.
+    let mut by_name: HashMap<&str, Vec<&ExtractedSymbol>> = HashMap::new();
+    for symbol in symbols {
+        by_name
+            .entry(symbol.name.as_str())
+            .or_default()
+            .push(symbol);
+    }
     for rel in pending {
-        let matches: Vec<&ExtractedSymbol> = symbols
+        let candidates: &[&ExtractedSymbol] = by_name
+            .get(rel.target_name.as_str())
+            .map_or(&[], Vec::as_slice);
+        let matches: Vec<&ExtractedSymbol> = candidates
             .iter()
-            .filter(|s| s.name == rel.target_name && kind_matches(analyzer, rel.kind, s.kind))
+            .copied()
+            .filter(|s| {
+                #[cfg(test)]
+                RESOLVE_CANDIDATE_CHECKS.with(|c| c.set(c.get() + 1));
+                kind_matches(analyzer, rel.kind, s.kind)
+            })
             .collect();
         match matches.as_slice() {
             [] => out.push(ExtractedRelationship {
@@ -354,5 +379,121 @@ mod tests {
         assert!(!same_resolution_domain(CSharp, TypeScript));
         assert!(!same_resolution_domain(TypeScript, CSharp));
         assert!(!same_resolution_domain(CSharp, JavaScript));
+    }
+
+    fn fixture_symbol(key: &str, name: &str, kind: SymbolKind) -> ExtractedSymbol {
+        ExtractedSymbol {
+            local_key: key.to_string(),
+            name: name.to_string(),
+            qualified_name: key.to_string(),
+            kind,
+            language: LanguageId::TypeScript,
+            span: SourceSpan {
+                start_byte: 0,
+                end_byte: 0,
+                start_line: 0,
+                start_column: 0,
+                end_line: 0,
+                end_column: 0,
+            },
+            parent: None,
+            is_exported: false,
+            signature_fingerprint: String::new(),
+            visibility: codekurve_core::Visibility::Default,
+            is_partial: false,
+            is_record: false,
+            partial_ordinal: None,
+            roles: Vec::new(),
+        }
+    }
+
+    fn fixture_pending(source: &str, kind: RelationshipKind, target: &str) -> PendingRel {
+        PendingRel {
+            source_key: source.to_string(),
+            kind,
+            target_name: target.to_string(),
+            span: SourceSpan {
+                start_byte: 0,
+                end_byte: 0,
+                start_line: 0,
+                start_column: 0,
+                end_line: 0,
+                end_column: 0,
+            },
+        }
+    }
+
+    /// Several same-named symbols (mixed kinds), an unknown name and repeated
+    /// names, shared by the PERF-6 guard and the candidate-count test.
+    fn same_name_fixture() -> (Vec<ExtractedSymbol>, Vec<PendingRel>) {
+        let symbols = vec![
+            fixture_symbol("k1", "Helper", SymbolKind::Class),
+            fixture_symbol("k2", "Helper", SymbolKind::Function),
+            fixture_symbol("k3", "Helper", SymbolKind::Class),
+            fixture_symbol("k4", "Make", SymbolKind::Function),
+            fixture_symbol("k5", "Make", SymbolKind::Method),
+            fixture_symbol("k6", "Other", SymbolKind::Class),
+        ];
+        let pending = vec![
+            fixture_pending("src1", RelationshipKind::Inherits, "Helper"),
+            fixture_pending("src2", RelationshipKind::Calls, "Make"),
+            fixture_pending("src3", RelationshipKind::Constructs, "Helper"),
+            fixture_pending("src4", RelationshipKind::Calls, "Missing"),
+            fixture_pending("src5", RelationshipKind::Calls, "Other"),
+            fixture_pending("src6", RelationshipKind::Inherits, "Helper"),
+        ];
+        (symbols, pending)
+    }
+
+    /// PERF-6 equivalence guard: several same-named symbols (mixed kinds),
+    /// unknown names and repeated names, pinned on the pre-change scan.
+    #[test]
+    fn resolve_pending_same_name_fixture_output_is_pinned() {
+        let (symbols, pending) = same_name_fixture();
+        let mut out = Vec::new();
+        resolve_pending(
+            &symbols,
+            pending,
+            &mut out,
+            analyzer_for(LanguageId::TypeScript),
+        );
+        let lines: Vec<String> = out
+            .iter()
+            .map(|r| {
+                format!(
+                    "{} {:?} {:?} {:?} {:?}",
+                    r.source_local_key, r.target, r.kind, r.confidence, r.reason
+                )
+            })
+            .collect();
+        let expected: Vec<&str> = vec![
+            r#"src1 Local("k1") Inherits Low Some("ambiguous: multiple same-file candidates")"#,
+            r#"src1 Local("k3") Inherits Low Some("ambiguous: multiple same-file candidates")"#,
+            r#"src2 Local("k4") Calls Low Some("ambiguous: multiple same-file candidates")"#,
+            r#"src2 Local("k5") Calls Low Some("ambiguous: multiple same-file candidates")"#,
+            r#"src3 Local("k1") Constructs Low Some("ambiguous: multiple same-file candidates")"#,
+            r#"src3 Local("k3") Constructs Low Some("ambiguous: multiple same-file candidates")"#,
+            r#"src4 Unresolved("Missing") Calls Unresolved Some("no matching same-file symbol")"#,
+            r#"src5 Unresolved("Other") Calls Unresolved Some("no matching same-file symbol")"#,
+            r#"src6 Local("k1") Inherits Low Some("ambiguous: multiple same-file candidates")"#,
+            r#"src6 Local("k3") Inherits Low Some("ambiguous: multiple same-file candidates")"#,
+        ];
+        assert_eq!(lines, expected);
+    }
+
+    /// PERF-6 work guard: each pending target is compared only with symbols
+    /// of its own name (Helper 3x3, Make 2, Missing 0, Other 1 = 12 checks).
+    #[test]
+    fn resolve_pending_checks_only_same_name_candidates() {
+        let (symbols, pending) = same_name_fixture();
+        RESOLVE_CANDIDATE_CHECKS.with(|c| c.set(0));
+        let mut out = Vec::new();
+        resolve_pending(
+            &symbols,
+            pending,
+            &mut out,
+            analyzer_for(LanguageId::TypeScript),
+        );
+        assert_eq!(RESOLVE_CANDIDATE_CHECKS.with(|c| c.get()), 12);
     }
 }
