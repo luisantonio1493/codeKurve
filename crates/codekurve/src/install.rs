@@ -882,6 +882,8 @@ fn remove_codex_toml_entry(path: &Path, apply: bool) -> Result<bool, String> {
 /// `<file>.bak` written before any modification (design rule 2), overwriting
 /// a prior backup — lets a user roll back without git.
 fn backup(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    // Refuse the target before creating any backup, so a refused write leaves no `.bak`.
+    refuse_symlink(path)?;
     let bak = path.with_extension(match path.extension() {
         Some(ext) => format!("{}.bak", ext.to_string_lossy()),
         None => "bak".to_string(),
@@ -1354,6 +1356,24 @@ mod safe_write_tests {
 
         assert!(err.contains("symlink"), "{err}");
         assert_eq!(fs::read_to_string(&victim).unwrap(), "{}");
+    }
+
+    #[test]
+    fn refused_symlink_write_leaves_no_stray_bak() {
+        let dir = tempdir().unwrap();
+        let victim = dir.path().join("victim.json");
+        fs::write(&victim, "{}").unwrap();
+        let path = dir.path().join(".mcp.json");
+        symlink(&victim, &path).unwrap();
+
+        let err = write_json_client(&path, &exe_path(), Path::new("/proj"), "mcpServers", true)
+            .unwrap_err();
+
+        assert!(err.contains("symlink"), "{err}");
+        assert!(
+            !dir.path().join(".mcp.json.bak").exists(),
+            "a refused write must not leave a .bak behind"
+        );
     }
 
     #[test]
