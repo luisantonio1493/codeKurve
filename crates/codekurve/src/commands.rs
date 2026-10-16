@@ -141,7 +141,7 @@ pub fn index(root: &Path) -> Result<(), String> {
     let fingerprint = analysis_fingerprint(&setup.config, &setup.aliases);
     let force_full = analyzer_version_changed(&setup.conn, &setup.project_id, &fingerprint)?;
 
-    let changes = crate::incremental::detect(
+    let (changes, outside_root) = crate::incremental::detect_with_outside_root(
         &setup.conn,
         &setup.project_id,
         &setup.root,
@@ -160,6 +160,7 @@ pub fn index(root: &Path) -> Result<(), String> {
     repo::set_analyzer_version(&setup.conn, &setup.project_id, &fingerprint)
         .map_err(|e| e.to_string())?;
 
+    crate::incremental::warn_outside_root(&outside_root);
     crate::incremental::warn_unverified(&outcome);
     if outcome.files_changed == 0 && outcome.files_deleted == 0 {
         if outcome.unverified == 0 {

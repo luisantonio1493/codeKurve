@@ -180,6 +180,20 @@ pub fn detect(
     filter: Option<&HashSet<String>>,
     force_full: bool,
 ) -> Result<Vec<FileChange>, String> {
+    detect_with_outside_root(conn, project_id, root, opts, filter, force_full)
+        .map(|(changes, _)| changes)
+}
+
+/// [`detect`] plus the root-relative paths of symlinks skipped for pointing
+/// outside the project root (A1), so `index` can report them.
+pub fn detect_with_outside_root(
+    conn: &Connection,
+    project_id: &str,
+    root: &Path,
+    opts: &DiscoveryOptions,
+    filter: Option<&HashSet<String>>,
+    force_full: bool,
+) -> Result<(Vec<FileChange>, Vec<String>), String> {
     // A batch names the entries it may touch, so only those are walked (PERF-3);
     // a sweep walks the whole project.
     let report = match filter {
@@ -257,7 +271,7 @@ pub fn detect(
         });
     }
 
-    Ok(changes)
+    Ok((changes, report.outside_root))
 }
 
 /// Task 7.6: `relative_path` matches `filter` if it's an exact entry, or a
@@ -382,6 +396,14 @@ fn record_unverified(
         tx.commit().map_err(|e| e.to_string())
     } else {
         Ok(())
+    }
+}
+
+/// One stderr line per symlink skipped for pointing outside the project root
+/// (A1), in the same form as the other discovery skips.
+pub fn warn_outside_root(outside_root: &[String]) {
+    for path in outside_root {
+        eprintln!("warning: skipped symlink {path}: its target lies outside the project root");
     }
 }
 
@@ -758,6 +780,29 @@ mod tests {
             })
             .collect();
         repo::reindex(conn, project_id, &files, &[], &[]).unwrap();
+    }
+
+    /// A1 reporting: a symlink skipped for pointing outside the root is listed
+    /// for `index` to print, and never becomes a change.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_skipped_for_pointing_outside_the_root_is_reported() {
+        let outside = tempfile::tempdir().unwrap();
+        std_fs::write(outside.path().join("secret.ts"), "export const s = 1;\n").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std_fs::write(root.join("a.ts"), "export const a = 1;\n").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.ts"), root.join("link.ts")).unwrap();
+        let mut opts = discovery_opts();
+        opts.follow_symlinks = true;
+        let conn = db::open_in_memory().unwrap();
+        let project = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+
+        let (changes, outside_root) =
+            detect_with_outside_root(&conn, &project, root, &opts, None, true).unwrap();
+
+        assert_eq!(outside_root, vec!["link.ts".to_string()]);
+        assert!(!changes.iter().any(|c| change_path(c) == "link.ts"));
     }
 
     /// Task 5.6: `detect` classifies a touch-only edit (mtime changed,
