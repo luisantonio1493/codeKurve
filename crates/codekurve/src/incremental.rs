@@ -15,6 +15,7 @@ use codekurve_analysis::resolve::{self, TsconfigAliases};
 use codekurve_core::{LanguageId, SymbolKind};
 use codekurve_store::repo;
 use codekurve_store::Connection;
+use rayon::prelude::*;
 
 use crate::commands::{self, FileMeta};
 
@@ -94,6 +95,26 @@ struct StableRead {
 
 fn read_stable(path: &Path) -> Result<StableRead, String> {
     read_stable_with(path, || {})
+}
+
+/// Read and analyze one file: the per-file work the parse loops run on the
+/// rayon pool. Pure per file (no DB access), so callers fold the results back
+/// in discovery order.
+fn read_and_analyze(
+    absolute: &Path,
+    relative_path: &str,
+    language: LanguageId,
+) -> Result<(FileMeta, FileAnalysis), String> {
+    let read = read_stable(absolute)?;
+    let analysis =
+        extract::analyze(&read.text, language, relative_path).map_err(|e| e.to_string())?;
+    let meta = FileMeta {
+        language,
+        size_bytes: read.bytes.len() as u64,
+        content_hash: repo::content_hash(&read.bytes),
+        modified_ns: read.modified_ns,
+    };
+    Ok((meta, analysis))
 }
 
 /// Stat, read, stat again; if size or mtime moved, a write raced the read —
@@ -374,24 +395,23 @@ fn apply_via_full_reindex(
     let report: DiscoveryReport =
         discovery::discover_report(ctx.root, ctx.options).map_err(|e| e.to_string())?;
 
+    // Read and analyze on the rayon pool; `collect` keeps discovery order, so
+    // the fold below builds the same `analyses` and `file_meta` a sequential
+    // loop would. Only the DB writes that follow stay single-threaded.
+    let parsed: Vec<Result<(FileMeta, FileAnalysis), String>> = report
+        .files
+        .par_iter()
+        .map(|file| read_and_analyze(&file.absolute_path, &file.relative_path, file.language))
+        .collect();
     let mut analyses: Vec<FileAnalysis> = Vec::new();
     let mut file_meta: Vec<FileMeta> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
-    for file in &report.files {
-        let Ok(read) = read_stable(&file.absolute_path) else {
+    for (file, result) in report.files.iter().zip(parsed) {
+        let Ok((meta, analysis)) = result else {
             skipped.push(file.relative_path.clone());
             continue;
         };
-        let Ok(analysis) = extract::analyze(&read.text, file.language, &file.relative_path) else {
-            skipped.push(file.relative_path.clone());
-            continue;
-        };
-        file_meta.push(FileMeta {
-            language: file.language,
-            size_bytes: read.bytes.len() as u64,
-            content_hash: repo::content_hash(&read.bytes),
-            modified_ns: read.modified_ns,
-        });
+        file_meta.push(meta);
         analyses.push(analysis);
     }
 
@@ -461,18 +481,16 @@ fn apply_incremental_changes(
     // Parse B — a parse error here fails the whole batch (spec "A Failed
     // Batch Preserves the Previous Index": "parse error treated as batch
     // failure"), unlike the fallback path's lenient skip-on-error.
+    let parsed: Vec<Result<(FileMeta, FileAnalysis), String>> = created_or_modified
+        .par_iter()
+        .map(|file| read_and_analyze(&file.absolute_path, &file.relative_path, file.language))
+        .collect();
     let mut analyses: Vec<FileAnalysis> = Vec::new();
     let mut file_meta: Vec<FileMeta> = Vec::new();
-    for file in &created_or_modified {
-        let read = read_stable(&file.absolute_path)?;
-        let analysis = extract::analyze(&read.text, file.language, &file.relative_path)
-            .map_err(|e| e.to_string())?;
-        file_meta.push(FileMeta {
-            language: file.language,
-            size_bytes: read.bytes.len() as u64,
-            content_hash: repo::content_hash(&read.bytes),
-            modified_ns: read.modified_ns,
-        });
+    // Discovery order: the first failure in that order is the one reported.
+    for result in parsed {
+        let (meta, analysis) = result?;
+        file_meta.push(meta);
         analyses.push(analysis);
     }
 
@@ -546,29 +564,22 @@ fn apply_incremental_changes(
 
     let mut d_paths: Vec<String> = dependents.into_iter().collect();
     d_paths.sort();
-    for path in &d_paths {
-        let absolute = ctx.root.join(path);
-        // Vanished since it was last indexed (rare race); skip this cycle,
-        // it'll be reconsidered on the next sweep.
-        let Ok(read) = read_stable(&absolute) else {
-            continue;
-        };
-        let ext = Path::new(path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-        let Some(language) = LanguageId::from_extension(ext) else {
-            continue;
-        };
-        let Ok(analysis) = extract::analyze(&read.text, language, path) else {
-            continue;
-        };
-        file_meta.push(FileMeta {
-            language,
-            size_bytes: read.bytes.len() as u64,
-            content_hash: repo::content_hash(&read.bytes),
-            modified_ns: read.modified_ns,
-        });
+    let root = ctx.root;
+    // A dependent that vanished since it was last indexed (rare race), or no
+    // longer parses, is skipped this cycle and reconsidered on the next sweep.
+    let d_parsed: Vec<(FileMeta, FileAnalysis)> = d_paths
+        .par_iter()
+        .filter_map(|path| {
+            let ext = Path::new(path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            let language = LanguageId::from_extension(ext)?;
+            read_and_analyze(&root.join(path), path, language).ok()
+        })
+        .collect();
+    for (meta, analysis) in d_parsed {
+        file_meta.push(meta);
         analyses.push(analysis);
     }
 
