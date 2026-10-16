@@ -23,8 +23,8 @@ use tree_sitter::{Node, Tree};
 use crate::extract::{find_child, span_of};
 use crate::ir::{EdgeTarget, ExtractedRelationship, ExtractedSymbol, FileAnalysis};
 use crate::languages::{
-    analyzer_for, push_unresolved_edge, resolve_pending, LanguageAnalyzer, PendingRel,
-    BASE_LIST_REASON, MAX_AST_DEPTH, PROPERTY_TYPE_REASON,
+    analyzer_for, note_depth_limit, push_unresolved_edge, resolve_pending, LanguageAnalyzer,
+    PendingRel, BASE_LIST_REASON, MAX_AST_DEPTH, PROPERTY_TYPE_REASON,
 };
 
 /// design "C# Node-Kind Mapping": `implicit_object_creation_expression` (the
@@ -157,6 +157,7 @@ fn analyze_tree(source: &str, tree: &Tree, relative_path: &str) -> Result<FileAn
 /// `Contains` source when this node turns out to be a declaration.
 fn collect(node: Node, container_key: Option<&str>, ctx: &mut CsCtx) {
     if ctx.depth >= MAX_AST_DEPTH {
+        note_depth_limit();
         return;
     }
     ctx.depth += 1;
@@ -523,6 +524,7 @@ fn collect_member_body(node: Node, scope: &str, ctx: &mut CsCtx) {
 /// design "C# Node-Kind Mapping", never dropped or guessed).
 fn walk_expressions(node: Node, scope: &str, ctx: &mut CsCtx) {
     if ctx.depth >= MAX_AST_DEPTH {
+        note_depth_limit();
         return;
     }
     ctx.depth += 1;
@@ -900,6 +902,7 @@ const BUILTIN_SCALAR_TYPES: &[&str] = &[
 /// (`Dictionary<K, V>`, tuples, pointers) is skipped rather than guessed.
 fn cs_entity_type_name(node: Node, source: &[u8], depth: usize) -> Option<String> {
     if depth > MAX_AST_DEPTH {
+        note_depth_limit();
         return None;
     }
     match node.kind() {

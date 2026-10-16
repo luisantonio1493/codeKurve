@@ -13,8 +13,8 @@ use tree_sitter::{Node, Tree};
 use crate::extract::{find_child, span_of};
 use crate::ir::{EdgeTarget, ExtractedRelationship, ExtractedSymbol, FileAnalysis};
 use crate::languages::{
-    analyzer_for, push_unresolved_edge, resolve_pending, LanguageAnalyzer, PendingRel,
-    MAX_AST_DEPTH,
+    analyzer_for, note_depth_limit, push_unresolved_edge, resolve_pending, LanguageAnalyzer,
+    PendingRel, MAX_AST_DEPTH,
 };
 
 /// One-field struct so a single implementation serves both TypeScript and
@@ -141,6 +141,7 @@ fn collect(
     ctx: &mut CollectCtx,
 ) {
     if depth > MAX_AST_DEPTH {
+        note_depth_limit();
         return;
     }
     let depth = depth + 1;
@@ -681,6 +682,7 @@ fn decorator_name(node: Node, source: &[u8]) -> Option<String> {
 
 fn decorator_expr_name(node: Node, source: &[u8], depth: usize) -> Option<String> {
     if depth > MAX_AST_DEPTH {
+        note_depth_limit();
         return None;
     }
     match node.kind() {

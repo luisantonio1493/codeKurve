@@ -28,7 +28,7 @@ use tree_sitter::{Node, Tree};
 
 use crate::extract::span_of;
 use crate::ir::FileAnalysis;
-use crate::languages::MAX_AST_DEPTH;
+use crate::languages::{note_depth_limit, MAX_AST_DEPTH};
 
 mod angular;
 
@@ -190,6 +190,7 @@ fn pair_key_text(key_node: Node, source: &[u8]) -> Option<String> {
 /// this generic walker's job.
 fn entry_name(node: Node, source: &[u8], depth: usize) -> Option<MetaEntry> {
     if depth > MAX_AST_DEPTH {
+        note_depth_limit();
         return None;
     }
     let span = span_of(node);
@@ -230,6 +231,7 @@ fn object_provider_name(
     depth: usize,
 ) -> Option<MetaEntry> {
     if depth > MAX_AST_DEPTH {
+        note_depth_limit();
         return None;
     }
     let mut cursor = node.walk();

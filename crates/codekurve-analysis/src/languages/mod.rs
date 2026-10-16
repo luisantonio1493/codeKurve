@@ -20,6 +20,26 @@ pub mod typescript;
 /// 256 leaves headroom while still covering long fluent call chains.
 pub(crate) const MAX_AST_DEPTH: usize = 256;
 
+thread_local! {
+    // A2: set by a walker that stops at MAX_AST_DEPTH on this thread.
+    // `extract::analyze` clears it before a file's walks and reads it after,
+    // so each file reports only its own truncation.
+    static DEPTH_LIMIT_HIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Records that a walker stopped at [`MAX_AST_DEPTH`] (A2). The walker keeps
+/// what it already extracted and returns as before; this only lets the caller
+/// report the file as truncated.
+pub(crate) fn note_depth_limit() {
+    DEPTH_LIMIT_HIT.with(|hit| hit.set(true));
+}
+
+/// Whether a walker stopped at the depth limit since the last call; clears the
+/// record (A2).
+pub(crate) fn take_depth_limit_hit() -> bool {
+    DEPTH_LIMIT_HIT.with(|hit| hit.replace(false))
+}
+
 /// Parse budget for one file (SEC-7). A parse that exceeds it yields no tree,
 /// which callers already treat as a failed parse.
 const PARSE_TIMEOUT_MICROS: u64 = 5_000_000;

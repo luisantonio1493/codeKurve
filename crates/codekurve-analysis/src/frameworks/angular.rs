@@ -19,7 +19,7 @@ use crate::extract::span_of;
 use crate::ir::{
     EdgeTarget, ExtractedRelationship, ExtractedSymbol, FileAnalysis, UnresolvedReference,
 };
-use crate::languages::MAX_AST_DEPTH;
+use crate::languages::{note_depth_limit, MAX_AST_DEPTH};
 
 use super::{object_literal_entries, AttrPattern};
 
@@ -50,6 +50,7 @@ pub(crate) fn recognize(
 
 fn walk(node: Node, relative_path: &str, source: &[u8], analysis: &mut FileAnalysis, depth: usize) {
     if depth > MAX_AST_DEPTH {
+        note_depth_limit();
         return;
     }
     match node.kind() {
@@ -330,6 +331,7 @@ fn collect_inject_calls(
     depth: usize,
 ) {
     if depth > MAX_AST_DEPTH {
+        note_depth_limit();
         return;
     }
     if node.kind() == "call_expression" {
@@ -571,6 +573,7 @@ fn process_route_object(
     depth: usize,
 ) {
     if depth > MAX_AST_DEPTH {
+        note_depth_limit();
         return;
     }
     let keys = object_literal_entries(node, source);
@@ -715,6 +718,7 @@ fn last_member_property(node: Node, source: &[u8]) -> Option<String> {
 fn all_member_expressions(node: Node, depth: usize) -> Vec<Node> {
     let mut found = Vec::new();
     if depth > MAX_AST_DEPTH {
+        note_depth_limit();
         return found;
     }
     if node.kind() == "member_expression" {
@@ -745,6 +749,7 @@ fn decorator_name(node: Node, source: &[u8]) -> Option<String> {
 
 fn decorator_expr_name(node: Node, source: &[u8], depth: usize) -> Option<String> {
     if depth > MAX_AST_DEPTH {
+        note_depth_limit();
         return None;
     }
     match node.kind() {

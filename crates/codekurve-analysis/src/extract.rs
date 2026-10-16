@@ -10,7 +10,23 @@ use tree_sitter::Node;
 use codekurve_core::SourceSpan;
 
 use crate::ir::FileAnalysis;
-use crate::languages::{analyzer_for, parse_tree};
+use crate::languages::{analyzer_for, parse_tree, take_depth_limit_hit};
+
+/// The AST depth a walk stops at (A2): symbols nested deeper are not extracted.
+pub const AST_DEPTH_LIMIT: usize = crate::languages::MAX_AST_DEPTH;
+
+/// Diagnostic recorded on a file whose walk stopped at [`AST_DEPTH_LIMIT`]
+/// (A2). The file still indexes; only the symbols below that depth are missing.
+const DEPTH_LIMIT_DIAGNOSTIC: &str =
+    "ast depth limit reached; symbols nested deeper were not extracted";
+
+/// Whether a walk of `analysis`'s file stopped at [`AST_DEPTH_LIMIT`] (A2).
+pub fn truncated_at_depth_limit(analysis: &FileAnalysis) -> bool {
+    analysis
+        .diagnostics
+        .iter()
+        .any(|d| d == DEPTH_LIMIT_DIAGNOSTIC)
+}
 
 /// Parse `source` for the given language and extract its symbols plus
 /// intra-file relationships into a per-file `FileAnalysis`. Keeps its public
@@ -22,8 +38,15 @@ use crate::languages::{analyzer_for, parse_tree};
 /// runs immediately after the analyzer, on the source it was given).
 pub fn analyze(source: &str, language: LanguageId, relative_path: &str) -> Result<FileAnalysis> {
     let tree = parse_tree(language, relative_path, source)?;
+    // A2: only walks of this file count toward its truncation record.
+    take_depth_limit_hit();
     let mut analysis = analyzer_for(language).analyze(source, &tree, relative_path)?;
     crate::frameworks::recognize(source, &tree, language, &mut analysis);
+    if take_depth_limit_hit() {
+        analysis
+            .diagnostics
+            .push(DEPTH_LIMIT_DIAGNOSTIC.to_string());
+    }
     Ok(analysis)
 }
 

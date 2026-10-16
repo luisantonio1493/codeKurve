@@ -66,6 +66,45 @@ fn assert_indexes_shallow_symbol(source: String, language: LanguageId, path: &'s
     );
 }
 
+/// A2: a file whose walk stops at the depth limit still indexes, and the
+/// truncation is recorded so `index` can warn about it.
+fn assert_reports_depth_truncation(source: String, language: LanguageId, path: &'static str) {
+    let analysis = on_small_stack(move || extract::analyze(&source, language, path))
+        .expect("deep source should still produce an analysis");
+    assert!(
+        extract::truncated_at_depth_limit(&analysis),
+        "a walk stopped at the depth limit must be recorded for {path}"
+    );
+    assert!(
+        analysis
+            .symbols
+            .iter()
+            .any(|s| s.name == "shallow" || s.name == "Shallow"),
+        "symbols above the depth cap must be kept"
+    );
+}
+
+#[test]
+fn typescript_deep_brackets_report_the_depth_truncation() {
+    assert_reports_depth_truncation(ts_deep_brackets(), LanguageId::TypeScript, "deep.ts");
+}
+
+/// Nesting inside a method body, which the C# analyzer walks itself. A field
+/// initializer is only walked by the .NET framework pass, which is not
+/// covered by the depth record yet.
+fn cs_deep_parens_in_method() -> String {
+    format!(
+        "namespace Deep;\n// Http\npublic class Shallow {{ public int M() {{ return {open}1{close}; }} }}\n",
+        open = "(".repeat(NESTING),
+        close = ")".repeat(NESTING),
+    )
+}
+
+#[test]
+fn csharp_deep_parens_in_method_report_the_depth_truncation() {
+    assert_reports_depth_truncation(cs_deep_parens_in_method(), LanguageId::CSharp, "Deep.cs");
+}
+
 #[test]
 fn typescript_deep_brackets_do_not_overflow_the_stack() {
     assert_indexes_shallow_symbol(ts_deep_brackets(), LanguageId::TypeScript, "deep.ts");

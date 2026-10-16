@@ -133,6 +133,14 @@ fn analyze_read(
 ) -> Result<(FileMeta, FileAnalysis), String> {
     let analysis =
         extract::analyze(&read.text, language, relative_path).map_err(|e| e.to_string())?;
+    // A2: the file is still indexed, but symbols nested past the depth limit
+    // were not extracted; say so on every analysis run (nothing is persisted).
+    if extract::truncated_at_depth_limit(&analysis) {
+        eprintln!(
+            "warning: {relative_path} stopped at the AST depth limit ({}); symbols nested deeper are not indexed",
+            extract::AST_DEPTH_LIMIT
+        );
+    }
     let meta = FileMeta {
         language,
         size_bytes: read.bytes.len() as u64,
