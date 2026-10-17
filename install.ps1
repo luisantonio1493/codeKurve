@@ -59,7 +59,8 @@ $base = "https://github.com/$repo/releases/download/$version"
 $url = "$base/$asset"
 Write-Host "Installing codekurve $version ($asset)..."
 New-Item -ItemType Directory -Force -Path $binDir | Out-Null
-$tmp = Join-Path $binDir ("codekurve.tmp." + [guid]::NewGuid().ToString())
+# The .exe suffix lets the smoke test execute the temp file directly.
+$tmp = Join-Path $binDir ("codekurve.tmp." + [guid]::NewGuid().ToString() + ".exe")
 $sumsTmp = "$tmp.SHA256SUMS"
 try {
   Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $tmp
@@ -90,6 +91,23 @@ try {
   Remove-Item -Force -ErrorAction SilentlyContinue $sumsTmp
 }
 Write-Host "Verified   SHA-256 $actual"
+
+# Smoke test the verified file before it replaces anything.
+& $tmp --version *> $null
+if ($LASTEXITCODE -ne 0) {
+  Remove-Item -Force -ErrorAction SilentlyContinue $tmp
+  throw "codekurve: downloaded $asset failed its '--version' smoke test; existing install left unchanged."
+}
+
+# Keep the previous binary for manual rollback, then replace it.
+if (Test-Path -LiteralPath $dest) {
+  try {
+    Copy-Item -Force -LiteralPath $dest -Destination "$dest.prev"
+  } catch {
+    Remove-Item -Force -ErrorAction SilentlyContinue $tmp
+    throw "codekurve: could not back up $dest to $dest.prev (file in use?). Close any running codekurve.exe (or terminal using it) and re-run this installer.`n$_"
+  }
+}
 try {
   Move-Item -Force $tmp $dest
 } catch {

@@ -56,7 +56,8 @@ pub(crate) fn setup_index(root: &Path) -> Result<IndexSetup, String> {
     let options = discovery_options(&config);
     let aliases = load_tsconfig_aliases(&root);
 
-    let db_path = root.join(&config.storage.database);
+    let db_path = config.database_path(&root)?;
+    warn_elevated_settings(&config);
     let conn = db::open(&db_path).map_err(|e| e.to_string())?;
     let config_text = config.to_toml().map_err(|e| e.to_string())?;
     let project_id = repo::upsert_project(
@@ -82,20 +83,47 @@ pub(crate) fn setup_index(root: &Path) -> Result<IndexSetup, String> {
 /// [`analyzer_version_changed`]).
 pub(crate) const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// True when the project's stored `analyzer_version` (§ repo::
-/// analyzer_version) doesn't match this build — a binary upgrade changed
-/// extraction logic without touching any source file, so content-hash-based
-/// change detection alone would never notice and stale relationships (e.g.
-/// a bug fix in the extractor) would stick around until something else
-/// happened to touch every file. `None` (never indexed, or migrated from a
-/// schema before this column existed) counts as changed too — one honest
-/// full reindex either way.
+/// Everything outside the source files that changes what analysis produces:
+/// the binary version, the config that decides what is indexed, and the
+/// resolved tsconfig aliases. Stamped on the project after a full (re)index
+/// and compared on every run, so changing any of them triggers one honest
+/// full reindex instead of leaving stale edges behind.
+pub(crate) fn analysis_fingerprint(config: &Config, aliases: &TsconfigAliases) -> String {
+    let mut sorted: Vec<(&String, &String)> = aliases.iter().collect();
+    sorted.sort();
+    let mut canonical = String::new();
+    for (pattern, replacement) in sorted {
+        canonical.push_str(&format!("alias:{pattern}={replacement}\n"));
+    }
+    for pattern in &config.ignore.patterns {
+        canonical.push_str(&format!("ignore:{pattern}\n"));
+    }
+    for language in &config.index.languages {
+        canonical.push_str(&format!("lang:{language}\n"));
+    }
+    canonical.push_str(&format!(
+        "gitignore:{}:{}\nhidden:{}\nsymlinks:{}\nmax_size:{}\n",
+        config.ignore.respect_gitignore,
+        config.ignore.respect_global_gitignore,
+        config.index.include_hidden,
+        config.index.follow_symlinks,
+        config.index.max_file_size_bytes,
+    ));
+    let hash = repo::content_hash(canonical.as_bytes());
+    format!("{ANALYZER_VERSION}+{}", &hash[..12.min(hash.len())])
+}
+
+/// True when the project's stored fingerprint doesn't match the current one
+/// (see [`analysis_fingerprint`]). `None` (never indexed, or an index from
+/// before the fingerprint existed) counts as changed too — one honest full
+/// reindex either way.
 pub(crate) fn analyzer_version_changed(
     conn: &Connection,
     project_id: &str,
+    fingerprint: &str,
 ) -> Result<bool, String> {
     let stored = repo::analyzer_version(conn, project_id).map_err(|e| e.to_string())?;
-    Ok(stored.as_deref() != Some(ANALYZER_VERSION))
+    Ok(stored.as_deref() != Some(fingerprint))
 }
 
 /// `codekurve index --root <path>` (task 5.5, design's shared engine):
@@ -110,9 +138,10 @@ pub(crate) fn analyzer_version_changed(
 /// detected" forever.
 pub fn index(root: &Path) -> Result<(), String> {
     let mut setup = setup_index(root)?;
-    let force_full = analyzer_version_changed(&setup.conn, &setup.project_id)?;
+    let fingerprint = analysis_fingerprint(&setup.config, &setup.aliases);
+    let force_full = analyzer_version_changed(&setup.conn, &setup.project_id, &fingerprint)?;
 
-    let changes = crate::incremental::detect(
+    let (changes, outside_root) = crate::incremental::detect_with_outside_root(
         &setup.conn,
         &setup.project_id,
         &setup.root,
@@ -120,18 +149,6 @@ pub fn index(root: &Path) -> Result<(), String> {
         None,
         force_full,
     )?;
-    if changes.is_empty() {
-        if force_full {
-            repo::set_analyzer_version(&setup.conn, &setup.project_id, ANALYZER_VERSION)
-                .map_err(|e| e.to_string())?;
-        }
-        // Also reached by an index built before planner statistics existed:
-        // a no-change `index` run is enough to give it statistics.
-        crate::incremental::refresh_planner_stats(&setup.conn);
-        println!("index up to date, no changes detected");
-        return Ok(());
-    }
-
     let ctx = crate::incremental::IndexContext {
         root: &setup.root,
         project_id: &setup.project_id,
@@ -140,9 +157,22 @@ pub fn index(root: &Path) -> Result<(), String> {
         full_reindex_threshold_pct: setup.config.index.watch.full_reindex_threshold_pct,
     };
     let outcome = crate::incremental::apply_batch(&mut setup.conn, &ctx, &changes)?;
-    repo::set_analyzer_version(&setup.conn, &setup.project_id, ANALYZER_VERSION)
+    repo::set_analyzer_version(&setup.conn, &setup.project_id, &fingerprint)
         .map_err(|e| e.to_string())?;
+    // Also reached by an index built before planner statistics existed, when
+    // nothing changed: a no-change run is enough to give it statistics.
+    crate::incremental::refresh_planner_stats(&setup.conn);
 
+    crate::incremental::warn_outside_root(&outside_root);
+    crate::incremental::warn_unverified(&outcome);
+    if outcome.files_changed == 0 && outcome.files_deleted == 0 {
+        if outcome.unverified == 0 {
+            println!("index up to date, no changes detected");
+        } else {
+            println!("no changes in the files that could be read");
+        }
+        return Ok(());
+    }
     println!(
         "indexed {} file(s) changed, {} deleted{}",
         outcome.files_changed,
@@ -797,7 +827,7 @@ pub fn trace(args: &QueryArgs, to: &str) -> Result<(), CommandError> {
     } else {
         let (conn, project_id) = s.indexed()?;
         let target = resolve_symbol(conn, project_id, None, Some(to))?;
-        print_trace_result(conn, &outcome, &target);
+        print_trace_result(conn, project_id, &outcome, &target);
     }
     Ok(())
 }
@@ -825,8 +855,8 @@ pub fn impact(args: &QueryArgs) -> Result<(), CommandError> {
             outcome.truncated,
         );
     } else {
-        let (conn, _project_id) = s.indexed()?;
-        print_impact_result(conn, &outcome);
+        let (conn, project_id) = s.indexed()?;
+        print_impact_result(conn, project_id, &outcome);
     }
     Ok(())
 }
@@ -962,19 +992,6 @@ pub(crate) fn parse_confidence(raw: Option<&str>) -> Result<Option<Confidence>, 
     }
 }
 
-/// ponytail: applies to the four flat relationship-list commands only —
-/// `trace`/`impact`'s BFS result (a path plus a reached-set) isn't a
-/// page-able list in the same sense, so they don't call this.
-pub(crate) fn paginate<T>(rows: &mut Vec<T>, limit: Option<usize>, offset: Option<usize>) {
-    if let Some(offset) = offset {
-        let drop_n = offset.min(rows.len());
-        rows.drain(0..drop_n);
-    }
-    if let Some(limit) = limit {
-        rows.truncate(limit);
-    }
-}
-
 fn relationship_json(r: &repo::StoredRelationship) -> serde_json::Value {
     serde_json::json!({
         "source_symbol_id": r.source_symbol_id,
@@ -1063,7 +1080,7 @@ fn trace_json(outcome: &traverse::BfsOutcome) -> serde_json::Value {
     })
 }
 
-fn truncation_reason_str(r: traverse::TruncationReason) -> &'static str {
+pub fn truncation_reason_str(r: traverse::TruncationReason) -> &'static str {
     match r {
         traverse::TruncationReason::MaxDepth => "max_depth",
         traverse::TruncationReason::MaxNodes => "max_nodes",
@@ -1075,8 +1092,8 @@ fn truncation_reason_str(r: traverse::TruncationReason) -> &'static str {
 /// A reached/traversed node's display label: `qualified_name path:line`,
 /// falling back to the bare id if the symbol row is somehow gone (e.g. a
 /// stale index) rather than failing the whole command over one lookup miss.
-fn describe_symbol(conn: &Connection, symbol_id: &str) -> String {
-    match repo::find_symbol_by_id(conn, symbol_id) {
+fn describe_symbol(conn: &Connection, project_id: &str, symbol_id: &str) -> String {
+    match repo::find_symbol_by_id(conn, project_id, symbol_id) {
         Ok(Some(sym)) => format!(
             "{} ({}:{})",
             sym.qualified_name, sym.relative_path, sym.span.start_line
@@ -1085,14 +1102,19 @@ fn describe_symbol(conn: &Connection, symbol_id: &str) -> String {
     }
 }
 
-fn print_trace_result(conn: &Connection, outcome: &traverse::BfsOutcome, target: &str) {
+fn print_trace_result(
+    conn: &Connection,
+    project_id: &str,
+    outcome: &traverse::BfsOutcome,
+    target: &str,
+) {
     match &outcome.path {
         Some(path) => {
             println!("path to {target} found ({} hop(s)):", path.len());
             for edge in path {
                 println!(
                     "  -> {} [{}, {}]",
-                    describe_symbol(conn, &edge.neighbor_symbol_id),
+                    describe_symbol(conn, project_id, &edge.neighbor_symbol_id),
                     edge.kind,
                     edge.confidence
                 );
@@ -1103,12 +1125,12 @@ fn print_trace_result(conn: &Connection, outcome: &traverse::BfsOutcome, target:
     print_truncation(outcome);
 }
 
-fn print_impact_result(conn: &Connection, outcome: &traverse::BfsOutcome) {
+fn print_impact_result(conn: &Connection, project_id: &str, outcome: &traverse::BfsOutcome) {
     println!("{} node(s) reached", outcome.reached.len());
     for r in &outcome.reached {
         println!(
             "  {} (depth {})",
-            describe_symbol(conn, &r.symbol_id),
+            describe_symbol(conn, project_id, &r.symbol_id),
             r.depth
         );
     }
@@ -1202,8 +1224,19 @@ fn load_config(root: &Path) -> Result<Config, String> {
     Config::from_toml(&text).map_err(|e| e.to_string())
 }
 
+/// Tell the user (stderr — stdout may carry MCP or `--json` output) when the
+/// project's own config switched on a setting that widens what is touched.
+pub fn warn_elevated_settings(config: &Config) {
+    for setting in config.elevated_settings() {
+        eprintln!(
+            "warning: {setting} is enabled by this project's .codekurve/config.toml; \
+             only keep it on for repositories you trust"
+        );
+    }
+}
+
 fn open_existing_db(root: &Path, config: &Config) -> Result<Connection, String> {
-    let db_path = root.join(&config.storage.database);
+    let db_path = config.database_path(root)?;
     if !db_path.exists() {
         return Err(format!(
             "no index found ({}). run `codekurve index` first.",
@@ -1311,6 +1344,45 @@ mod symbol_ids_tests {
         assert_ne!(
             contains_to_ctors[0].target_symbol_id,
             contains_to_ctors[1].target_symbol_id
+        );
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+
+    /// IDX-2: anything that changes what the analyzer produces changes the
+    /// fingerprint; the order aliases were inserted in does not.
+    #[test]
+    fn analysis_fingerprint_tracks_analysis_inputs() {
+        let config = Config::default();
+        let aliases = TsconfigAliases::new();
+        let base = analysis_fingerprint(&config, &aliases);
+        assert!(base.starts_with(ANALYZER_VERSION), "{base}");
+        assert_eq!(base, analysis_fingerprint(&config, &aliases));
+
+        let mut other = config.clone();
+        other.ignore.patterns.push("**/generated/**".to_string());
+        assert_ne!(base, analysis_fingerprint(&other, &aliases));
+
+        let mut other = config.clone();
+        other.index.follow_symlinks = !other.index.follow_symlinks;
+        assert_ne!(base, analysis_fingerprint(&other, &aliases));
+
+        let mut with_alias = TsconfigAliases::new();
+        with_alias.insert("@app/*".to_string(), "src/*".to_string());
+        assert_ne!(base, analysis_fingerprint(&config, &with_alias));
+
+        let mut a = TsconfigAliases::new();
+        a.insert("@a/*".to_string(), "a/*".to_string());
+        a.insert("@b/*".to_string(), "b/*".to_string());
+        let mut b = TsconfigAliases::new();
+        b.insert("@b/*".to_string(), "b/*".to_string());
+        b.insert("@a/*".to_string(), "a/*".to_string());
+        assert_eq!(
+            analysis_fingerprint(&config, &a),
+            analysis_fingerprint(&config, &b)
         );
     }
 }

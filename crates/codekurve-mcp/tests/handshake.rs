@@ -107,7 +107,7 @@ fn handshake_and_project_status_call_stay_clean_jsonrpc() {
         .as_str()
         .unwrap();
     let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["schema_version"], 2);
     assert!(envelope["result"]["stale"].is_boolean());
 }
 

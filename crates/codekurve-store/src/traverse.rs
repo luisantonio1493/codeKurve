@@ -603,4 +603,57 @@ mod tests {
         }
         assert_eq!(compared, 2 * 4 * 2 * 4 * 2);
     }
+
+    /// QRY-2, adapted to `LazyAdjacency`: a single node's edges come straight
+    /// from the database, with no full-graph load in between.
+    #[test]
+    fn lazy_adjacency_answers_a_single_node() {
+        let mut conn = db::open_in_memory().unwrap();
+        let project = repo::upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        let names = ["A", "B", "X", "Y"];
+        let files = vec![repo::FileInput {
+            relative_path: "src/graph.ts".to_string(),
+            language: "typescript".to_string(),
+            content_hash: "test-hash".to_string(),
+            modified_ns: 0,
+            size_bytes: 10,
+            symbols: names
+                .iter()
+                .map(|n| symbol(n, SymbolKind::Function))
+                .collect(),
+        }];
+        repo::reindex(&mut conn, &project, &files, &[], &[]).unwrap();
+        let ids: HashMap<&str, String> = names
+            .iter()
+            .map(|n| {
+                let id: String = conn
+                    .query_row("SELECT id FROM symbols WHERE name = ?1", [n], |r| r.get(0))
+                    .unwrap();
+                (*n, id)
+            })
+            .collect();
+        let file_id: String = conn
+            .query_row("SELECT id FROM files LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let rel = |from: &str, to: &str| repo::RelationshipInput {
+            source_symbol_id: ids[from].clone(),
+            target_symbol_id: Some(ids[to].clone()),
+            target_external: None,
+            kind: RelationshipKind::Calls,
+            provenance: codekurve_core::Provenance::Extracted,
+            confidence: Confidence::Exact,
+            source_file_id: file_id.clone(),
+            start_line: Some(1),
+            start_column: Some(0),
+            reason: None,
+        };
+        // A -> B and X -> Y: asking about X must return only X's edge.
+        let relationships = vec![rel("A", "B"), rel("X", "Y")];
+        repo::reindex(&mut conn, &project, &files, &relationships, &[]).unwrap();
+
+        let mut lazy = LazyAdjacency::new(&conn, false).unwrap();
+        let edges = lazy.neighbors(&ids["X"]).unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].neighbor_symbol_id, ids["Y"]);
+    }
 }

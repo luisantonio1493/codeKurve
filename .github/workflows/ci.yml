@@ -62,7 +62,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: cargo-deny (advisories, licenses, bans, sources)
-        uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # floating `v2` tag at pin time (not the v2.1.1 commit)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check advisories licenses bans sources
 
@@ -71,7 +71,7 @@ jobs:
           toolchain: stable
 
       - name: install cargo-about
-        run: cargo install cargo-about --locked --features cli
+        run: cargo install cargo-about --version 0.9.2 --locked --features cli
 
       - name: generate third-party NOTICE report
         run: cargo about generate about.hbs > NOTICE-3rdparty.md

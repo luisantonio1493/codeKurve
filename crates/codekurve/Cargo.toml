@@ -18,6 +18,7 @@ codekurve-store = { path = "../codekurve-store" }
 serde_json = "1"
 toml_edit = "0.22"
 notify = "6"
+rayon = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

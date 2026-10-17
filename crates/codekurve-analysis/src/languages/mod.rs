@@ -11,18 +11,6 @@
 pub mod csharp;
 pub mod typescript;
 
-use codekurve_core::error::Result;
-use codekurve_core::{
-    Confidence, LanguageId, Provenance, RelationshipKind, SourceSpan, SymbolKind,
-};
-
-use tree_sitter::Tree;
-
-use crate::extract::NO_SAME_FILE_MATCH_REASON;
-use crate::ir::{
-    EdgeTarget, ExtractedRelationship, ExtractedSymbol, FileAnalysis, TOO_DEEP_DIAGNOSTIC,
-};
-
 /// Deepest syntax tree the extractors will walk. They recurse once per tree
 /// level, and a stack overflow aborts the process (it cannot be caught), so
 /// a crafted file (10k nested `[` is ~20 KB) could kill `index`, `watch` or
@@ -74,12 +62,102 @@ pub(crate) fn too_deep(language: LanguageId, relative_path: &str) -> FileAnalysi
     }
 }
 
+/// Parse budget for one file (SEC-7). A parse that exceeds it yields no tree,
+/// which callers already treat as a failed parse.
+const PARSE_TIMEOUT_MICROS: u64 = 5_000_000;
+
+/// Fresh tree-sitter parser with the shared parse timeout applied. Every
+/// parser in the analysis pipeline is created here so none can run unbounded.
+/// `set_timeout_micros` is deprecated upstream in favor of a progress
+/// callback; the simple budget is kept because it is the one-line equivalent.
+#[allow(deprecated)]
+pub(crate) fn new_parser() -> tree_sitter::Parser {
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_timeout_micros(PARSE_TIMEOUT_MICROS);
+    parser
+}
+
+// Test-only count of every tree-sitter parse the pipeline runs (PERF-4).
+// Thread-local, so parallel test threads never see each other's parses.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PARSE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    // PERF-4: one parser per grammar and thread, reused across files. A
+    // rayon worker (PERF-1) keeps its own three parsers for its lifetime.
+    static TS_PARSER: RefCell<Option<Parser>> = const { RefCell::new(None) };
+    static TSX_PARSER: RefCell<Option<Parser>> = const { RefCell::new(None) };
+    static CS_PARSER: RefCell<Option<Parser>> = const { RefCell::new(None) };
+}
+
+/// Parses `source` once for the whole analysis pipeline (PERF-4). The tree
+/// is handed to the language analyzer and then to the framework pass, so no
+/// later stage re-parses the file. The TypeScript-family grammar is picked
+/// per file (IDX-9): `.tsx` needs the TSX grammar, since the plain grammar
+/// turns JSX into ERROR nodes; `.ts` keeps the plain grammar, since TSX reads
+/// `<T,>(x: T)` as a JSX tag; JS always uses TSX, which covers JSX.
+pub(crate) fn parse_tree(language: LanguageId, relative_path: &str, source: &str) -> Result<Tree> {
+    #[cfg(test)]
+    PARSE_CALLS.with(|c| c.set(c.get() + 1));
+
+    let (slot, grammar): (
+        &'static LocalKey<RefCell<Option<Parser>>>,
+        tree_sitter::Language,
+    ) = match language {
+        LanguageId::CSharp => (&CS_PARSER, tree_sitter_c_sharp::LANGUAGE.into()),
+        LanguageId::TypeScript if relative_path.ends_with(".tsx") => {
+            (&TSX_PARSER, tree_sitter_typescript::LANGUAGE_TSX.into())
+        }
+        LanguageId::TypeScript => (
+            &TS_PARSER,
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        ),
+        LanguageId::JavaScript => (&TSX_PARSER, tree_sitter_typescript::LANGUAGE_TSX.into()),
+    };
+
+    slot.with(|cell: &RefCell<Option<Parser>>| -> Result<Tree> {
+        let mut parser = cell.borrow_mut();
+        if parser.is_none() {
+            let mut fresh = new_parser();
+            fresh
+                .set_language(&grammar)
+                .map_err(|e| Error::Parse(e.to_string()))?;
+            *parser = Some(fresh);
+        }
+        let active = parser
+            .as_mut()
+            .ok_or_else(|| Error::Parse("parser unavailable".to_string()))?;
+        active
+            .parse(source, None)
+            .ok_or_else(|| Error::Parse("parser returned no tree".to_string()))
+    })
+}
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::thread::LocalKey;
+
+use tree_sitter::{Parser, Tree};
+
+use codekurve_core::error::{Error, Result};
+use codekurve_core::{
+    Confidence, LanguageId, Provenance, RelationshipKind, SourceSpan, SymbolKind,
+};
+
+use crate::extract::NO_SAME_FILE_MATCH_REASON;
+use crate::ir::{
+    EdgeTarget, ExtractedRelationship, ExtractedSymbol, FileAnalysis, TOO_DEEP_DIAGNOSTIC,
+};
+
 /// What every language analyzer must provide to plug into `extract::analyze`
 /// dispatch and `resolve.rs`'s kind-compatibility check. Three methods,
 /// fixed — a fourth needs a real TS or C# need, not speculative width.
 pub trait LanguageAnalyzer {
     fn language(&self) -> LanguageId;
-    fn analyze(&self, source: &str, relative_path: &str) -> Result<FileAnalysis>;
+    /// `tree` is the file's parse, produced once by `parse_tree` (PERF-4).
+    fn analyze(&self, source: &str, tree: &Tree, relative_path: &str) -> Result<FileAnalysis>;
     fn kind_matches(&self, rel: RelationshipKind, sym: SymbolKind) -> bool;
 }
 
@@ -142,6 +220,13 @@ pub(crate) struct PendingRel {
     pub(crate) span: SourceSpan,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: symbol candidates `resolve_pending` examined on this thread.
+    pub(crate) static RESOLVE_CANDIDATE_CHECKS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Resolves every deferred heritage/call/construct/local-export target
 /// against the file's full symbol list, now that forward references are
 /// visible. A same-file name+kind match becomes `EdgeTarget::Local`; zero
@@ -156,10 +241,27 @@ pub(crate) fn resolve_pending(
     out: &mut Vec<ExtractedRelationship>,
     analyzer: &dyn LanguageAnalyzer,
 ) {
+    // PERF-6: one name -> symbols map per file, built in symbol order so each
+    // bucket keeps the candidate order the full scan produced.
+    let mut by_name: HashMap<&str, Vec<&ExtractedSymbol>> = HashMap::new();
+    for symbol in symbols {
+        by_name
+            .entry(symbol.name.as_str())
+            .or_default()
+            .push(symbol);
+    }
     for rel in pending {
-        let matches: Vec<&ExtractedSymbol> = symbols
+        let candidates: &[&ExtractedSymbol] = by_name
+            .get(rel.target_name.as_str())
+            .map_or(&[], Vec::as_slice);
+        let matches: Vec<&ExtractedSymbol> = candidates
             .iter()
-            .filter(|s| s.name == rel.target_name && kind_matches(analyzer, rel.kind, s.kind))
+            .copied()
+            .filter(|s| {
+                #[cfg(test)]
+                RESOLVE_CANDIDATE_CHECKS.with(|c| c.set(c.get() + 1));
+                kind_matches(analyzer, rel.kind, s.kind)
+            })
             .collect();
         match matches.as_slice() {
             [] => out.push(ExtractedRelationship {
@@ -321,6 +423,122 @@ mod tests {
         assert!(!same_resolution_domain(CSharp, TypeScript));
         assert!(!same_resolution_domain(TypeScript, CSharp));
         assert!(!same_resolution_domain(CSharp, JavaScript));
+    }
+
+    fn fixture_symbol(key: &str, name: &str, kind: SymbolKind) -> ExtractedSymbol {
+        ExtractedSymbol {
+            local_key: key.to_string(),
+            name: name.to_string(),
+            qualified_name: key.to_string(),
+            kind,
+            language: LanguageId::TypeScript,
+            span: SourceSpan {
+                start_byte: 0,
+                end_byte: 0,
+                start_line: 0,
+                start_column: 0,
+                end_line: 0,
+                end_column: 0,
+            },
+            parent: None,
+            is_exported: false,
+            signature_fingerprint: String::new(),
+            visibility: codekurve_core::Visibility::Default,
+            is_partial: false,
+            is_record: false,
+            partial_ordinal: None,
+            roles: Vec::new(),
+        }
+    }
+
+    fn fixture_pending(source: &str, kind: RelationshipKind, target: &str) -> PendingRel {
+        PendingRel {
+            source_key: source.to_string(),
+            kind,
+            target_name: target.to_string(),
+            span: SourceSpan {
+                start_byte: 0,
+                end_byte: 0,
+                start_line: 0,
+                start_column: 0,
+                end_line: 0,
+                end_column: 0,
+            },
+        }
+    }
+
+    /// Several same-named symbols (mixed kinds), an unknown name and repeated
+    /// names, shared by the PERF-6 guard and the candidate-count test.
+    fn same_name_fixture() -> (Vec<ExtractedSymbol>, Vec<PendingRel>) {
+        let symbols = vec![
+            fixture_symbol("k1", "Helper", SymbolKind::Class),
+            fixture_symbol("k2", "Helper", SymbolKind::Function),
+            fixture_symbol("k3", "Helper", SymbolKind::Class),
+            fixture_symbol("k4", "Make", SymbolKind::Function),
+            fixture_symbol("k5", "Make", SymbolKind::Method),
+            fixture_symbol("k6", "Other", SymbolKind::Class),
+        ];
+        let pending = vec![
+            fixture_pending("src1", RelationshipKind::Inherits, "Helper"),
+            fixture_pending("src2", RelationshipKind::Calls, "Make"),
+            fixture_pending("src3", RelationshipKind::Constructs, "Helper"),
+            fixture_pending("src4", RelationshipKind::Calls, "Missing"),
+            fixture_pending("src5", RelationshipKind::Calls, "Other"),
+            fixture_pending("src6", RelationshipKind::Inherits, "Helper"),
+        ];
+        (symbols, pending)
+    }
+
+    /// PERF-6 equivalence guard: several same-named symbols (mixed kinds),
+    /// unknown names and repeated names, pinned on the pre-change scan.
+    #[test]
+    fn resolve_pending_same_name_fixture_output_is_pinned() {
+        let (symbols, pending) = same_name_fixture();
+        let mut out = Vec::new();
+        resolve_pending(
+            &symbols,
+            pending,
+            &mut out,
+            analyzer_for(LanguageId::TypeScript),
+        );
+        let lines: Vec<String> = out
+            .iter()
+            .map(|r| {
+                format!(
+                    "{} {:?} {:?} {:?} {:?}",
+                    r.source_local_key, r.target, r.kind, r.confidence, r.reason
+                )
+            })
+            .collect();
+        let expected: Vec<&str> = vec![
+            r#"src1 Local("k1") Inherits Low Some("ambiguous: multiple same-file candidates")"#,
+            r#"src1 Local("k3") Inherits Low Some("ambiguous: multiple same-file candidates")"#,
+            r#"src2 Local("k4") Calls Low Some("ambiguous: multiple same-file candidates")"#,
+            r#"src2 Local("k5") Calls Low Some("ambiguous: multiple same-file candidates")"#,
+            r#"src3 Local("k1") Constructs Low Some("ambiguous: multiple same-file candidates")"#,
+            r#"src3 Local("k3") Constructs Low Some("ambiguous: multiple same-file candidates")"#,
+            r#"src4 Unresolved("Missing") Calls Unresolved Some("no matching same-file symbol")"#,
+            r#"src5 Unresolved("Other") Calls Unresolved Some("no matching same-file symbol")"#,
+            r#"src6 Local("k1") Inherits Low Some("ambiguous: multiple same-file candidates")"#,
+            r#"src6 Local("k3") Inherits Low Some("ambiguous: multiple same-file candidates")"#,
+        ];
+        assert_eq!(lines, expected);
+    }
+
+    /// PERF-6 work guard: each pending target is compared only with symbols
+    /// of its own name (Helper 3x3, Make 2, Missing 0, Other 1 = 12 checks).
+    #[test]
+    fn resolve_pending_checks_only_same_name_candidates() {
+        let (symbols, pending) = same_name_fixture();
+        RESOLVE_CANDIDATE_CHECKS.with(|c| c.set(0));
+        let mut out = Vec::new();
+        resolve_pending(
+            &symbols,
+            pending,
+            &mut out,
+            analyzer_for(LanguageId::TypeScript),
+        );
+        assert_eq!(RESOLVE_CANDIDATE_CHECKS.with(|c| c.get()), 12);
     }
 
     fn reference_depth(node: tree_sitter::Node) -> usize {

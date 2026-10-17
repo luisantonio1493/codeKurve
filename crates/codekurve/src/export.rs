@@ -107,8 +107,8 @@ pub fn run(args: &QueryArgs, output: &Path, yes: bool) -> Result<(), CommandErro
     Ok(())
 }
 
-/// Bidirectional neighbourhood: the existing bounded BFS (`traverse::bfs`)
-/// run once forward and once over the reverse-keyed adjacency, then merged.
+/// Bidirectional neighbourhood: the existing bounded BFS (`traverse::bfs` over `LazyAdjacency`)
+/// run once forward and once over the reverse-keyed edges, then merged.
 /// No new traversal — the caps, the truncation reasons and the
 /// `min_confidence` filter are exactly the ones `trace`/`impact` already
 /// respect.

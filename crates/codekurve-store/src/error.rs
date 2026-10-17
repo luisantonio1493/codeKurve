@@ -10,6 +10,9 @@ pub enum Error {
     #[error("database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+
     #[error("migration error: {0}")]
     Migration(String),
 }

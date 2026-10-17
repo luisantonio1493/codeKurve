@@ -152,7 +152,19 @@ fn envelope_of(call_result: &serde_json::Value) -> serde_json::Value {
     let text = call_result["result"]["content"][0]["text"]
         .as_str()
         .unwrap_or_else(|| panic!("missing content[0].text: {call_result}"));
-    serde_json::from_str(text).unwrap()
+    let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_no_nulls(&envelope, &envelope);
+    envelope
+}
+
+/// Schema v2: absent means none — a `null` anywhere is wasted tokens.
+fn assert_no_nulls(value: &serde_json::Value, whole: &serde_json::Value) {
+    match value {
+        serde_json::Value::Null => panic!("null in response: {whole}"),
+        serde_json::Value::Array(items) => items.iter().for_each(|v| assert_no_nulls(v, whole)),
+        serde_json::Value::Object(map) => map.values().for_each(|v| assert_no_nulls(v, whole)),
+        _ => {}
+    }
 }
 
 /// `project_overview`/`doctor`/`project_status` don't paginate, so their
@@ -161,18 +173,13 @@ fn envelope_of(call_result: &serde_json::Value) -> serde_json::Value {
 /// checks, minus `total`.
 fn assert_envelope_shape_without_total(envelope: &serde_json::Value) {
     let obj = envelope.as_object().expect("envelope must be an object");
-    for field in [
-        "schema_version",
-        "project",
-        "result",
-        "warnings",
-        "truncated",
-    ] {
+    for field in ["schema_version", "project", "result", "truncated"] {
         assert!(
             obj.contains_key(field),
             "missing envelope field {field:?}: {envelope}"
         );
     }
+    assert_warnings_only_when_present(envelope);
     assert!(
         !obj.contains_key("total"),
         "unexpected total key: {envelope}"
@@ -181,19 +188,27 @@ fn assert_envelope_shape_without_total(envelope: &serde_json::Value) {
 
 fn assert_envelope_shape(envelope: &serde_json::Value) {
     let obj = envelope.as_object().expect("envelope must be an object");
-    for field in [
-        "schema_version",
-        "project",
-        "result",
-        "warnings",
-        "truncated",
-        "total",
-    ] {
+    for field in ["schema_version", "project", "result", "truncated", "total"] {
         assert!(
             obj.contains_key(field),
             "missing envelope field {field:?}: {envelope}"
         );
     }
+    assert_warnings_only_when_present(envelope);
+}
+
+/// `warnings` is omitted when there are none; when present it is non-empty.
+fn assert_warnings_only_when_present(envelope: &serde_json::Value) {
+    if let Some(warnings) = envelope.get("warnings") {
+        assert!(
+            !warnings
+                .as_array()
+                .expect("warnings is an array")
+                .is_empty(),
+            "empty warnings must be omitted: {envelope}"
+        );
+    }
+    assert_eq!(envelope["schema_version"], 2);
 }
 
 /// Golden coverage for all read tools, one fixture project,
@@ -260,7 +275,26 @@ fn all_read_tools_return_the_28_3_envelope() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|row| row["name"] == "Submit"));
+        .any(|row| row["qualified_name"]
+            .as_str()
+            .is_some_and(|qn| qn.ends_with(".Submit"))));
+
+    // A page that merely hit the limit says so (one extra row is fetched to
+    // tell it from a page that is simply complete).
+    let result = session.call(
+        "codekurve_search_symbols",
+        serde_json::json!({"query": "call", "limit": 1}),
+    );
+    let envelope = envelope_of(&result);
+    assert_eq!(envelope["result"].as_array().unwrap().len(), 1);
+    assert_eq!(envelope["truncated"], true, "{envelope}");
+    let result = session.call(
+        "codekurve_search_symbols",
+        serde_json::json!({"query": "call", "limit": 50}),
+    );
+    let envelope = envelope_of(&result);
+    assert!(envelope["result"].as_array().unwrap().len() >= 2);
+    assert_eq!(envelope["truncated"], false, "{envelope}");
 
     let result = session.call(
         "codekurve_find_routes",
@@ -283,12 +317,32 @@ fn all_read_tools_return_the_28_3_envelope() {
     let hits = envelope["result"].as_array().unwrap();
     assert!(!hits.is_empty());
     let hit = &hits[0];
-    for field in ["path", "start_line", "end_line", "confidence", "provenance"] {
+    for field in [
+        "id",
+        "qualified_name",
+        "kind",
+        "language",
+        "start_line",
+        "end_line",
+    ] {
         assert!(
             hit.get(field).is_some(),
             "search row missing {field:?}: {hit}"
         );
     }
+    // Derivable or constant fields are not sent: `path` is the part of
+    // `qualified_name` before the first `::`, `name` its last segment, and
+    // symbol rows are always tree-sitter / high confidence.
+    for field in ["path", "name", "confidence", "provenance"] {
+        assert!(
+            hit.get(field).is_none(),
+            "search row must not repeat {field:?}: {hit}"
+        );
+    }
+    assert_eq!(
+        hit["qualified_name"].as_str().unwrap().split("::").next(),
+        Some("src/a.ts")
+    );
     let symbol_id = hit["id"].as_str().unwrap().to_string();
 
     // get_symbol, chained off the search hit's id (design "SymbolHit carries
@@ -324,13 +378,14 @@ fn all_read_tools_return_the_28_3_envelope() {
         envelope["result"]["anchor"]["qualified_name"],
         "src/a.ts::getEligibility"
     );
-    for field in ["path", "start_line", "confidence", "provenance"] {
+    for field in ["start_line", "confidence", "provenance"] {
         assert!(
             rows[0].get(field).is_some(),
             "caller row missing {field:?}: {}",
             rows[0]
         );
     }
+    assert!(rows[0].get("path").is_none(), "{}", rows[0]);
     assert!(
         rows[0].get("target_qualified_name").is_none(),
         "caller row should not repeat the anchor: {}",
@@ -363,6 +418,8 @@ fn all_read_tools_return_the_28_3_envelope() {
         "src/a.ts::callLocal"
     );
     assert!(envelope["result"]["anchor"].get("external").is_none());
+    assert!(envelope["result"]["anchor"].get("path").is_none());
+    assert!(envelope["result"]["rows"][0].get("path").is_none());
 
     // find_references: same underlying rows as find_callers here (no
     // non-call references in the fixture).
@@ -395,13 +452,14 @@ fn all_read_tools_return_the_28_3_envelope() {
     assert_eq!(envelope["total"], 1);
     assert_eq!(rows[0]["target_text"], "missingThing");
     assert_eq!(rows[0]["source_qualified_name"], "src/b.ts::callGhost");
-    for field in ["path", "kind", "reason", "confidence", "candidate_count"] {
+    for field in ["kind", "reason", "confidence", "candidate_count"] {
         assert!(
             rows[0].get(field).is_some(),
             "unresolved row missing {field:?}: {}",
             rows[0]
         );
     }
+    assert!(rows[0].get("path").is_none(), "{}", rows[0]);
     assert!(rows[0]["reason"].as_str().unwrap().contains("no matching"));
 
     // …and the exact-target filter, plus a miss returning an empty page
@@ -425,17 +483,32 @@ fn all_read_tools_return_the_28_3_envelope() {
         serde_json::json!({"symbol_name": "src/a.ts::callLocal", "to": "src/a.ts::getEligibility"}),
     );
     let envelope = envelope_of(&result);
-    assert_envelope_shape(&envelope);
+    // `trace_path` reports `reached_count` inside `result` instead of `total`.
+    assert_envelope_shape_without_total(&envelope);
     assert_eq!(envelope["result"]["path_found"], true);
-    let reached = envelope["result"]["reached"].as_array().unwrap();
-    assert!(!reached.is_empty());
-    for field in ["path", "start_line", "end_line"] {
+    // Only the nodes on the path, start first: callLocal -> getEligibility.
+    let path = envelope["result"]["path"].as_array().unwrap();
+    assert_eq!(path.len(), 2, "{envelope}");
+    assert_eq!(path[0]["qualified_name"], "src/a.ts::callLocal");
+    assert_eq!(path[1]["qualified_name"], "src/a.ts::getEligibility");
+    for field in ["start_line", "end_line"] {
         assert!(
-            reached[0].get(field).is_some(),
-            "reached row missing {field:?}: {}",
-            reached[0]
+            path[1].get(field).is_some(),
+            "path row missing {field:?}: {}",
+            path[1]
         );
     }
+    assert!(envelope["result"]["reached_count"].as_u64().unwrap() >= 2);
+    assert!(envelope["result"].get("reached").is_none());
+
+    // No path: no `path` rows, `path_found` false.
+    let result = session.call(
+        "codekurve_trace_path",
+        serde_json::json!({"symbol_name": "src/a.ts::getEligibility", "to": "src/a.ts::callLocal"}),
+    );
+    let envelope = envelope_of(&result);
+    assert_eq!(envelope["result"]["path_found"], false);
+    assert_eq!(envelope["result"]["path"].as_array().unwrap().len(), 0);
 
     // analyze_impact
     let result = session.call(
@@ -445,6 +518,48 @@ fn all_read_tools_return_the_28_3_envelope() {
     let envelope = envelope_of(&result);
     assert_envelope_shape(&envelope);
     assert!(!envelope["result"]["reached"].as_array().unwrap().is_empty());
+
+    // analyze_impact pages its reached rows in BFS order with `limit`/`offset`.
+    // Without them the output is the full reached set, and `total` is that
+    // full count in every page.
+    let impact_all = envelope_of(&session.call(
+        "codekurve_analyze_impact",
+        serde_json::json!({"symbol_name": "src/a.ts::getEligibility"}),
+    ));
+    let all_rows = impact_all["result"]["reached"].as_array().unwrap().clone();
+    assert!(all_rows.len() >= 2, "{impact_all}");
+    assert_eq!(impact_all["total"], all_rows.len(), "{impact_all}");
+    assert_eq!(impact_all["truncated"], false, "{impact_all}");
+
+    let first = envelope_of(&session.call(
+        "codekurve_analyze_impact",
+        serde_json::json!({"symbol_name": "src/a.ts::getEligibility", "limit": 1}),
+    ));
+    assert_eq!(
+        first["result"]["reached"].as_array().unwrap().len(),
+        1,
+        "{first}"
+    );
+    assert_eq!(first["result"]["reached"][0], all_rows[0], "{first}");
+    assert_eq!(first["total"], all_rows.len(), "{first}");
+    assert_eq!(first["truncated"], true, "{first}");
+
+    let second = envelope_of(&session.call(
+        "codekurve_analyze_impact",
+        serde_json::json!({"symbol_name": "src/a.ts::getEligibility", "limit": 1, "offset": 1}),
+    ));
+    assert_eq!(second["result"]["reached"][0], all_rows[1], "{second}");
+
+    let past_end = envelope_of(&session.call(
+        "codekurve_analyze_impact",
+        serde_json::json!({"symbol_name": "src/a.ts::getEligibility", "offset": all_rows.len()}),
+    ));
+    assert_eq!(
+        past_end["result"]["reached"].as_array().unwrap().len(),
+        0,
+        "{past_end}"
+    );
+    assert_eq!(past_end["truncated"], false, "{past_end}");
 
     session.finish();
 }
@@ -568,7 +683,7 @@ fn stale_warning_reflects_pending_files() {
     let mut session = McpSession::start(root);
     let result = session.call("codekurve_project_status", serde_json::json!({}));
     let envelope = envelope_of(&result);
-    assert_eq!(envelope["warnings"].as_array().unwrap().len(), 0);
+    assert!(envelope.get("warnings").is_none(), "{envelope}");
     assert_eq!(envelope["result"]["stale"], false);
     session.finish();
 
@@ -685,6 +800,43 @@ fn not_indexed_session_answers_degraded_without_auto_indexing() {
 
     // Still no index run happened — no db file, no `.codekurve/index.db`.
     assert!(!root.join(".codekurve").join("index.db").exists());
+
+    session.finish();
+}
+
+/// QRY-11: a server started before the first `codekurve index` recovers on
+/// its own once the index exists, instead of answering "not indexed" until
+/// the client restarts it.
+#[test]
+fn not_indexed_session_picks_up_an_index_created_later() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    codekurve_core::project::init(root).unwrap();
+    let mut session = McpSession::start(root);
+
+    let before = session.call(
+        "codekurve_search_symbols",
+        serde_json::json!({"query": "getEligibility"}),
+    );
+    assert!(before["error"]["message"].as_str().is_some(), "{before}");
+
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src").join("a.ts"), A_TS).unwrap();
+    AssertCommand::cargo_bin("codekurve")
+        .unwrap()
+        .arg("index")
+        .arg("--root")
+        .arg(root)
+        .assert()
+        .success();
+
+    let after = session.call(
+        "codekurve_search_symbols",
+        serde_json::json!({"query": "getEligibility"}),
+    );
+    assert!(after["error"].is_null(), "{after}");
+    let envelope = envelope_of(&after);
+    assert!(!envelope["result"].as_array().unwrap().is_empty());
 
     session.finish();
 }

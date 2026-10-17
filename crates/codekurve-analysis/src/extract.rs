@@ -10,7 +10,9 @@ use tree_sitter::Node;
 use codekurve_core::SourceSpan;
 
 use crate::ir::FileAnalysis;
-use crate::languages::analyzer_for;
+use crate::languages::{
+    analyzer_for, parse_tree, syntax_depth_exceeds, too_deep, MAX_SYNTAX_DEPTH,
+};
 
 /// Parse `source` for the given language and extract its symbols plus
 /// intra-file relationships into a per-file `FileAnalysis`. Keeps its public
@@ -22,19 +24,30 @@ use crate::languages::analyzer_for;
 /// routes through, and the only place holding both the source text and the
 /// finished per-file symbol list.
 ///
-/// A file deeper than [`crate::languages::MAX_SYNTAX_DEPTH`] comes back
-/// empty with a diagnostic ([`FileAnalysis::skipped_too_deep`]) and skips
-/// framework recognition, which would re-parse and walk it recursively.
+/// PERF-4: the file is parsed exactly once here. The same tree feeds the
+/// language analyzer and then `frameworks::recognize`, so no later stage
+/// re-parses the file.
+///
+/// A file deeper than [`MAX_SYNTAX_DEPTH`] comes back empty with a diagnostic
+/// ([`FileAnalysis::skipped_too_deep`]) and skips framework recognition.
 /// Below that limit extraction still recurses per tree level: run it on
 /// [`on_analysis_stack`].
 pub fn analyze(source: &str, language: LanguageId, relative_path: &str) -> Result<FileAnalysis> {
-    let mut analysis = analyzer_for(language).analyze(source, relative_path)?;
-    if !analysis.skipped_too_deep() {
-        crate::frameworks::recognize(source, language, &mut analysis);
+    let tree = parse_tree(language, relative_path, source)?;
+    if syntax_depth_exceeds(&tree, MAX_SYNTAX_DEPTH) {
+        return Ok(too_deep(language, relative_path));
     }
+    let mut analysis = analyzer_for(language).analyze(source, &tree, relative_path)?;
+    crate::frameworks::recognize(source, &tree, language, &mut analysis);
     disambiguate_duplicate_keys(&mut analysis);
     Ok(analysis)
 }
+
+/// Reason text for a deferred (`PendingRel`) target with zero same-file
+/// candidates. Shared with `resolve.rs` so cross-file resolution can tell a
+/// same-file-miss `Exports` edge apart from a module-specifier re-export
+/// without re-parsing.
+pub(crate) const NO_SAME_FILE_MATCH_REASON: &str = "no matching same-file symbol";
 
 /// First ordinal handed to a duplicate by [`disambiguate_duplicate_keys`];
 /// far above any C# `partial` fragment ordinal, so the two never meet.
@@ -104,12 +117,6 @@ pub fn on_analysis_stack<T: Send>(work: impl FnOnce() -> T + Send) -> T {
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     })
 }
-
-/// Reason text for a deferred (`PendingRel`) target with zero same-file
-/// candidates. Shared with `resolve.rs` so cross-file resolution can tell a
-/// same-file-miss `Exports` edge apart from a module-specifier re-export
-/// without re-parsing.
-pub(crate) const NO_SAME_FILE_MATCH_REASON: &str = "no matching same-file symbol";
 
 // ponytail: not `Iterator::find` (clippy's own suggestion) — tree-sitter's
 // cursor-borrowed `Node` items don't outlive the function that way here.

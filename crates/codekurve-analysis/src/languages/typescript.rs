@@ -6,9 +6,9 @@
 //! edge here either resolves to a same-file symbol or carries
 //! `EdgeTarget::Unresolved(text)` for that later pass to pick up.
 
-use codekurve_core::error::{Error, Result};
+use codekurve_core::error::Result;
 use codekurve_core::{Confidence, LanguageId, Provenance, RelationshipKind, SymbolKind};
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Tree};
 
 use crate::extract::{find_child, span_of};
 use crate::ir::{EdgeTarget, ExtractedRelationship, ExtractedSymbol, FileAnalysis};
@@ -35,8 +35,8 @@ impl LanguageAnalyzer for TypeScriptAnalyzer {
         self.language
     }
 
-    fn analyze(&self, source: &str, relative_path: &str) -> Result<FileAnalysis> {
-        analyze(source, self.language, relative_path)
+    fn analyze(&self, source: &str, tree: &Tree, relative_path: &str) -> Result<FileAnalysis> {
+        analyze_tree(source, tree, self.language, relative_path)
     }
 
     /// Today's `extract::kind_matches` body, moved verbatim — that identity
@@ -73,32 +73,24 @@ impl LanguageAnalyzer for TypeScriptAnalyzer {
     }
 }
 
-/// Parse `source` for the given language and extract its symbols plus
-/// intra-file relationships into a per-file `FileAnalysis`. `unresolved`
-/// stays empty here — it is populated once whole-project resolution proves a
-/// target has zero candidates anywhere in the project.
+/// Test-only convenience: parses `source` the way `extract::analyze` does and
+/// runs the analyzer on that tree.
+#[cfg(test)]
 fn analyze(source: &str, language: LanguageId, relative_path: &str) -> Result<FileAnalysis> {
-    // ponytail: one grammar for both languages — the TypeScript grammar parses
-    // plain JS as a subset, TSX covers JS/JSX. Add tree-sitter-javascript only
-    // if fidelity gaps appear (§12 lists it for later).
-    let grammar = match language {
-        LanguageId::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
-        LanguageId::JavaScript => tree_sitter_typescript::LANGUAGE_TSX,
-        LanguageId::CSharp => unreachable!("TypeScriptAnalyzer only serves TS/JS"),
-    };
+    let tree = crate::languages::parse_tree(language, relative_path, source)?;
+    analyze_tree(source, &tree, language, relative_path)
+}
 
-    let mut parser = Parser::new();
-    parser
-        .set_language(&grammar.into())
-        .map_err(|e| Error::Parse(e.to_string()))?;
-
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| Error::Parse("parser returned no tree".to_string()))?;
-    if super::syntax_depth_exceeds(&tree, super::MAX_SYNTAX_DEPTH) {
-        return Ok(super::too_deep(language, relative_path));
-    }
-
+/// Extracts symbols plus intra-file relationships from an already-parsed
+/// `tree` (PERF-4: the tree comes from `parse_tree`, parsed once per file).
+/// `unresolved` stays empty here — it is populated once whole-project
+/// resolution proves a target has zero candidates anywhere in the project.
+fn analyze_tree(
+    source: &str,
+    tree: &Tree,
+    language: LanguageId,
+    relative_path: &str,
+) -> Result<FileAnalysis> {
     let mut ctx = CollectCtx {
         source: source.as_bytes(),
         language,

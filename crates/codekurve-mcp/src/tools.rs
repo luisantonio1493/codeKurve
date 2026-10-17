@@ -5,7 +5,7 @@
 //! blocking pool through [`CodeKurve::blocking`], which owns the locking —
 //! no `.await` while the lock is held (design "Concurrency").
 
-use codekurve::commands::QueryArgs;
+use codekurve::commands::{self, QueryArgs};
 use codekurve::query::{self, RelKind, SearchInput, Session};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -41,6 +41,7 @@ pub struct ReindexInput {}
 #[serde(deny_unknown_fields)]
 pub struct SearchSymbolsInput {
     pub query: String,
+    /// Max rows (default 50, max 500).
     pub limit: Option<u32>,
 }
 
@@ -50,7 +51,9 @@ pub struct SearchSymbolsInput {
 #[serde(deny_unknown_fields)]
 pub struct FindRoutesInput {
     pub query: Option<String>,
+    /// Max rows (default 50, max 500).
     pub limit: Option<u32>,
+    /// Rows to skip (default 0).
     pub offset: Option<u32>,
 }
 
@@ -61,7 +64,9 @@ pub struct FindRoutesInput {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct GetSymbolInput {
     pub id: String,
+    /// Extra source lines on each side (default 0, max 200).
     pub ctx_lines: Option<u32>,
+    /// Read the source (default true); false returns only the location.
     pub include_source: Option<bool>,
 }
 
@@ -73,16 +78,11 @@ pub struct GetSymbolInput {
 pub struct RelationshipInput {
     pub symbol_id: Option<String>,
     pub symbol_name: Option<String>,
-    /// Filter by resolution confidence (`exact`/`high`/`medium`/`low`/
-    /// `unresolved`, floor inclusive). Caveat: the heuristic by-name resolver
-    /// tags most real hits `low` whenever a name collides with another
-    /// project symbol of the same name — common in larger codebases (e.g. a
-    /// property name reused across sibling classes). `medium`/`high` can
-    /// come back empty even when `low`/unfiltered has real results; prefer
-    /// leaving this unset for consumer-discovery and triaging by `reason`/
-    /// `provenance` instead of filtering confidence away.
+    /// Confidence floor: exact|high|medium|low|unresolved. By-name matches are often `low`; leave unset to see them.
     pub min_confidence: Option<String>,
+    /// Max rows (default 50, max 500).
     pub limit: Option<u32>,
+    /// Rows to skip (default 0).
     pub offset: Option<u32>,
 }
 
@@ -95,7 +95,9 @@ pub struct FindUnresolvedInput {
     pub target_text: Option<String>,
     pub symbol_id: Option<String>,
     pub symbol_name: Option<String>,
+    /// Max rows (default 50, max 500).
     pub limit: Option<u32>,
+    /// Rows to skip (default 0).
     pub offset: Option<u32>,
 }
 
@@ -106,34 +108,27 @@ pub struct TracePathInput {
     pub symbol_id: Option<String>,
     pub symbol_name: Option<String>,
     pub to: String,
-    /// Filter by resolution confidence (`exact`/`high`/`medium`/`low`/
-    /// `unresolved`, floor inclusive). Caveat: the heuristic by-name resolver
-    /// tags most real hits `low` whenever a name collides with another
-    /// project symbol of the same name — common in larger codebases (e.g. a
-    /// property name reused across sibling classes). `medium`/`high` can
-    /// come back empty even when `low`/unfiltered has real results; prefer
-    /// leaving this unset and triaging by `reason`/`provenance` instead.
+    /// Confidence floor: exact|high|medium|low|unresolved. By-name matches are often `low`; leave unset to see them.
     pub min_confidence: Option<String>,
+    /// Max hops (default 10).
     pub depth: Option<u32>,
 }
 
 /// `analyze_impact` (§28.2): same subject resolution as [`RelationshipInput`]
 /// plus `--depth`; no `to` (reverse BFS explores everything reachable, no
-/// single target).
+/// single target). `limit`/`offset` page the reached rows in BFS order.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct AnalyzeImpactInput {
     pub symbol_id: Option<String>,
     pub symbol_name: Option<String>,
-    /// Filter by resolution confidence (`exact`/`high`/`medium`/`low`/
-    /// `unresolved`, floor inclusive). Caveat: the heuristic by-name resolver
-    /// tags most real hits `low` whenever a name collides with another
-    /// project symbol of the same name — common in larger codebases (e.g. a
-    /// property name reused across sibling classes). `medium`/`high` can
-    /// come back empty even when `low`/unfiltered has real results; prefer
-    /// leaving this unset for consumer-discovery and triaging by `reason`/
-    /// `provenance` instead of filtering confidence away.
+    /// Confidence floor: exact|high|medium|low|unresolved. By-name matches are often `low`; leave unset to see them.
     pub min_confidence: Option<String>,
+    /// Max hops (default 10).
     pub depth: Option<u32>,
+    /// Max reached rows returned (default: all).
+    pub limit: Option<u32>,
+    /// Reached rows to skip before `limit` (default 0). `total` is the full reached count.
+    pub offset: Option<u32>,
 }
 
 #[tool_router(vis = "pub(crate)")]
@@ -159,7 +154,7 @@ impl CodeKurve {
                 "last_verified_at": data.last_verified_at,
                 "stale": data.stale,
             });
-            let envelope = query::envelope(&project, result, warnings, false, None);
+            let envelope = query::mcp_envelope(&project, result, warnings, false, None);
             Ok(CallToolResult::success(vec![ContentBlock::text(
                 envelope.to_string(),
             )]))
@@ -189,24 +184,20 @@ impl CodeKurve {
                 .map(|sym| {
                     serde_json::json!({
                         "id": sym.id,
-                        "name": sym.name,
                         "qualified_name": sym.qualified_name,
                         "kind": sym.kind,
                         "language": sym.language,
-                        "path": sym.relative_path,
                         "start_line": sym.span.start_line,
                         "end_line": sym.span.end_line,
                         // ponytail: `reindex` hardcodes provenance/confidence at
                         // write time (codekurve-store::repo::insert_file) — no
                         // per-symbol variance yet to read back, so these mirror
                         // that constant rather than a stored column.
-                        "confidence": "high",
-                        "provenance": "tree-sitter",
                     })
                 })
                 .collect();
 
-            let envelope = query::envelope(
+            let envelope = query::mcp_envelope(
                 &project,
                 serde_json::Value::Array(rows),
                 warnings,
@@ -248,9 +239,15 @@ impl CodeKurve {
             .map_err(|e| McpError::internal_error(e.message, None))?;
             let warnings = session.warnings();
             let project = session.config().project.name.clone();
-            let rows: Vec<_> = page.rows.iter().map(query::relationship_row).collect();
+            let rows: Vec<_> = page
+                .rows
+                .iter()
+                .map(|r| {
+                    query::drop_keys(query::prune_nulls(query::relationship_row(r)), &["path"])
+                })
+                .collect();
 
-            let envelope = query::envelope(
+            let envelope = query::mcp_envelope(
                 &project,
                 serde_json::Value::Array(rows),
                 warnings,
@@ -280,46 +277,52 @@ impl CodeKurve {
             let project = session.config().project.name.clone();
             let sym = &detail.symbol;
 
+            let mut source_truncated = false;
             let (source, stale, reason) = if include_source {
-                let path = session.root().join(&sym.relative_path);
                 // Session::warnings() for an Indexed session is only ever the
                 // pending-files wording (see query::pending_warning) — non-empty
                 // here means index_pending > 0, the exact bit source_slice
                 // needs, without a second `repo::index_status` round-trip.
                 let index_pending = !warnings.is_empty();
                 let indexed_hash = query::indexed_file_hash(session, &sym.relative_path);
+                let limits = query::SliceLimits {
+                    max_file_bytes: session.config().index.max_file_size_bytes,
+                    max_snippet_bytes: session.config().queries.max_snippet_bytes as usize,
+                };
                 let slice = query::source_slice(
-                    &path,
+                    session.root(),
+                    &sym.relative_path,
                     &sym.span,
                     ctx_lines,
                     index_pending,
+                    &limits,
                     indexed_hash.as_deref(),
                 );
+                source_truncated = slice.truncated;
                 (slice.source, slice.stale, slice.reason)
             } else {
                 (None, false, None)
             };
 
-            let row = serde_json::json!({
+            let mut row = query::prune_nulls(serde_json::json!({
                 "id": sym.id,
-                "name": sym.name,
                 "qualified_name": sym.qualified_name,
                 "kind": sym.kind,
                 "language": sym.language,
-                "path": sym.relative_path,
                 "start_line": sym.span.start_line,
                 "end_line": sym.span.end_line,
-                "confidence": "high",
-                "provenance": "tree-sitter",
                 "source": source,
                 // Distinct from the project-level stale warning (spec
                 // "get_symbol Reads Live Source and Flags Drift"): this flags
                 // drift for *this* symbol's own span/file.
                 "stale": stale,
                 "stale_reason": reason,
-            });
+            }));
+            if source_truncated {
+                row["source_truncated"] = serde_json::Value::Bool(true);
+            }
 
-            let envelope = query::envelope(&project, row, warnings, false, Some(1));
+            let envelope = query::mcp_envelope(&project, row, warnings, false, Some(1));
             Ok(CallToolResult::success(vec![ContentBlock::text(
                 envelope.to_string(),
             )]))
@@ -364,7 +367,7 @@ impl CodeKurve {
     }
 
     #[tool(
-        description = "Explain why a relationship is missing. Reach for this when find_implementations/find_callers/find_references come back empty for a symbol that clearly ought to have relationships: the analyzer records every reference it could not resolve, with the reason it stopped, instead of guessing an edge. Typical causes are a target defined outside the indexed project (an external base class or interface, e.g. a C# `class X : IFoo` where `IFoo` comes from a NuGet package and base-class vs interface is undeterminable) or a name with zero/ambiguous candidates. Filter by target_text (exact match on the name as written in the source), by symbol_id/symbol_name, or pass nothing to list the whole project."
+        description = "Explain a missing relationship: lists references the analyzer could not resolve, with the reason (e.g. external base class, no or ambiguous candidates). Use when find_callers/find_implementations come back empty. Filter by target_text (exact), symbol_id/symbol_name, or none for all"
     )]
     async fn codekurve_find_unresolved(
         &self,
@@ -391,9 +394,13 @@ impl CodeKurve {
                 .map_err(|e| McpError::internal_error(e.message, None))?;
             let warnings = session.warnings();
             let project = session.config().project.name.clone();
-            let rows: Vec<_> = page.rows.iter().map(query::unresolved_row).collect();
+            let rows: Vec<_> = page
+                .rows
+                .iter()
+                .map(|r| query::drop_keys(query::prune_nulls(query::unresolved_row(r)), &["path"]))
+                .collect();
 
-            let envelope = query::envelope(
+            let envelope = query::mcp_envelope(
                 &project,
                 serde_json::Value::Array(rows),
                 warnings,
@@ -425,16 +432,28 @@ impl CodeKurve {
             };
             let outcome = query::trace(session, &args, &input.to)
                 .map_err(|e| McpError::internal_error(e.message, None))?;
-            let rows = query::bfs_rows(session, &outcome)
+            // Only the nodes ON the path: the search frontier (up to 500 nodes)
+            // is not an answer to "how does A reach B".
+            let rows = query::path_rows(session, &outcome)
                 .map_err(|e| McpError::internal_error(e.message, None))?;
             let warnings = session.warnings();
             let project = session.config().project.name.clone();
-            let total = rows.len();
+            let reached_count = outcome.reached.len();
             let truncated = outcome.truncated;
+            let truncated_reason = outcome
+                .truncated_reason
+                .map(commands::truncation_reason_str);
             let path_found = outcome.path.is_some();
 
-            let result = serde_json::json!({ "reached": rows, "path_found": path_found });
-            let envelope = query::envelope(&project, result, warnings, truncated, Some(total));
+            let result = serde_json::json!({
+                "path_found": path_found,
+                "path": rows,
+                "reached_count": reached_count,
+            });
+            let mut envelope = query::mcp_envelope(&project, result, warnings, truncated, None);
+            if let Some(reason) = truncated_reason {
+                envelope["truncated_reason"] = serde_json::json!(reason);
+            }
             Ok(CallToolResult::success(vec![ContentBlock::text(
                 envelope.to_string(),
             )]))
@@ -467,10 +486,24 @@ impl CodeKurve {
             let warnings = session.warnings();
             let project = session.config().project.name.clone();
             let total = rows.len();
-            let truncated = outcome.truncated;
+            // Without `limit`/`offset` the window is the whole reached set, so the
+            // output is unchanged. A window that leaves reached rows out is
+            // reported as truncated.
+            let offset = input.offset.unwrap_or(0) as usize;
+            let limit = input.limit.map_or(usize::MAX, |limit| limit as usize);
+            let window_cut = offset.saturating_add(limit) < total;
+            let rows: Vec<serde_json::Value> = rows.into_iter().skip(offset).take(limit).collect();
+            let truncated = outcome.truncated || window_cut;
+            let truncated_reason = outcome
+                .truncated_reason
+                .map(commands::truncation_reason_str);
 
             let result = serde_json::json!({ "reached": rows });
-            let envelope = query::envelope(&project, result, warnings, truncated, Some(total));
+            let mut envelope =
+                query::mcp_envelope(&project, result, warnings, truncated, Some(total));
+            if let Some(reason) = truncated_reason {
+                envelope["truncated_reason"] = serde_json::json!(reason);
+            }
             Ok(CallToolResult::success(vec![ContentBlock::text(
                 envelope.to_string(),
             )]))
@@ -501,9 +534,9 @@ impl CodeKurve {
                 "symbols": data.symbols,
                 "relationships": data.relationships,
                 "languages": languages,
-                "entry_points": data.entry_points.iter().map(query::relationship_row).collect::<Vec<_>>(),
+                "entry_points": data.entry_points.iter().map(|r| query::drop_keys(query::prune_nulls(query::relationship_row(r)), &["path"])).collect::<Vec<_>>(),
             });
-            let envelope = query::envelope(&project, result, warnings, false, None);
+            let envelope = query::mcp_envelope(&project, result, warnings, false, None);
             Ok(CallToolResult::success(vec![ContentBlock::text(
                 envelope.to_string(),
             )]))
@@ -529,7 +562,7 @@ impl CodeKurve {
                 .map(|c| serde_json::json!({ "name": c.name, "ok": c.ok, "detail": c.detail }))
                 .collect();
             let result = serde_json::json!({ "ok": report.ok, "checks": checks });
-            let envelope = query::envelope(&project, result, warnings, false, None);
+            let envelope = query::mcp_envelope(&project, result, warnings, false, None);
             Ok(CallToolResult::success(vec![ContentBlock::text(
                 envelope.to_string(),
             )]))
@@ -565,7 +598,7 @@ impl CodeKurve {
                 "files_deleted": outcome.files_deleted,
                 "fell_back_to_full_reindex": outcome.fell_back_to_full_reindex,
             });
-            let envelope = query::envelope(&project, result, warnings, false, None);
+            let envelope = query::mcp_envelope(&project, result, warnings, false, None);
             Ok(CallToolResult::success(vec![ContentBlock::text(
                 envelope.to_string(),
             )]))
@@ -614,10 +647,10 @@ fn relationship_result(
     let rows: Vec<_> = page
         .rows
         .iter()
-        .map(|r| query::relationship_row_compact(r, anchor_is_target))
+        .map(|r| query::prune_nulls(query::relationship_row_compact(r, anchor_is_target)))
         .collect();
 
-    let envelope = query::envelope(
+    let envelope = query::mcp_envelope(
         &project,
         serde_json::json!({ "anchor": anchor, "rows": rows }),
         warnings,

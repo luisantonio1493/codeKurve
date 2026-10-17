@@ -16,6 +16,8 @@ rmcp = "=2.2.0"
 tokio = "1"
 schemars = "1"
 serde_json = "1"
+# Released 2026-04-14. Parallel read+analyze of indexed files (PERF-1).
+rayon = "1.12.0"
 # TUI (ADR 0011). `default-features = false` drops the calendar widget, the
 # `macros` helpers and the layout cache we never use; `crossterm_0_29` pins
 # ratatui's backend to the same crossterm generation this workspace depends

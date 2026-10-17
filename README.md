@@ -55,12 +55,13 @@ build from source instead — it compiles locally, so nothing gets flagged:
 
 ```powershell
 winget install Rustlang.Rustup
-cargo install --git https://github.com/luisantonio1493/codeKurve codekurve-bin
+cargo install --git https://github.com/luisantonio1493/codeKurve --tag v0.2.11 codekurve-bin
 ```
 
 This installs the `codekurve` binary to `%USERPROFILE%\.cargo\bin`, which
-`rustup` puts on your PATH automatically. Re-run the same `cargo install`
-command to upgrade.
+`rustup` puts on your PATH automatically. The command is pinned to a release
+tag, so re-running it installs the same version. To upgrade, change `v0.2.11`
+to a newer release tag and run the command again.
 
 Both scripts install the latest release binary and add it to your PATH.
 Before installing, they verify the binary against the release's

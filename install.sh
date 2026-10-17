@@ -108,7 +108,17 @@ if [ "$actual" != "$expected" ]; then
 fi
 echo "Verified   SHA-256 $actual"
 
+# Smoke test the verified file before it replaces anything.
 chmod +x "$tmp"
+if ! "$tmp" --version >/dev/null 2>&1; then
+  echo "codekurve: downloaded $asset failed its '--version' smoke test; existing install left unchanged." >&2
+  exit 1
+fi
+
+# Keep the previous binary for manual rollback, then replace it.
+if [ -e "$DEST" ]; then
+  cp -p "$DEST" "$DEST.prev"
+fi
 mv "$tmp" "$DEST"
 trap - EXIT
 

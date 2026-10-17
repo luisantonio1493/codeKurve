@@ -286,19 +286,24 @@ fn find_file(base: &str, known_files: &HashSet<String>) -> Option<String> {
 /// A single-`*`-prefix `compilerOptions.paths` alias mapping (e.g.
 /// `"@app/*": "src/*"`), or a literal (no-wildcard) exact match.
 fn apply_alias(specifier: &str, aliases: &TsconfigAliases) -> Option<String> {
-    for (pattern, replacement) in aliases {
-        match pattern.strip_suffix('*') {
-            Some(prefix) => {
-                if let Some(rest) = specifier.strip_prefix(prefix) {
-                    let repl_prefix = replacement.strip_suffix('*').unwrap_or(replacement);
-                    return Some(format!("{repl_prefix}{rest}"));
-                }
-            }
-            None if pattern == specifier => return Some(replacement.clone()),
-            None => {}
-        }
+    // An exact (no-wildcard) match always wins; among wildcard patterns the
+    // longest matching prefix wins, as in TypeScript — never whichever the
+    // map happens to iterate first.
+    if let Some(replacement) = aliases.get(specifier) {
+        return Some(replacement.clone());
     }
-    None
+    aliases
+        .iter()
+        .filter_map(|(pattern, replacement)| {
+            let prefix = pattern.strip_suffix('*')?;
+            let rest = specifier.strip_prefix(prefix)?;
+            Some((prefix.len(), replacement, rest))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(a.1)))
+        .map(|(_, replacement, rest)| {
+            let repl_prefix = replacement.strip_suffix('*').unwrap_or(replacement);
+            format!("{repl_prefix}{rest}")
+        })
 }
 
 /// Counts of how many edges resolution produced, for `codekurve index`'s
@@ -369,8 +374,10 @@ fn resolve_one(
     unresolved: &mut Vec<UnresolvedReference>,
     report: &mut ResolutionReport,
 ) {
-    let text = match &rel.target {
-        EdgeTarget::Unresolved(t) => t.clone(),
+    // Borrowed from `rel`: every dispatch arm only reads it, so the name
+    // lookups take a `&str` without an owned copy per relationship.
+    let text: &str = match &rel.target {
+        EdgeTarget::Unresolved(t) => t.as_str(),
         _ => {
             new_rels.push(rel);
             return;
@@ -379,12 +386,12 @@ fn resolve_one(
 
     match rel.kind {
         RelationshipKind::Imports if source_language == LanguageId::CSharp => {
-            resolve_using(&rel, &text, table, new_rels, report)
+            resolve_using(&rel, text, table, new_rels, report)
         }
         RelationshipKind::Imports => resolve_import(
             file,
             &rel,
-            &text,
+            text,
             table,
             known_files,
             aliases,
@@ -395,7 +402,7 @@ fn resolve_one(
         RelationshipKind::Exports => resolve_export(
             file,
             &rel,
-            &text,
+            text,
             table,
             known_files,
             aliases,
@@ -407,7 +414,7 @@ fn resolve_one(
             resolve_base_entry(
                 source_language,
                 &rel,
-                &text,
+                text,
                 table,
                 new_rels,
                 unresolved,
@@ -423,7 +430,7 @@ fn resolve_one(
             resolve_property_type(
                 source_language,
                 &rel,
-                &text,
+                text,
                 table,
                 new_rels,
                 unresolved,
@@ -438,7 +445,7 @@ fn resolve_one(
         | RelationshipKind::Reads => resolve_by_name(
             source_language,
             &rel,
-            &text,
+            text,
             table,
             new_rels,
             unresolved,
@@ -456,7 +463,7 @@ fn resolve_one(
         | RelationshipKind::PersistsTo => resolve_framework_edge(
             source_language,
             &rel,
-            &text,
+            text,
             table,
             new_rels,
             unresolved,
@@ -475,6 +482,12 @@ fn resolve_one(
 /// analyzer (design "Resolution Changes") rather than a shared free
 /// function, so a second language never silently inherits TypeScript's
 /// rules; language-filtered candidates land in a later PR (PR5).
+/// A by-name hit with more candidates than this is noise, not information:
+/// on a real C# API `x.Name` fanned out to 450 same-named properties and made
+/// 90% of the index. Past the cap no edges are emitted and the reference is
+/// kept as unresolved ("ambiguous: N candidates") so it stays discoverable.
+pub const MAX_AMBIGUOUS_CANDIDATES: usize = 8;
+
 fn resolve_by_name(
     source_language: LanguageId,
     rel: &ExtractedRelationship,
@@ -511,6 +524,13 @@ fn resolve_by_name(
                 Confidence::High,
             );
             report.resolved += 1;
+        }
+        many if many.len() > MAX_AMBIGUOUS_CANDIDATES => {
+            let mut reference =
+                unresolved_ref(rel, text, &format!("ambiguous: {} candidates", many.len()));
+            reference.candidate_count = many.len();
+            unresolved.push(reference);
+            report.unresolved += 1;
         }
         many => {
             // Never silently pick one (§20.4/§27.4): one Low-confidence,
@@ -1279,6 +1299,86 @@ mod tests {
         assert!(files[0].unresolved.is_empty());
     }
 
+    /// IDX-2: overlapping alias patterns resolve by longest prefix, never by
+    /// `HashMap` iteration order.
+    #[test]
+    fn overlapping_aliases_resolve_by_longest_prefix() {
+        for _ in 0..64 {
+            let aliases: TsconfigAliases = [
+                ("@app/*".to_string(), "src/*".to_string()),
+                ("@app/core/*".to_string(), "src/core/*".to_string()),
+                (
+                    "@app/core/special".to_string(),
+                    "src/special.ts".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect();
+            assert_eq!(
+                apply_alias("@app/core/x", &aliases).as_deref(),
+                Some("src/core/x")
+            );
+            assert_eq!(
+                apply_alias("@app/other", &aliases).as_deref(),
+                Some("src/other")
+            );
+            assert_eq!(
+                apply_alias("@app/core/special", &aliases).as_deref(),
+                Some("src/special.ts")
+            );
+        }
+    }
+
+    fn caller_with_candidates(n: usize) -> Vec<FileAnalysis> {
+        let mut files = vec![analyzed(
+            "src/caller.ts",
+            "function run() { return doWork(); }\n",
+        )];
+        for i in 0..n {
+            files.push(analyzed(
+                &format!("src/worker{i}.ts"),
+                "export function doWork() { return 1; }\n",
+            ));
+        }
+        files
+    }
+
+    /// At the cap, every candidate still gets its Low-confidence edge.
+    #[test]
+    fn candidates_at_the_cap_still_produce_edges() {
+        let mut files = caller_with_candidates(MAX_AMBIGUOUS_CANDIDATES);
+        let report = resolve(&mut files, &TsconfigAliases::new());
+
+        let calls = files[0]
+            .relationships
+            .iter()
+            .filter(|r| r.kind == RelationshipKind::Calls)
+            .count();
+        assert_eq!(calls, MAX_AMBIGUOUS_CANDIDATES);
+        assert_eq!(report.unresolved, 0);
+    }
+
+    /// Past the cap a by-name hit is noise, not information: no edges, one
+    /// unresolved row that says how many candidates there were.
+    #[test]
+    fn candidates_over_the_cap_become_one_unresolved_reference() {
+        let n = MAX_AMBIGUOUS_CANDIDATES + 1;
+        let mut files = caller_with_candidates(n);
+        let report = resolve(&mut files, &TsconfigAliases::new());
+
+        assert!(files[0]
+            .relationships
+            .iter()
+            .all(|r| r.kind != RelationshipKind::Calls));
+        assert_eq!(report.unresolved, 1);
+        let unresolved = &files[0].unresolved;
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].target_text, "doWork");
+        assert_eq!(unresolved[0].reason, format!("ambiguous: {n} candidates"));
+        assert_eq!(unresolved[0].candidate_count, n);
+        assert_eq!(unresolved[0].confidence, Confidence::Unresolved);
+    }
+
     /// Task 4.1/4.2 (design "Baseline for re-resolution"): `resolve_with`
     /// resolves a batch file's call/import against a `ProjectBaseline`
     /// symbol from a file that is NOT in `files` at all (never re-parsed),
@@ -1339,6 +1439,68 @@ mod tests {
     /// Zero candidates anywhere in the project -> `UnresolvedReference`,
     /// never dropped and never left as a relationships-table row (spec
     /// "Zero-candidate import" principle applies equally to calls).
+    /// PERF-7 (d) equivalence pin: unresolved edges keep their target text,
+    /// kind and reason, and resolved edges keep their targets, in the file's
+    /// relationship order.
+    #[test]
+    fn unresolved_targets_keep_text_kind_and_reason() {
+        let mut files = vec![
+            analyzed("src/a.ts", "export function helper() { return 1; }\n"),
+            analyzed(
+                "src/b.ts",
+                "import { helper } from './a';\nimport { gone } from './missing';\nfunction run() { helper(); missingCall(); }\n",
+            ),
+        ];
+        resolve(&mut files, &TsconfigAliases::new());
+
+        let unresolved: Vec<(RelationshipKind, String, String)> = files[1]
+            .unresolved
+            .iter()
+            .map(|u| (u.relationship_kind, u.target_text.clone(), u.reason.clone()))
+            .collect();
+        assert_eq!(
+            unresolved,
+            vec![
+                (
+                    RelationshipKind::Imports,
+                    "./missing".to_string(),
+                    "module not found in project".to_string(),
+                ),
+                (
+                    RelationshipKind::Calls,
+                    "missingCall".to_string(),
+                    "no matching symbol in project".to_string(),
+                ),
+            ]
+        );
+        let targets: Vec<(RelationshipKind, String, String)> = files[1]
+            .relationships
+            .iter()
+            .filter_map(|r| match &r.target {
+                EdgeTarget::Global {
+                    file,
+                    qualified_name,
+                } => Some((r.kind, file.clone(), qualified_name.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            targets,
+            vec![
+                (
+                    RelationshipKind::Imports,
+                    "src/a.ts".to_string(),
+                    "src/a.ts::helper".to_string(),
+                ),
+                (
+                    RelationshipKind::Calls,
+                    "src/a.ts".to_string(),
+                    "src/a.ts::helper".to_string(),
+                ),
+            ]
+        );
+    }
+
     #[test]
     fn zero_candidate_call_becomes_unresolved_reference() {
         let mut files = vec![analyzed(

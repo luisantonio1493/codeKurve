@@ -14,11 +14,11 @@
 
 use std::collections::HashMap;
 
-use codekurve_core::error::{Error, Result};
+use codekurve_core::error::Result;
 use codekurve_core::{
     Confidence, LanguageId, Provenance, RelationshipKind, SourceSpan, SymbolKind, Visibility,
 };
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Tree};
 
 use crate::extract::{find_child, span_of};
 use crate::ir::{EdgeTarget, ExtractedRelationship, ExtractedSymbol, FileAnalysis};
@@ -42,8 +42,8 @@ impl LanguageAnalyzer for CSharpAnalyzer {
         LanguageId::CSharp
     }
 
-    fn analyze(&self, source: &str, relative_path: &str) -> Result<FileAnalysis> {
-        analyze(source, relative_path)
+    fn analyze(&self, source: &str, tree: &Tree, relative_path: &str) -> Result<FileAnalysis> {
+        analyze_tree(source, tree, relative_path)
     }
 
     fn kind_matches(&self, rel: RelationshipKind, sym: SymbolKind) -> bool {
@@ -88,19 +88,16 @@ struct CsCtx<'a> {
     pending: Vec<PendingRel>,
 }
 
+/// Test-only convenience: parses `source` the way `extract::analyze` does and
+/// runs the analyzer on that tree.
+#[cfg(test)]
 fn analyze(source: &str, relative_path: &str) -> Result<FileAnalysis> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
-        .map_err(|e| Error::Parse(e.to_string()))?;
+    let tree = crate::languages::parse_tree(LanguageId::CSharp, relative_path, source)?;
+    analyze_tree(source, &tree, relative_path)
+}
 
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| Error::Parse("parser returned no tree".to_string()))?;
-    if super::syntax_depth_exceeds(&tree, super::MAX_SYNTAX_DEPTH) {
-        return Ok(super::too_deep(LanguageId::CSharp, relative_path));
-    }
-
+/// Extracts symbols and edges from an already-parsed `tree` (PERF-4).
+fn analyze_tree(source: &str, tree: &Tree, relative_path: &str) -> Result<FileAnalysis> {
     let mut ctx = CsCtx {
         source: source.as_bytes(),
         relative_path,

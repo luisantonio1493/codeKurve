@@ -13,7 +13,9 @@
 use std::path::{Path, PathBuf};
 
 use codekurve_core::{Config, SourceSpan};
-use codekurve_store::repo::{self, StoredRelationship, StoredSymbol, StoredUnresolved};
+use codekurve_store::repo::{
+    self, PageRequest, Paged, StoredRelationship, StoredSymbol, StoredUnresolved,
+};
 use codekurve_store::{db, migrations, traverse, Connection};
 
 use crate::commands::{self, CommandError, QueryArgs};
@@ -71,6 +73,15 @@ impl Session {
                 reason: e.message,
             }),
         }
+    }
+
+    /// Make the session's connection refuse writes — for servers that never
+    /// reindex. A `NotIndexed` session has no connection and stays as is.
+    pub fn set_read_only(&mut self) -> Result<(), CommandError> {
+        if let Session::Indexed { conn, .. } = self {
+            db::set_read_only(conn).map_err(|e| CommandError::from(e.to_string()))?;
+        }
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -137,6 +148,16 @@ pub struct Page<T> {
     pub truncated: bool,
 }
 
+/// A store page as a [`Page`]: `truncated` when rows remain past this page.
+fn page_of<T>(paged: Paged<T>, offset: usize) -> Page<T> {
+    let truncated = paged.total > offset + paged.rows.len();
+    Page {
+        rows: paged.rows,
+        total: paged.total,
+        truncated,
+    }
+}
+
 /// §27.5 JSON envelope. `total` is only emitted when `Some` — every CLI call
 /// site passes `None`, so today's `--json` golden output stays
 /// byte-identical; MCP (PR5+) passes `Some(page.total)`.
@@ -160,9 +181,72 @@ pub fn envelope(
     envelope
 }
 
+/// Remove `null` fields from a JSON object row (absent = none): every null is
+/// tokens an agent pays for and learns nothing from.
+pub fn prune_nulls(mut row: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = row.as_object_mut() {
+        object.retain(|_, value| !value.is_null());
+    }
+    row
+}
+
+/// Remove `keys` from a JSON object row. Used for MCP fields that are
+/// derivable from `qualified_name` (`path` is everything before the first
+/// `::`, or all of it for a file-level symbol).
+pub fn drop_keys(mut row: serde_json::Value, keys: &[&str]) -> serde_json::Value {
+    if let Some(object) = row.as_object_mut() {
+        for key in keys {
+            object.remove(*key);
+        }
+    }
+    row
+}
+
+/// [`prune_nulls`] all the way down: object fields that are `null` are
+/// dropped at every depth (array elements are kept as they are).
+pub fn prune_nulls_deep(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, v)| (k, prune_nulls_deep(v)))
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(prune_nulls_deep).collect())
+        }
+        other => other,
+    }
+}
+
+/// The MCP response envelope (`schema_version` 2): like [`envelope`] but
+/// `warnings` is omitted when empty and `total` when `None`. The CLI's
+/// `--json` keeps the version-1 [`envelope`].
+pub fn mcp_envelope(
+    project: &str,
+    result: serde_json::Value,
+    warnings: Vec<String>,
+    truncated: bool,
+    total: Option<usize>,
+) -> serde_json::Value {
+    let mut envelope = serde_json::json!({
+        "schema_version": 2,
+        "project": project,
+        "result": prune_nulls_deep(result),
+        "truncated": truncated,
+    });
+    if !warnings.is_empty() {
+        envelope["warnings"] = serde_json::json!(warnings);
+    }
+    if let Some(total) = total {
+        envelope["total"] = serde_json::json!(total);
+    }
+    envelope
+}
+
 /// Shared body of `references`/`callers`/`callees`/`implementations`:
 /// resolve the subject symbol, run the single indexed SELECT (§5a.1), then
-/// paginate. Extracted from `commands::relationship_command`.
+/// page it in SQL. Extracted from `commands::relationship_command`.
 pub fn relationships(
     s: &Session,
     kind: RelKind,
@@ -178,16 +262,13 @@ pub fn relationships(
         RelKind::Implementations => repo::implementations,
     };
 
-    let mut rows = query_fn(conn, project_id, &symbol_id, min_confidence)
+    let window = PageRequest {
+        limit: args.limit,
+        offset: args.offset.unwrap_or(0),
+    };
+    let paged = query_fn(conn, project_id, &symbol_id, min_confidence, window)
         .map_err(|e| CommandError::from(e.to_string()))?;
-    let total = rows.len();
-    commands::paginate(&mut rows, args.limit, args.offset);
-    let truncated = total > args.offset.unwrap_or(0) + rows.len();
-    Ok(Page {
-        rows,
-        total,
-        truncated,
-    })
+    Ok(page_of(paged, window.offset))
 }
 
 /// Extracted from `commands::trace`: bounded forward BFS (§26.4) from the
@@ -229,24 +310,36 @@ pub fn impact(s: &Session, args: &QueryArgs) -> Result<traverse::BfsOutcome, Com
 /// One §28.3 row (path, line range, confidence, provenance) for a
 /// [`traverse::Reached`] node — `trace_path`/`analyze_impact`'s shared row
 /// shape (MCP-only; the CLI's `trace_json`/`reached_json` stay unchanged).
-/// One extra lookup per node (`find_symbol_by_id`) — `Reached` only carries
-/// the id, not the node's own file/span; fixture-sized result sets make this
-/// an acceptable cost rather than a second joined query.
-pub fn reached_row(s: &Session, r: &traverse::Reached) -> Result<serde_json::Value, CommandError> {
-    let (conn, _project_id) = s.indexed()?;
-    let sym = repo::find_symbol_by_id(conn, &r.symbol_id)
-        .map_err(|e| CommandError::from(e.to_string()))?;
-    Ok(serde_json::json!({
+/// `sym` is the node's own symbol row, looked up for all nodes at once by
+/// [`reached_rows`] (`Reached` only carries the id).
+fn reached_row(r: &traverse::Reached, sym: Option<&StoredSymbol>) -> serde_json::Value {
+    prune_nulls(serde_json::json!({
         "symbol_id": r.symbol_id,
+        "qualified_name": sym.map(|sym| sym.qualified_name.clone()),
         "depth": r.depth,
-        "path": sym.as_ref().map(|sym| sym.relative_path.clone()),
-        "start_line": sym.as_ref().map(|sym| sym.span.start_line),
-        "end_line": sym.as_ref().map(|sym| sym.span.end_line),
+        "start_line": sym.map(|sym| sym.span.start_line),
+        "end_line": sym.map(|sym| sym.span.end_line),
         "confidence": r.via.as_ref().map(|e| e.confidence.clone()),
         "provenance": r.via.as_ref().map(|e| e.provenance.clone()),
         "via_kind": r.via.as_ref().map(|e| e.kind.clone()),
         "predecessor": r.predecessor,
     }))
+}
+
+/// Rows for `nodes`, in order, from one batched symbol lookup (not one query
+/// per node).
+fn reached_rows(
+    s: &Session,
+    nodes: &[&traverse::Reached],
+) -> Result<Vec<serde_json::Value>, CommandError> {
+    let (conn, project_id) = s.indexed()?;
+    let ids: Vec<&str> = nodes.iter().map(|r| r.symbol_id.as_str()).collect();
+    let symbols = repo::find_symbols_by_ids(conn, project_id, &ids)
+        .map_err(|e| CommandError::from(e.to_string()))?;
+    Ok(nodes
+        .iter()
+        .map(|r| reached_row(r, symbols.get(&r.symbol_id)))
+        .collect())
 }
 
 /// Every reached node as a §28.3 row (see [`reached_row`]), for `trace_path`/
@@ -255,7 +348,32 @@ pub fn bfs_rows(
     s: &Session,
     outcome: &traverse::BfsOutcome,
 ) -> Result<Vec<serde_json::Value>, CommandError> {
-    outcome.reached.iter().map(|r| reached_row(s, r)).collect()
+    let nodes: Vec<&traverse::Reached> = outcome.reached.iter().collect();
+    reached_rows(s, &nodes)
+}
+
+/// `trace_path`'s answer: only the nodes on the found path, start first, in
+/// order — not every node the search visited on the way.
+pub fn path_rows(
+    s: &Session,
+    outcome: &traverse::BfsOutcome,
+) -> Result<Vec<serde_json::Value>, CommandError> {
+    let Some(path) = &outcome.path else {
+        return Ok(Vec::new());
+    };
+    let by_id: std::collections::HashMap<&str, &traverse::Reached> = outcome
+        .reached
+        .iter()
+        .map(|r| (r.symbol_id.as_str(), r))
+        .collect();
+    let mut ids: Vec<&str> = Vec::with_capacity(path.len() + 1);
+    if let Some(start) = outcome.reached.first() {
+        ids.push(start.symbol_id.as_str());
+    }
+    ids.extend(path.iter().map(|edge| edge.neighbor_symbol_id.as_str()));
+    let nodes: Vec<&traverse::Reached> =
+        ids.iter().filter_map(|id| by_id.get(id).copied()).collect();
+    reached_rows(s, &nodes)
 }
 
 /// One §28.3 row (path, line range, confidence, provenance) for a
@@ -321,7 +439,6 @@ pub fn relationship_row_compact(
             "source_symbol_id": r.source_symbol_id,
             "source_qualified_name": r.source_qualified_name,
             "kind": r.kind,
-            "path": r.source_relative_path,
             "start_line": r.start_line,
             "start_column": r.start_column,
             "confidence": r.confidence,
@@ -334,7 +451,6 @@ pub fn relationship_row_compact(
             "target_qualified_name": r.target_qualified_name,
             "target_external": r.target_external,
             "kind": r.kind,
-            "path": r.source_relative_path,
             "start_line": r.start_line,
             "start_column": r.start_column,
             "confidence": r.confidence,
@@ -374,16 +490,19 @@ pub fn unresolved(
         (id, name) => Some(commands::resolve_symbol(conn, project_id, id, name)?),
     };
 
-    let mut rows = repo::unresolved(conn, project_id, filter.target_text, symbol_id.as_deref())
-        .map_err(|e| CommandError::from(e.to_string()))?;
-    let total = rows.len();
-    commands::paginate(&mut rows, filter.limit, filter.offset);
-    let truncated = total > filter.offset.unwrap_or(0) + rows.len();
-    Ok(Page {
-        rows,
-        total,
-        truncated,
-    })
+    let window = PageRequest {
+        limit: filter.limit,
+        offset: filter.offset.unwrap_or(0),
+    };
+    let paged = repo::unresolved(
+        conn,
+        project_id,
+        filter.target_text,
+        symbol_id.as_deref(),
+        window,
+    )
+    .map_err(|e| CommandError::from(e.to_string()))?;
+    Ok(page_of(paged, window.offset))
 }
 
 /// One §28.3 row for a [`StoredUnresolved`] — shared by the CLI's `--json`
@@ -418,14 +537,22 @@ pub struct SearchInput<'a> {
 /// MCP client can chain a hit straight into [`get_symbol`].
 pub fn search(s: &Session, q: &SearchInput) -> Result<Page<StoredSymbol>, CommandError> {
     let (conn, project_id) = s.indexed()?;
-    let limit = q.limit.unwrap_or(s.config().queries.default_limit);
-    let rows = repo::search(conn, project_id, q.query, limit)
+    let queries = &s.config().queries;
+    let limit = q
+        .limit
+        .unwrap_or(queries.default_limit)
+        .min(queries.max_limit);
+    // Ask for one extra row: its presence is how a full page is told apart
+    // from a page that merely hit the limit.
+    let mut rows = repo::search(conn, project_id, q.query, limit.saturating_add(1))
         .map_err(|e| CommandError::from(e.to_string()))?;
+    let truncated = rows.len() > limit as usize;
+    rows.truncate(limit as usize);
     let total = rows.len();
     Ok(Page {
         rows,
         total,
-        truncated: false,
+        truncated,
     })
 }
 
@@ -437,16 +564,13 @@ pub fn routes(
     offset: Option<usize>,
 ) -> Result<Page<StoredRelationship>, CommandError> {
     let (conn, project_id) = s.indexed()?;
-    let mut rows = repo::routes(conn, project_id, route_query)
+    let window = PageRequest {
+        limit: Some(limit),
+        offset: offset.unwrap_or(0),
+    };
+    let paged = repo::routes(conn, project_id, route_query, window)
         .map_err(|e| CommandError::from(e.to_string()))?;
-    let total = rows.len();
-    commands::paginate(&mut rows, Some(limit), offset);
-    let truncated = total > offset.unwrap_or(0) + rows.len();
-    Ok(Page {
-        rows,
-        total,
-        truncated,
-    })
+    Ok(page_of(paged, window.offset))
 }
 
 /// A single resolved symbol by id — the shape `get_symbol` needs to chain
@@ -463,8 +587,8 @@ pub struct SymbolDetail {
 /// same-named hits) — needs [`repo::find_symbol_by_id`] (PR3 store
 /// addition).
 pub fn get_symbol(s: &Session, id: &str, _ctx_lines: u32) -> Result<SymbolDetail, CommandError> {
-    let (conn, _project_id) = s.indexed()?;
-    let symbol = repo::find_symbol_by_id(conn, id)
+    let (conn, project_id) = s.indexed()?;
+    let symbol = repo::find_symbol_by_id(conn, project_id, id)
         .map_err(|e| CommandError::from(e.to_string()))?
         .ok_or_else(|| CommandError::from(format!("no symbol with id {id:?}")))?;
     Ok(SymbolDetail { symbol })
@@ -478,14 +602,71 @@ pub struct SourceSlice {
     pub source: Option<String>,
     pub stale: bool,
     pub reason: Option<&'static str>,
+    /// The snippet was cut to `SliceLimits::max_snippet_bytes`.
+    pub truncated: bool,
 }
 
-/// `path` is the file on disk (project root joined with the symbol's
-/// `relative_path`); `ctx_lines` extra lines of context on each side of the
-/// symbol's line span; `index_pending` is whether the project's stored
-/// freshness metadata shows pending files (`Session::warnings()` non-empty
-/// for an `Indexed` session) — folded into `stale` even when the read itself
-/// succeeds, per confirmed decision 4.
+/// Upper bound on `ctx_lines`, whatever the caller asks for.
+pub const MAX_CTX_LINES: u32 = 200;
+
+/// Read-boundary limits for [`source_slice`] (from `[queries]`/`[index]`).
+pub struct SliceLimits {
+    pub max_file_bytes: u64,
+    pub max_snippet_bytes: usize,
+}
+
+/// Resolve `relative_path` under `root`, refusing anything that could leave
+/// it: absolute paths, `..`, symlinked files and symlinked directories.
+/// Errors are the `SourceSlice::reason` wording.
+pub fn contained_path(root: &Path, relative_path: &str) -> Result<PathBuf, &'static str> {
+    use std::path::Component;
+
+    let rel = Path::new(relative_path);
+    if rel.is_absolute() || rel.components().any(|c| !matches!(c, Component::Normal(_))) {
+        return Err("path_outside_root");
+    }
+    let joined = root.join(rel);
+    let meta = std::fs::symlink_metadata(&joined).map_err(|_| "file_missing")?;
+    if meta.file_type().is_symlink() {
+        return Err("path_outside_root");
+    }
+    let canonical_root = root.canonicalize().map_err(|_| "file_missing")?;
+    let canonical = joined.canonicalize().map_err(|_| "file_missing")?;
+    if canonical.starts_with(&canonical_root) {
+        Ok(canonical)
+    } else {
+        Err("path_outside_root")
+    }
+}
+
+fn unreadable(reason: &'static str) -> SourceSlice {
+    SourceSlice {
+        source: None,
+        stale: true,
+        reason: Some(reason),
+        truncated: false,
+    }
+}
+
+/// Cut `text` to at most `max` bytes without splitting a character.
+fn truncate_at_char_boundary(text: &mut String, max: usize) -> bool {
+    if text.len() <= max {
+        return false;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    true
+}
+
+/// `relative_path` is the symbol's file under the project `root` (resolved
+/// with [`contained_path`]); `ctx_lines` extra lines of context on each side
+/// of the symbol's line span, capped at [`MAX_CTX_LINES`]; `index_pending` is
+/// whether the project's stored freshness metadata shows pending files
+/// (`Session::warnings()` non-empty for an `Indexed` session) — folded into
+/// `stale` even when the read itself succeeds, per confirmed decision 4.
 ///
 /// `indexed_hash` is the file's content hash at index time
 /// ([`indexed_file_hash`]). If the file on disk no longer matches it, the
@@ -493,52 +674,55 @@ pub struct SourceSlice {
 /// wrong lines as if they were current, so no source is returned
 /// (`file_changed`). `None` skips the check.
 pub fn source_slice(
-    path: &Path,
+    root: &Path,
+    relative_path: &str,
     span: &SourceSpan,
     ctx_lines: u32,
     index_pending: bool,
+    limits: &SliceLimits,
     indexed_hash: Option<&str>,
 ) -> SourceSlice {
-    let Ok(bytes) = std::fs::read(path) else {
-        return SourceSlice {
-            source: None,
-            stale: true,
-            reason: Some("file_missing"),
-        };
+    let path = match contained_path(root, relative_path) {
+        Ok(path) => path,
+        Err(reason) => return unreadable(reason),
+    };
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.len() > limits.max_file_bytes => return unreadable("file_too_large"),
+        Ok(_) => {}
+        Err(_) => return unreadable("file_missing"),
+    }
+    let Ok(bytes) = std::fs::read(&path) else {
+        return unreadable("file_missing");
     };
     if indexed_hash.is_some_and(|hash| hash != repo::content_hash(&bytes)) {
         return SourceSlice {
             source: None,
             stale: true,
             reason: Some("file_changed"),
+            truncated: false,
         };
     }
     if span.end_byte > bytes.len() {
-        return SourceSlice {
-            source: None,
-            stale: true,
-            reason: Some("span_out_of_range"),
-        };
+        return unreadable("span_out_of_range");
     }
     let Ok(text) = std::str::from_utf8(&bytes) else {
-        return SourceSlice {
-            source: None,
-            stale: true,
-            reason: Some("non_utf8"),
-        };
+        return unreadable("non_utf8");
     };
+    let ctx_lines = ctx_lines.min(MAX_CTX_LINES) as usize;
     let lines: Vec<&str> = text.lines().collect();
-    let start = span.start_line.saturating_sub(ctx_lines as usize).max(1);
-    let end = (span.end_line + ctx_lines as usize).min(lines.len());
-    let snippet = if start >= 1 && start <= end && end <= lines.len() {
+    let start = span.start_line.saturating_sub(ctx_lines).max(1);
+    let end = (span.end_line + ctx_lines).min(lines.len());
+    let mut snippet = if start >= 1 && start <= end && end <= lines.len() {
         lines[(start - 1)..end].join("\n")
     } else {
         String::new()
     };
+    let truncated = truncate_at_char_boundary(&mut snippet, limits.max_snippet_bytes);
     SourceSlice {
         source: Some(snippet),
         stale: index_pending,
         reason: None,
+        truncated,
     }
 }
 
@@ -743,8 +927,10 @@ pub(crate) fn engine_checks() -> Vec<DoctorCheck> {
 /// `NotIndexed`).
 pub fn reindex(root: &Path) -> Result<crate::incremental::BatchOutcome, CommandError> {
     let mut setup = commands::setup_index(root).map_err(CommandError::from)?;
-    let force_full = commands::analyzer_version_changed(&setup.conn, &setup.project_id)
-        .map_err(CommandError::from)?;
+    let fingerprint = commands::analysis_fingerprint(&setup.config, &setup.aliases);
+    let force_full =
+        commands::analyzer_version_changed(&setup.conn, &setup.project_id, &fingerprint)
+            .map_err(CommandError::from)?;
     let changes = crate::incremental::detect(
         &setup.conn,
         &setup.project_id,
@@ -763,12 +949,8 @@ pub fn reindex(root: &Path) -> Result<crate::incremental::BatchOutcome, CommandE
     };
     let outcome = crate::incremental::apply_batch(&mut setup.conn, &ctx, &changes)
         .map_err(CommandError::from)?;
-    codekurve_store::repo::set_analyzer_version(
-        &setup.conn,
-        &setup.project_id,
-        commands::ANALYZER_VERSION,
-    )
-    .map_err(|e| CommandError::from(e.to_string()))?;
+    codekurve_store::repo::set_analyzer_version(&setup.conn, &setup.project_id, &fingerprint)
+        .map_err(|e| CommandError::from(e.to_string()))?;
     Ok(outcome)
 }
 
@@ -876,5 +1058,168 @@ mod tests {
             via_session,
             vec!["index is stale (2 pending file(s)); run `codekurve index`".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod read_only_tests {
+    use super::*;
+
+    /// QRY-9: a session made read-only (MCP with `allow_reindex` off) can
+    /// still query, and any write through its connection is refused.
+    #[test]
+    fn read_only_session_still_reads_but_refuses_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        codekurve_core::project::init(tmp.path()).unwrap();
+        std::fs::write(tmp.path().join("a.ts"), "export const a = 1;\n").unwrap();
+        commands::index(tmp.path()).unwrap();
+
+        let mut session = Session::open(tmp.path()).unwrap();
+        session.set_read_only().unwrap();
+
+        let (conn, project_id) = session.indexed().unwrap();
+        assert!(repo::pending_files(conn, project_id).is_ok());
+        let err = conn
+            .execute("UPDATE index_state SET pending_files = 9", [])
+            .unwrap_err();
+        assert!(err.to_string().contains("readonly"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod read_boundary_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn span(start_line: usize, end_line: usize, end_byte: usize) -> SourceSpan {
+        SourceSpan {
+            start_byte: 0,
+            end_byte,
+            start_line,
+            start_column: 0,
+            end_line,
+            end_column: 0,
+        }
+    }
+
+    fn limits() -> SliceLimits {
+        SliceLimits {
+            max_file_bytes: 1_000_000,
+            max_snippet_bytes: 12_000,
+        }
+    }
+
+    #[test]
+    fn reads_a_file_inside_the_root() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.ts"), "one\ntwo\n").unwrap();
+        let slice = source_slice(
+            dir.path(),
+            "a.ts",
+            &span(2, 2, 3),
+            0,
+            false,
+            &limits(),
+            None,
+        );
+        assert_eq!(slice.source.as_deref(), Some("two"));
+        assert!(!slice.truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_leaving_the_root_is_not_served() {
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), "TOP SECRET").unwrap();
+        let root = tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), root.path().join("a.ts"))
+            .unwrap();
+        let slice = source_slice(
+            root.path(),
+            "a.ts",
+            &span(1, 1, 1),
+            0,
+            false,
+            &limits(),
+            None,
+        );
+        assert_eq!(slice.source, None);
+        assert_eq!(slice.reason, Some("path_outside_root"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_directory_leaving_the_root_is_not_served() {
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.ts"), "TOP SECRET").unwrap();
+        let root = tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("dir")).unwrap();
+        let slice = source_slice(
+            root.path(),
+            "dir/secret.ts",
+            &span(1, 1, 1),
+            0,
+            false,
+            &limits(),
+            None,
+        );
+        assert_eq!(slice.source, None);
+        assert_eq!(slice.reason, Some("path_outside_root"));
+    }
+
+    #[test]
+    fn parent_and_absolute_paths_are_rejected() {
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), "TOP SECRET").unwrap();
+        let root = tempdir().unwrap();
+        let abs = outside.path().join("secret");
+        for rel in ["../secret", abs.to_str().unwrap()] {
+            let slice = source_slice(root.path(), rel, &span(1, 1, 1), 0, false, &limits(), None);
+            assert_eq!(slice.reason, Some("path_outside_root"), "{rel}");
+        }
+    }
+
+    #[test]
+    fn snippet_is_cut_on_a_char_boundary() {
+        let dir = tempdir().unwrap();
+        // 'é' is 2 bytes: a 5-byte cap would land inside the third one.
+        std::fs::write(dir.path().join("a.ts"), "ééééé\n").unwrap();
+        let limits = SliceLimits {
+            max_file_bytes: 1_000_000,
+            max_snippet_bytes: 5,
+        };
+        let slice = source_slice(dir.path(), "a.ts", &span(1, 1, 10), 0, false, &limits, None);
+        assert_eq!(slice.source.as_deref(), Some("éé"));
+        assert!(slice.truncated);
+    }
+
+    #[test]
+    fn oversized_file_is_not_read() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.ts"), "x".repeat(100)).unwrap();
+        let limits = SliceLimits {
+            max_file_bytes: 10,
+            max_snippet_bytes: 12_000,
+        };
+        let slice = source_slice(dir.path(), "a.ts", &span(1, 1, 1), 0, false, &limits, None);
+        assert_eq!(slice.reason, Some("file_too_large"));
+    }
+
+    #[test]
+    fn ctx_lines_is_capped() {
+        let dir = tempdir().unwrap();
+        let text: String = (1..=1000).map(|i| format!("l{i}\n")).collect();
+        std::fs::write(dir.path().join("a.ts"), &text).unwrap();
+        let slice = source_slice(
+            dir.path(),
+            "a.ts",
+            &span(500, 500, 1),
+            u32::MAX,
+            false,
+            &limits(),
+            None,
+        );
+        let lines = slice.source.unwrap().lines().count();
+        assert_eq!(lines, 1 + 2 * MAX_CTX_LINES as usize);
     }
 }
