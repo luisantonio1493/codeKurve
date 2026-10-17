@@ -14,9 +14,28 @@ sensitive generated artifacts (plan §29.1).
 
 Never execute analyzed code, package-manager scripts, or repository
 config; never shell out to `npm`/`dotnet`/`cargo`; canonicalize paths;
-symlinks off by default; max file size and total file count; timeouts and
-cancellation; memory budgets; **no network**; structured logs with content
-redaction; dependency audit and SBOM; release checksums (plan §29.2).
+symlinks off by default; **no network**; dependency audit and SBOM; release
+checksums (plan §29.2).
+
+Resource limits, as implemented:
+
+- **Input size**: `index.max_file_size_bytes` (default 2 MiB per file) and
+  `index.max_total_files` (hard failure when exceeded); `[ignore] patterns`
+  plus `.gitignore`.
+- **Syntax depth**: extractors recurse per syntax-tree level, and a stack
+  overflow aborts the process, so a crafted file could kill `index`,
+  `watch` or the MCP server (~20 KB of nested `[` did). Files deeper than
+  `MAX_SYNTAX_DEPTH` (10,000 levels) are skipped with a warning, and
+  extraction runs on a thread with a 256 MiB stack reservation sized for
+  that limit (`codekurve_analysis::extract::on_analysis_stack`).
+- **Graph queries**: every traversal is capped by depth, node, edge and
+  time (5 s) budgets and reports truncation.
+
+Not implemented, so not claimed: a parse timeout (tree-sitter parses of
+files within the size cap finish in seconds even when pathological, e.g.
+~2.5 s for 1M nesting levels), an explicit memory budget, and structured
+logging with content redaction (output is plain text; nothing logs file
+contents).
 
 ## No-network
 
@@ -91,5 +110,21 @@ No auto-update. Dependency and license audit runs in CI via `cargo-deny`
 and `cargo-about` (`.github/workflows/ci.yml`, `deny.toml`, `about.toml`).
 Tagged releases build a CycloneDX SBOM, a NOTICE report, and a `SHA256SUMS`
 checksum file covering every platform binary
-(`.github/workflows/release.yml`); artifacts stay inside CI workflow storage
-— no public publish step, no binary signing or notarization, in this phase.
+(`.github/workflows/release.yml`), and publish them as a public GitHub
+Release (`gh release create`, `publish` job).
+
+- **Checksum verification**: `install.sh` and `install.ps1` (and therefore
+  `codekurve update`) download `SHA256SUMS` from the same release and refuse
+  to install a binary whose SHA-256 does not match. This detects corrupted,
+  truncated, or swapped downloads. It does **not** detect a compromised
+  release, since whoever can replace the binary can replace `SHA256SUMS` too.
+- **Build provenance**: releases after v0.2.11 carry a signed SLSA provenance
+  attestation for every file in `SHA256SUMS`, tying it to this repository's
+  release workflow and tag. Verify manually with
+  `gh attestation verify <file> --repo luisantonio1493/codeKurve`; the
+  installers do not check it.
+- **CI supply chain**: every third-party GitHub Action is pinned to a commit
+  SHA; workflow tokens are read-only except the `publish` job, which gets
+  `contents`/`id-token`/`attestations` write.
+- Not in place: binary code signing or notarization, verification of the
+  install script itself (it is fetched from `main`).

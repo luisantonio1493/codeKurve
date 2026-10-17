@@ -28,7 +28,6 @@ use tree_sitter::{Node, Tree};
 
 use crate::extract::span_of;
 use crate::ir::FileAnalysis;
-use crate::languages::{note_depth_limit, MAX_AST_DEPTH};
 
 mod angular;
 
@@ -156,10 +155,10 @@ pub(crate) fn object_literal_entries(node: Node, source: &[u8]) -> Vec<MetaKey> 
                 let mut vcursor = value.walk();
                 value
                     .named_children(&mut vcursor)
-                    .filter_map(|el| entry_name(el, source, 0))
+                    .filter_map(|el| entry_name(el, source))
                     .collect()
             } else {
-                entry_name(value, source, 0).into_iter().collect()
+                entry_name(value, source).into_iter().collect()
             };
             Some(MetaKey { key, entries })
         })
@@ -188,11 +187,7 @@ fn pair_key_text(key_node: Node, source: &[u8]) -> Option<String> {
 /// arrow function, a spread, ...) resolves to `None` rather than a guess —
 /// `loadComponent`'s arrow-function shape is Angular-specific (PR4), not
 /// this generic walker's job.
-fn entry_name(node: Node, source: &[u8], depth: usize) -> Option<MetaEntry> {
-    if depth > MAX_AST_DEPTH {
-        note_depth_limit();
-        return None;
-    }
+fn entry_name(node: Node, source: &[u8]) -> Option<MetaEntry> {
     let span = span_of(node);
     let name = match node.kind() {
         "identifier" | "property_identifier" | "shorthand_property_identifier" => {
@@ -204,7 +199,7 @@ fn entry_name(node: Node, source: &[u8], depth: usize) -> Option<MetaEntry> {
         }
         "new_expression" => {
             let ctor = node.child_by_field_name("constructor")?;
-            entry_name(ctor, source, depth + 1)?.name
+            entry_name(ctor, source)?.name
         }
         "string" => node
             .utf8_text(source)
@@ -213,9 +208,9 @@ fn entry_name(node: Node, source: &[u8], depth: usize) -> Option<MetaEntry> {
             .to_string(),
         "parenthesized_expression" => {
             let inner = node.named_child(0)?;
-            entry_name(inner, source, depth + 1)?.name
+            entry_name(inner, source)?.name
         }
-        "object" => return object_provider_name(node, source, span, depth + 1),
+        "object" => return object_provider_name(node, source, span),
         _ => return None,
     };
     Some(MetaEntry { name, span })
@@ -224,16 +219,7 @@ fn entry_name(node: Node, source: &[u8], depth: usize) -> Option<MetaEntry> {
 /// The `{ provide, useClass }`/`{ provide, useExisting }`/`{ provide,
 /// useFactory }` shape (D14): the resolved name of whichever of those three
 /// keys is present, falling back to `provide`'s own resolved name.
-fn object_provider_name(
-    node: Node,
-    source: &[u8],
-    span: SourceSpan,
-    depth: usize,
-) -> Option<MetaEntry> {
-    if depth > MAX_AST_DEPTH {
-        note_depth_limit();
-        return None;
-    }
+fn object_provider_name(node: Node, source: &[u8], span: SourceSpan) -> Option<MetaEntry> {
     let mut cursor = node.walk();
     let pairs: Vec<Node> = node
         .named_children(&mut cursor)
@@ -241,21 +227,21 @@ fn object_provider_name(
         .collect();
 
     for wanted in ["useClass", "useExisting", "useFactory"] {
-        if let Some(name) = find_pair_value_name(&pairs, wanted, source, depth) {
+        if let Some(name) = find_pair_value_name(&pairs, wanted, source) {
             return Some(MetaEntry { name, span });
         }
     }
-    find_pair_value_name(&pairs, "provide", source, depth).map(|name| MetaEntry { name, span })
+    find_pair_value_name(&pairs, "provide", source).map(|name| MetaEntry { name, span })
 }
 
-fn find_pair_value_name(pairs: &[Node], key: &str, source: &[u8], depth: usize) -> Option<String> {
+fn find_pair_value_name(pairs: &[Node], key: &str, source: &[u8]) -> Option<String> {
     pairs.iter().find_map(|pair| {
         let key_node = pair.child_by_field_name("key")?;
         if pair_key_text(key_node, source)?.as_str() != key {
             return None;
         }
         let value = pair.child_by_field_name("value")?;
-        entry_name(value, source, depth + 1).map(|e| e.name)
+        entry_name(value, source).map(|e| e.name)
     })
 }
 

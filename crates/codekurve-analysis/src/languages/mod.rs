@@ -11,33 +11,55 @@
 pub mod csharp;
 pub mod typescript;
 
-/// Deepest AST level the recursive walkers descend into (SEC-7). Tree-sitter
-/// happily builds trees thousands of levels deep (`[[[[...`, `a+a+a+...`),
-/// and each walker recursion costs stack; past this cap a walker stops
-/// descending but keeps every symbol it already extracted, so the file still
-/// indexes and nothing panics. Sized against the debug-build frame cost of the
-/// TypeScript walker: 512 overflowed a 2 MB thread stack in the SEC-7 repro,
-/// 256 leaves headroom while still covering long fluent call chains.
-pub(crate) const MAX_AST_DEPTH: usize = 256;
+/// Deepest syntax tree the extractors will walk. They recurse once per tree
+/// level, and a stack overflow aborts the process (it cannot be caught), so
+/// a crafted file (10k nested `[` is ~20 KB) could kill `index`, `watch` or
+/// the MCP server. Deeper files are skipped with a diagnostic instead.
+///
+/// Real code rarely passes a few hundred levels, but long operator chains
+/// (`a + b + c + ...`, one level per term) in generated code can, so the
+/// limit is generous and extraction runs on [`crate::extract::on_analysis_stack`],
+/// which is sized for it. Measured on a 2 MiB stack: TypeScript overflowed
+/// at ~500 levels in debug and ~2,000 in release (C#: ~1,500 / ~6,000).
+pub const MAX_SYNTAX_DEPTH: usize = 10_000;
 
-thread_local! {
-    // A2: set by a walker that stops at MAX_AST_DEPTH on this thread.
-    // `extract::analyze` clears it before a file's walks and reads it after,
-    // so each file reports only its own truncation.
-    static DEPTH_LIMIT_HIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+/// Whether `tree` is more than `limit` levels deep. Iterative (a cursor, no
+/// recursion), so it is safe on any stack however deep the tree is.
+pub(crate) fn syntax_depth_exceeds(tree: &Tree, limit: usize) -> bool {
+    let mut cursor = tree.walk();
+    let mut depth = 0usize;
+    loop {
+        if depth > limit {
+            return true;
+        }
+        if cursor.goto_first_child() {
+            depth += 1;
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return false;
+            }
+            depth -= 1;
+        }
+    }
 }
 
-/// Records that a walker stopped at [`MAX_AST_DEPTH`] (A2). The walker keeps
-/// what it already extracted and returns as before; this only lets the caller
-/// report the file as truncated.
-pub(crate) fn note_depth_limit() {
-    DEPTH_LIMIT_HIT.with(|hit| hit.set(true));
-}
-
-/// Whether a walker stopped at the depth limit since the last call; clears the
-/// record (A2).
-pub(crate) fn take_depth_limit_hit() -> bool {
-    DEPTH_LIMIT_HIT.with(|hit| hit.replace(false))
+/// The empty analysis an analyzer returns for a file past
+/// [`MAX_SYNTAX_DEPTH`]: `Ok`, not `Err`, because an `Err` fails the whole
+/// incremental batch and would fail it again on every later batch.
+pub(crate) fn too_deep(language: LanguageId, relative_path: &str) -> FileAnalysis {
+    FileAnalysis {
+        file: relative_path.to_string(),
+        language,
+        symbols: Vec::new(),
+        relationships: Vec::new(),
+        unresolved: Vec::new(),
+        diagnostics: vec![format!("{TOO_DEEP_DIAGNOSTIC} {MAX_SYNTAX_DEPTH} levels")],
+    }
 }
 
 /// Parse budget for one file (SEC-7). A parse that exceeds it yields no tree,
@@ -125,7 +147,9 @@ use codekurve_core::{
 };
 
 use crate::extract::NO_SAME_FILE_MATCH_REASON;
-use crate::ir::{EdgeTarget, ExtractedRelationship, ExtractedSymbol, FileAnalysis};
+use crate::ir::{
+    EdgeTarget, ExtractedRelationship, ExtractedSymbol, FileAnalysis, TOO_DEEP_DIAGNOSTIC,
+};
 
 /// What every language analyzer must provide to plug into `extract::analyze`
 /// dispatch and `resolve.rs`'s kind-compatibility check. Three methods,
@@ -515,5 +539,40 @@ mod tests {
             analyzer_for(LanguageId::TypeScript),
         );
         assert_eq!(RESOLVE_CANDIDATE_CHECKS.with(|c| c.get()), 12);
+    }
+
+    fn reference_depth(node: tree_sitter::Node) -> usize {
+        let mut cursor = node.walk();
+        node.children(&mut cursor)
+            .map(|child| 1 + reference_depth(child))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// `syntax_depth_exceeds(tree, limit)` is true exactly when the tree is
+    /// deeper than `limit`, matching a straightforward recursive depth on
+    /// trees small enough for recursion to be safe.
+    #[test]
+    fn syntax_depth_exceeds_matches_recursive_depth_at_the_boundary() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .unwrap();
+        for source in [
+            "",
+            "let a = 1;",
+            "function f() { if (a) { return [[1, [2]], g(h(3))]; } }",
+            &format!("const x = {}{};", "[".repeat(60), "]".repeat(60)),
+        ] {
+            let tree = parser.parse(source, None).unwrap();
+            let depth = reference_depth(tree.root_node());
+            assert!(!syntax_depth_exceeds(&tree, depth), "{source:?} at {depth}");
+            if depth > 0 {
+                assert!(
+                    syntax_depth_exceeds(&tree, depth - 1),
+                    "{source:?} at {depth}"
+                );
+            }
+        }
     }
 }

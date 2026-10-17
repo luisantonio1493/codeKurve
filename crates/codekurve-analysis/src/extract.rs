@@ -10,43 +10,36 @@ use tree_sitter::Node;
 use codekurve_core::SourceSpan;
 
 use crate::ir::FileAnalysis;
-use crate::languages::{analyzer_for, parse_tree, take_depth_limit_hit};
-
-/// The AST depth a walk stops at (A2): symbols nested deeper are not extracted.
-pub const AST_DEPTH_LIMIT: usize = crate::languages::MAX_AST_DEPTH;
-
-/// Diagnostic recorded on a file whose walk stopped at [`AST_DEPTH_LIMIT`]
-/// (A2). The file still indexes; only the symbols below that depth are missing.
-const DEPTH_LIMIT_DIAGNOSTIC: &str =
-    "ast depth limit reached; symbols nested deeper were not extracted";
-
-/// Whether a walk of `analysis`'s file stopped at [`AST_DEPTH_LIMIT`] (A2).
-pub fn truncated_at_depth_limit(analysis: &FileAnalysis) -> bool {
-    analysis
-        .diagnostics
-        .iter()
-        .any(|d| d == DEPTH_LIMIT_DIAGNOSTIC)
-}
+use crate::languages::{
+    analyzer_for, parse_tree, syntax_depth_exceeds, too_deep, MAX_SYNTAX_DEPTH,
+};
 
 /// Parse `source` for the given language and extract its symbols plus
 /// intra-file relationships into a per-file `FileAnalysis`. Keeps its public
 /// signature; every existing caller (`commands.rs`, `incremental.rs`) is
 /// untouched by the seam refactor (design "Technical Approach").
 ///
+/// D3: `frameworks::recognize` runs here, immediately after the per-language
+/// analyzer returns — this is the single entry point every caller already
+/// routes through, and the only place holding both the source text and the
+/// finished per-file symbol list.
+///
 /// PERF-4: the file is parsed exactly once here. The same tree feeds the
-/// language analyzer and then `frameworks::recognize` (D3: the framework pass
-/// runs immediately after the analyzer, on the source it was given).
+/// language analyzer and then `frameworks::recognize`, so no later stage
+/// re-parses the file.
+///
+/// A file deeper than [`MAX_SYNTAX_DEPTH`] comes back empty with a diagnostic
+/// ([`FileAnalysis::skipped_too_deep`]) and skips framework recognition.
+/// Below that limit extraction still recurses per tree level: run it on
+/// [`on_analysis_stack`].
 pub fn analyze(source: &str, language: LanguageId, relative_path: &str) -> Result<FileAnalysis> {
     let tree = parse_tree(language, relative_path, source)?;
-    // A2: only walks of this file count toward its truncation record.
-    take_depth_limit_hit();
+    if syntax_depth_exceeds(&tree, MAX_SYNTAX_DEPTH) {
+        return Ok(too_deep(language, relative_path));
+    }
     let mut analysis = analyzer_for(language).analyze(source, &tree, relative_path)?;
     crate::frameworks::recognize(source, &tree, language, &mut analysis);
-    if take_depth_limit_hit() {
-        analysis
-            .diagnostics
-            .push(DEPTH_LIMIT_DIAGNOSTIC.to_string());
-    }
+    disambiguate_duplicate_keys(&mut analysis);
     Ok(analysis)
 }
 
@@ -55,6 +48,75 @@ pub fn analyze(source: &str, language: LanguageId, relative_path: &str) -> Resul
 /// same-file-miss `Exports` edge apart from a module-specifier re-export
 /// without re-parsing.
 pub(crate) const NO_SAME_FILE_MATCH_REASON: &str = "no matching same-file symbol";
+
+/// First ordinal handed to a duplicate by [`disambiguate_duplicate_keys`];
+/// far above any C# `partial` fragment ordinal, so the two never meet.
+const DUPLICATE_ORDINAL_BASE: u32 = 1 << 20;
+
+/// Makes every symbol's storage key unique within its file. The key hashes
+/// (kind, qualified name, signature, `partial_ordinal`), and ordinary code
+/// produces exact duplicates of that tuple: TypeScript interfaces of one
+/// name in different `namespace`s or merged declarations, same-named classes
+/// in two test callbacks, C# explicit interface implementations
+/// (`Descriptor` and `IMessage.Descriptor` in generated gRPC code), a
+/// generic and non-generic interface of one name. A single duplicate hit the
+/// `UNIQUE(project_id, symbol_key)` constraint and failed the whole index:
+/// v0.2.11 could not index `dotnet/eShop`, `zod` or `effect`.
+///
+/// The first occurrence keeps its key (existing indexes keep their ids);
+/// each later one gets the next free ordinal from
+/// [`DUPLICATE_ORDINAL_BASE`], in source order. This only keeps the index
+/// writable: the qualified names stay ambiguous until the analyzers qualify
+/// them (namespace, generic arity, explicit interface).
+fn disambiguate_duplicate_keys(analysis: &mut FileAnalysis) {
+    let mut seen = std::collections::HashSet::new();
+    let mut next = DUPLICATE_ORDINAL_BASE;
+    for symbol in &mut analysis.symbols {
+        let key = |ordinal: Option<u32>| {
+            (
+                symbol.kind,
+                symbol.qualified_name.clone(),
+                symbol.signature_fingerprint.clone(),
+                ordinal,
+            )
+        };
+        if seen.insert(key(symbol.partial_ordinal)) {
+            continue;
+        }
+        loop {
+            let candidate = Some(next);
+            next += 1;
+            if seen.insert(key(candidate)) {
+                symbol.partial_ordinal = candidate;
+                break;
+            }
+        }
+    }
+}
+
+/// Stack reserved for [`on_analysis_stack`]. A reservation, not an
+/// allocation: pages are only committed as recursion actually touches them.
+/// Sized so a tree right at [`crate::languages::MAX_SYNTAX_DEPTH`] fits with
+/// margin even in a debug build (~4 KiB per level measured for TypeScript).
+pub const ANALYSIS_STACK_BYTES: usize = 256 << 20;
+
+/// Runs `work` (a batch of [`analyze`] calls and whatever follows them) on a
+/// dedicated thread with an [`ANALYSIS_STACK_BYTES`] stack, and returns its
+/// result. Callers' own stacks vary: 8 MiB on the main thread, 2 MiB on
+/// tokio's blocking pool where the MCP server reindexes, which a few hundred
+/// nested levels already overflowed. One thread per batch, not per file.
+/// A panic in `work` is re-raised on the caller's thread.
+pub fn on_analysis_stack<T: Send>(work: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("codekurve-analysis".to_string())
+            .stack_size(ANALYSIS_STACK_BYTES)
+            .spawn_scoped(scope, work)
+            .expect("spawn the analysis thread")
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
 
 // ponytail: not `Iterator::find` (clippy's own suggestion) — tree-sitter's
 // cursor-borrowed `Node` items don't outlive the function that way here.

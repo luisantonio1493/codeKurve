@@ -696,9 +696,10 @@ pub struct IndexStatus {
     pub last_verified_at: Option<String>,
 }
 
-/// Just the pending-file count: every MCP call asks for it to decide on a
-/// staleness warning, and [`index_status`] would run four `COUNT(*)` scans
-/// to answer that.
+/// Just the stored pending-file count (`0` when `index_state` has no row).
+/// Every MCP tool call reads it for its stale warning, so it must stay a
+/// single-row lookup; [`index_status`]'s full-table counts cost tens of
+/// milliseconds per call on a 10k-file project.
 pub fn pending_files(conn: &Connection, project_id: &str) -> Result<i64> {
     Ok(conn
         .query_row(
@@ -1871,6 +1872,26 @@ pub fn dependents_by_unresolved_module(
     found.sort();
     found.dedup();
     Ok(found)
+}
+
+/// The `content_hash` a file had when it was last indexed; `None` if the
+/// file is not indexed or no hash was stored. Readers of live source compare
+/// it with [`content_hash`] of the current bytes: a mismatch means the stored
+/// spans no longer describe the file, even though the file may still be
+/// long enough to slice.
+pub fn indexed_content_hash(
+    conn: &Connection,
+    project_id: &str,
+    relative_path: &str,
+) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT content_hash FROM files WHERE project_id = ?1 AND relative_path = ?2",
+            params![project_id, relative_path],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
 }
 
 /// Stable BLAKE3 content hash of the config text.
@@ -4135,5 +4156,113 @@ mod tests {
             remaining_calls, 1,
             "the edge survives the round-trip intact"
         );
+    }
+
+    /// A 300-function call chain: enough rows that the planner's choice
+    /// reflects statistics rather than "any index will do".
+    fn seed_call_chain() -> (Connection, String) {
+        let mut conn = db::open_in_memory().unwrap();
+        let pid = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        let files = vec![FileInput {
+            relative_path: "src/member.ts".to_string(),
+            language: "typescript".to_string(),
+            content_hash: "test-hash".to_string(),
+            modified_ns: 0,
+            size_bytes: 42,
+            symbols: (0..300)
+                .map(|n| symbol(&format!("f{n}"), SymbolKind::Function, n * 10))
+                .collect(),
+        }];
+        reindex(&mut conn, &pid, &files, &[], &[]).unwrap();
+        let file_id: String = conn
+            .query_row("SELECT id FROM files LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let id = |n: usize| -> String {
+            conn.query_row(
+                "SELECT id FROM symbols WHERE name = ?1",
+                params![format!("f{n}")],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let relationships: Vec<_> = (1..300)
+            .map(|n| RelationshipInput {
+                source_symbol_id: id(n),
+                target_symbol_id: Some(id(n - 1)),
+                target_external: None,
+                kind: RelationshipKind::Calls,
+                provenance: Provenance::Extracted,
+                confidence: Confidence::Exact,
+                source_file_id: file_id.clone(),
+                start_line: Some(n as u32),
+                start_column: Some(0),
+                reason: None,
+            })
+            .collect();
+        reindex(&mut conn, &pid, &files, &relationships, &[]).unwrap();
+        (conn, pid)
+    }
+
+    fn query_plan(conn: &Connection, sql: &str) -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(3)).unwrap();
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n")
+    }
+
+    /// Without statistics SQLite takes `(project_id, kind)` for a
+    /// by-target relationship lookup (every edge of that kind in the project)
+    /// and walks every project symbol for FTS search; with them it seeks by
+    /// target / by FTS hit. The queries mirror `query_relationships` and
+    /// `search` (the `ORDER BY s.name` is what lures the unanalyzed planner
+    /// onto `(project_id, name)`).
+    #[test]
+    fn planner_stats_make_lookups_use_selective_indexes() {
+        let (conn, pid) = seed_call_chain();
+        let callers_sql = format!(
+            "SELECT r.source_symbol_id FROM relationships r
+             WHERE r.project_id = '{pid}' AND r.target_symbol_id = 'x' AND r.kind IN ('calls')"
+        );
+        let search_sql = format!(
+            "SELECT s.id FROM symbols s JOIN files f ON f.id = s.file_id
+             WHERE s.project_id = '{pid}'
+               AND s.id IN (SELECT symbol_id FROM symbols_fts WHERE symbols_fts MATCH '\"f7\"')
+             ORDER BY s.name LIMIT 50"
+        );
+
+        assert!(query_plan(&conn, &callers_sql).contains("idx_relationships_project_kind"));
+        assert!(query_plan(&conn, &search_sql).contains("idx_symbols_project_name"));
+
+        db::refresh_planner_stats(&conn).unwrap();
+
+        let callers_plan = query_plan(&conn, &callers_sql);
+        assert!(
+            callers_plan.contains("idx_relationships_target_kind"),
+            "{callers_plan}"
+        );
+        let search_plan = query_plan(&conn, &search_sql);
+        assert!(
+            search_plan.contains("sqlite_autoindex_symbols_1 (id=?)"),
+            "{search_plan}"
+        );
+
+        // Second call takes the `PRAGMA optimize` branch and keeps the plan.
+        db::refresh_planner_stats(&conn).unwrap();
+        assert!(query_plan(&conn, &callers_sql).contains("idx_relationships_target_kind"));
+    }
+
+    #[test]
+    fn pending_files_reads_index_state_and_defaults_to_zero() {
+        let conn = db::open_in_memory().unwrap();
+        let pid = upsert_project(&conn, "demo", "/tmp/demo", "hash").unwrap();
+        assert_eq!(pending_files(&conn, &pid).unwrap(), 0);
+
+        let mut conn = conn;
+        let tx = conn.transaction().unwrap();
+        set_pending_files(&tx, &pid, &now_ts(), 3).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(pending_files(&conn, &pid).unwrap(), 3);
+        assert_eq!(index_status(&conn, &pid).unwrap().pending_files, 3);
     }
 }

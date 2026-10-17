@@ -19,7 +19,6 @@ use crate::extract::span_of;
 use crate::ir::{
     EdgeTarget, ExtractedRelationship, ExtractedSymbol, FileAnalysis, UnresolvedReference,
 };
-use crate::languages::{note_depth_limit, MAX_AST_DEPTH};
 
 use super::{object_literal_entries, AttrPattern};
 
@@ -45,14 +44,10 @@ pub(crate) fn recognize(
     analysis: &mut FileAnalysis,
 ) {
     let bytes = source.as_bytes();
-    walk(tree.root_node(), relative_path, bytes, analysis, 0);
+    walk(tree.root_node(), relative_path, bytes, analysis);
 }
 
-fn walk(node: Node, relative_path: &str, source: &[u8], analysis: &mut FileAnalysis, depth: usize) {
-    if depth > MAX_AST_DEPTH {
-        note_depth_limit();
-        return;
-    }
+fn walk(node: Node, relative_path: &str, source: &[u8], analysis: &mut FileAnalysis) {
     match node.kind() {
         "class_declaration" | "abstract_class_declaration" => {
             process_class(node, relative_path, source, analysis);
@@ -64,7 +59,7 @@ fn walk(node: Node, relative_path: &str, source: &[u8], analysis: &mut FileAnaly
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk(child, relative_path, source, analysis, depth + 1);
+        walk(child, relative_path, source, analysis);
     }
 }
 
@@ -194,7 +189,7 @@ fn process_di(class_node: Node, class_key: &str, source: &[u8], analysis: &mut F
     // confined to this class body, not the shared `walk` above.
     let mut icursor = body.walk();
     for child in body.named_children(&mut icursor) {
-        collect_inject_calls(child, class_key, source, analysis, 0);
+        collect_inject_calls(child, class_key, source, analysis);
     }
 }
 
@@ -323,17 +318,7 @@ fn inject_call_token(decorator: Node, source: &[u8]) -> Option<String> {
     }
 }
 
-fn collect_inject_calls(
-    node: Node,
-    class_key: &str,
-    source: &[u8],
-    analysis: &mut FileAnalysis,
-    depth: usize,
-) {
-    if depth > MAX_AST_DEPTH {
-        note_depth_limit();
-        return;
-    }
+fn collect_inject_calls(node: Node, class_key: &str, source: &[u8], analysis: &mut FileAnalysis) {
     if node.kind() == "call_expression" {
         if let Some(func) = node.child_by_field_name("function") {
             if func.kind() == "identifier" && func.utf8_text(source) == Ok("inject") {
@@ -369,7 +354,7 @@ fn collect_inject_calls(
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_inject_calls(child, class_key, source, analysis, depth + 1);
+        collect_inject_calls(child, class_key, source, analysis);
     }
 }
 
@@ -530,7 +515,7 @@ fn process_routes_declaration(
         let mut vcursor = value.walk();
         for element in value.named_children(&mut vcursor) {
             if element.kind() == "object" {
-                process_route_object(element, &var_key, "", source, analysis, 0);
+                process_route_object(element, &var_key, "", source, analysis);
             }
         }
     }
@@ -570,12 +555,7 @@ fn process_route_object(
     prefix: &str,
     source: &[u8],
     analysis: &mut FileAnalysis,
-    depth: usize,
 ) {
-    if depth > MAX_AST_DEPTH {
-        note_depth_limit();
-        return;
-    }
     let keys = object_literal_entries(node, source);
     let path_segment = keys
         .iter()
@@ -674,14 +654,7 @@ fn process_route_object(
                     .named_children(&mut ccursor)
                     .filter(|c| c.kind() == "object")
                 {
-                    process_route_object(
-                        child_route,
-                        source_key,
-                        &full_path,
-                        source,
-                        analysis,
-                        depth + 1,
-                    );
+                    process_route_object(child_route, source_key, &full_path, source, analysis);
                 }
             }
             _ => {}
@@ -707,7 +680,7 @@ fn last_member_property(node: Node, source: &[u8]) -> Option<String> {
     // and `m.XComponent`); the *last* one written is the evidence (design
     // Q5's `loadComponent` rule), not the outermost/first one a preorder
     // walk would reach.
-    let last = all_member_expressions(node, 0)
+    let last = all_member_expressions(node)
         .into_iter()
         .max_by_key(|m| m.start_byte())?;
     last.child_by_field_name("property")
@@ -715,18 +688,14 @@ fn last_member_property(node: Node, source: &[u8]) -> Option<String> {
         .map(str::to_string)
 }
 
-fn all_member_expressions(node: Node, depth: usize) -> Vec<Node> {
+fn all_member_expressions(node: Node) -> Vec<Node> {
     let mut found = Vec::new();
-    if depth > MAX_AST_DEPTH {
-        note_depth_limit();
-        return found;
-    }
     if node.kind() == "member_expression" {
         found.push(node);
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        found.extend(all_member_expressions(child, depth + 1));
+        found.extend(all_member_expressions(child));
     }
     found
 }
@@ -744,24 +713,18 @@ fn qualified_name(relative_path: &str, name: &str) -> String {
 /// `languages/`) and this one only ever asks about the closed Angular list.
 fn decorator_name(node: Node, source: &[u8]) -> Option<String> {
     let inner = node.named_child(0)?;
-    decorator_expr_name(inner, source, 0)
+    decorator_expr_name(inner, source)
 }
 
-fn decorator_expr_name(node: Node, source: &[u8], depth: usize) -> Option<String> {
-    if depth > MAX_AST_DEPTH {
-        note_depth_limit();
-        return None;
-    }
+fn decorator_expr_name(node: Node, source: &[u8]) -> Option<String> {
     match node.kind() {
         "identifier" => node.utf8_text(source).ok().map(str::to_string),
-        "call_expression" => {
-            decorator_expr_name(node.child_by_field_name("function")?, source, depth + 1)
-        }
+        "call_expression" => decorator_expr_name(node.child_by_field_name("function")?, source),
         "member_expression" => node
             .child_by_field_name("property")
             .and_then(|p| p.utf8_text(source).ok())
             .map(str::to_string),
-        "parenthesized_expression" => decorator_expr_name(node.named_child(0)?, source, depth + 1),
+        "parenthesized_expression" => decorator_expr_name(node.named_child(0)?, source),
         _ => node.utf8_text(source).ok().map(str::to_string),
     }
 }

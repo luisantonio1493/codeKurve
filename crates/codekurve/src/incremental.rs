@@ -14,8 +14,8 @@ use codekurve_analysis::extract;
 use codekurve_analysis::ir::{EdgeTarget, FileAnalysis};
 use codekurve_analysis::resolve::{self, TsconfigAliases};
 use codekurve_core::{LanguageId, SymbolKind};
-use codekurve_store::repo;
 use codekurve_store::Connection;
+use codekurve_store::{db, repo};
 use rayon::prelude::*;
 
 use crate::commands::{self, FileMeta};
@@ -133,14 +133,7 @@ fn analyze_read(
 ) -> Result<(FileMeta, FileAnalysis), String> {
     let analysis =
         extract::analyze(&read.text, language, relative_path).map_err(|e| e.to_string())?;
-    // A2: the file is still indexed, but symbols nested past the depth limit
-    // were not extracted; say so on every analysis run (nothing is persisted).
-    if extract::truncated_at_depth_limit(&analysis) {
-        eprintln!(
-            "warning: {relative_path} stopped at the AST depth limit ({}); symbols nested deeper are not indexed",
-            extract::AST_DEPTH_LIMIT
-        );
-    }
+    warn_if_skipped(&analysis);
     let meta = FileMeta {
         language,
         size_bytes: read.bytes.len() as u64,
@@ -180,6 +173,40 @@ fn read_stable_with(path: &Path, mut between: impl FnMut()) -> Result<StableRead
     ))
 }
 
+/// Why [`detect`] failed.
+#[derive(Debug)]
+pub enum DetectError {
+    /// Discovery rejected the project as configured: more files than
+    /// `index.max_total_files`, or an invalid `[ignore] patterns` entry.
+    /// Retrying cannot help until the project or its config changes, so the
+    /// watcher stops on it instead of failing again on every batch.
+    Discovery(codekurve_core::Error),
+    /// Anything else (reading stored state, stat-ing a file): may be
+    /// transient.
+    Other(String),
+}
+
+impl std::fmt::Display for DetectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DetectError::Discovery(e) => e.fmt(f),
+            DetectError::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<DetectError> for String {
+    fn from(e: DetectError) -> Self {
+        e.to_string()
+    }
+}
+
+impl From<DetectError> for commands::CommandError {
+    fn from(e: DetectError) -> Self {
+        e.to_string().into()
+    }
+}
+
 pub fn detect(
     conn: &Connection,
     project_id: &str,
@@ -187,7 +214,7 @@ pub fn detect(
     opts: &DiscoveryOptions,
     filter: Option<&HashSet<String>>,
     force_full: bool,
-) -> Result<Vec<FileChange>, String> {
+) -> Result<Vec<FileChange>, DetectError> {
     detect_with_outside_root(conn, project_id, root, opts, filter, force_full)
         .map(|(changes, _)| changes)
 }
@@ -201,16 +228,17 @@ pub fn detect_with_outside_root(
     opts: &DiscoveryOptions,
     filter: Option<&HashSet<String>>,
     force_full: bool,
-) -> Result<(Vec<FileChange>, Vec<String>), String> {
+) -> Result<(Vec<FileChange>, Vec<String>), DetectError> {
     // A batch names the entries it may touch, so only those are walked (PERF-3);
     // a sweep walks the whole project.
     let report = match filter {
         Some(paths) => discovery::discover_report_for(root, opts, paths),
         None => discovery::discover_report(root, opts),
     }
-    .map_err(|e| e.to_string())?;
+    .map_err(DetectError::Discovery)?;
     let discovered = report.files.clone();
-    let snapshot = repo::file_snapshot(conn, project_id).map_err(|e| e.to_string())?;
+    let snapshot =
+        repo::file_snapshot(conn, project_id).map_err(|e| DetectError::Other(e.to_string()))?;
     // `force_full` re-reads everything (every file looks new) but deletions
     // are still judged against what is really stored.
     let no_prior = HashMap::new();
@@ -236,7 +264,7 @@ pub fn detect_with_outside_root(
             continue;
         };
         let size = meta.len();
-        let mtime = mtime_ns(&meta)?;
+        let mtime = mtime_ns(&meta).map_err(DetectError::Other)?;
         if size == prior.size_bytes && Some(mtime) == prior.modified_ns {
             continue; // fast path: unchanged
         }
@@ -277,6 +305,30 @@ pub fn detect_with_outside_root(
         changes.push(FileChange::Deleted {
             relative_path: path.clone(),
         });
+    }
+
+    // A restricted walk counts only the entries it lists, so the
+    // `max_total_files` cap is checked here against the stored file count
+    // (what a full walk would have counted). A sweep enforces it in discovery.
+    // Only a batch that grows the project past the cap fails here; a project
+    // already over it keeps getting precise batches (PERF-3).
+    if filter.is_some() && opts.max_total_files > 0 && snapshot.len() <= opts.max_total_files {
+        let created = changes
+            .iter()
+            .filter(|c| matches!(c, FileChange::Created(_)))
+            .count();
+        let deleted = changes
+            .iter()
+            .filter(|c| matches!(c, FileChange::Deleted { .. }))
+            .count();
+        let projected = (snapshot.len() + created).saturating_sub(deleted);
+        if projected > opts.max_total_files {
+            return Err(DetectError::Discovery(
+                codekurve_core::Error::TooManyFiles {
+                    limit: opts.max_total_files,
+                },
+            ));
+        }
     }
 
     Ok((changes, report.outside_root))
@@ -379,9 +431,41 @@ pub fn apply_batch(
     // take that back.
     record_unverified(conn, ctx.project_id, unverified)?;
     outcome.unverified = unverified;
-    // Refresh planner statistics after real writes; a hint, never a failure.
-    let _ = codekurve_store::db::optimize(conn);
+    refresh_planner_stats(conn);
     Ok(outcome)
+}
+
+/// Stderr, not stdout: this also runs inside the MCP server, whose stdout
+/// carries only JSON-RPC.
+fn warn_if_skipped(analysis: &FileAnalysis) {
+    if analysis.skipped_too_deep() {
+        eprintln!(
+            "warning: {} not indexed: {}",
+            analysis.file,
+            analysis.diagnostics.join("; ")
+        );
+    }
+}
+
+/// [`db::refresh_planner_stats`], best effort: statistics only steer query
+/// plans, so a failure here must not turn an index write that already
+/// committed into a reported error.
+pub(crate) fn refresh_planner_stats(conn: &Connection) {
+    let _ = db::refresh_planner_stats(conn);
+}
+
+/// Rayon pool for the batch parses. Its workers carry the analysis stack
+/// ([`extract::ANALYSIS_STACK_BYTES`]): a default worker stack overflows on the
+/// deep trees [`extract::analyze`] still walks recursively.
+pub(crate) fn analysis_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("codekurve-analysis-{i}"))
+            .stack_size(extract::ANALYSIS_STACK_BYTES)
+            .build()
+            .expect("build the analysis thread pool")
+    })
 }
 
 /// Publish the verification state after a pass: with unverifiable files the
@@ -468,11 +552,13 @@ fn apply_via_full_reindex(
     // Read and analyze on the rayon pool; `collect` keeps discovery order, so
     // the fold below builds the same `analyses` and `file_meta` a sequential
     // loop would. Only the DB writes that follow stay single-threaded.
-    let parsed: Vec<Result<(FileMeta, FileAnalysis), String>> = report
-        .files
-        .par_iter()
-        .map(|file| read_and_analyze(&file.absolute_path, &file.relative_path, file.language))
-        .collect();
+    let parsed: Vec<Result<(FileMeta, FileAnalysis), String>> = analysis_pool().install(|| {
+        report
+            .files
+            .par_iter()
+            .map(|file| read_and_analyze(&file.absolute_path, &file.relative_path, file.language))
+            .collect()
+    });
     let mut analyses: Vec<FileAnalysis> = Vec::new();
     let mut file_meta: Vec<FileMeta> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
@@ -555,13 +641,15 @@ fn apply_incremental_changes(
     // Parse B — a parse error here fails the whole batch (spec "A Failed
     // Batch Preserves the Previous Index": "parse error treated as batch
     // failure"), unlike the fallback path's lenient skip-on-error.
-    let parsed: Vec<Result<(FileMeta, FileAnalysis), String>> = created_or_modified
-        .par_iter()
-        .map(|(file, read)| match read {
-            Some(read) => analyze_read(read, &file.relative_path, file.language),
-            None => read_and_analyze(&file.absolute_path, &file.relative_path, file.language),
-        })
-        .collect();
+    let parsed: Vec<Result<(FileMeta, FileAnalysis), String>> = analysis_pool().install(|| {
+        created_or_modified
+            .par_iter()
+            .map(|(file, read)| match read {
+                Some(read) => analyze_read(read, &file.relative_path, file.language),
+                None => read_and_analyze(&file.absolute_path, &file.relative_path, file.language),
+            })
+            .collect()
+    });
     let mut analyses: Vec<FileAnalysis> = Vec::new();
     let mut file_meta: Vec<FileMeta> = Vec::new();
     // Discovery order: the first failure in that order is the one reported.
@@ -644,17 +732,19 @@ fn apply_incremental_changes(
     let root = ctx.root;
     // A dependent that vanished since it was last indexed (rare race), or no
     // longer parses, is skipped this cycle and reconsidered on the next sweep.
-    let d_parsed: Vec<(FileMeta, FileAnalysis)> = d_paths
-        .par_iter()
-        .filter_map(|path| {
-            let ext = Path::new(path)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
-            let language = LanguageId::from_extension(ext)?;
-            read_and_analyze(&root.join(path), path, language).ok()
-        })
-        .collect();
+    let d_parsed: Vec<(FileMeta, FileAnalysis)> = analysis_pool().install(|| {
+        d_paths
+            .par_iter()
+            .filter_map(|path| {
+                let ext = Path::new(path)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
+                let language = LanguageId::from_extension(ext)?;
+                read_and_analyze(&root.join(path), path, language).ok()
+            })
+            .collect()
+    });
     for (meta, analysis) in d_parsed {
         file_meta.push(meta);
         analyses.push(analysis);
@@ -761,8 +851,8 @@ mod tests {
             follow_symlinks: false,
             max_file_size_bytes: 2_097_152,
             max_total_files: 0,
+            exclude_patterns: Vec::new(),
             languages: vec![LanguageId::TypeScript, LanguageId::CSharp],
-            ignore_patterns: Vec::new(),
         }
     }
 

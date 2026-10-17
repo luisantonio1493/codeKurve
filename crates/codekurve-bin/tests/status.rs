@@ -92,3 +92,36 @@ fn status_and_query_warn_when_pending_changes_exist() {
             "warning: index is stale (3 pending file(s)); run `codekurve index`",
         ));
 }
+
+/// `codekurve symbol` after an edit that keeps the file long enough to slice:
+/// the snippet must say stale, not show shifted text as live.
+#[test]
+fn symbol_snippet_is_stale_when_file_changed_since_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/greet.ts"), SOURCE).unwrap();
+
+    ck().arg("init").arg(root).assert().success();
+    ck().arg("index").arg("--root").arg(root).assert().success();
+    ck().arg("symbol")
+        .arg("greet")
+        .arg("--root")
+        .arg(root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("(live)"));
+
+    std::fs::write(root.join("src/greet.ts"), format!("// header\n{SOURCE}")).unwrap();
+
+    ck().arg("symbol")
+        .arg("greet")
+        .arg("--root")
+        .arg(root)
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("(stale: file changed since index")
+                .and(predicate::str::contains("(live)").not()),
+        );
+}

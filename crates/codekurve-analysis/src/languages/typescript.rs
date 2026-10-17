@@ -13,8 +13,7 @@ use tree_sitter::{Node, Tree};
 use crate::extract::{find_child, span_of};
 use crate::ir::{EdgeTarget, ExtractedRelationship, ExtractedSymbol, FileAnalysis};
 use crate::languages::{
-    analyzer_for, note_depth_limit, push_unresolved_edge, resolve_pending, LanguageAnalyzer,
-    PendingRel, MAX_AST_DEPTH,
+    analyzer_for, push_unresolved_edge, resolve_pending, LanguageAnalyzer, PendingRel,
 };
 
 /// One-field struct so a single implementation serves both TypeScript and
@@ -100,7 +99,7 @@ fn analyze_tree(
         out_rels: Vec::new(),
         pending: Vec::new(),
     };
-    collect(tree.root_node(), None, None, 0, &mut ctx);
+    collect(tree.root_node(), None, None, &mut ctx);
     let mut relationships = ctx.out_rels;
     resolve_pending(
         &ctx.out,
@@ -133,18 +132,7 @@ struct CollectCtx<'a> {
     pending: Vec<PendingRel>,
 }
 
-fn collect(
-    node: Node,
-    parent: Option<&str>,
-    scope: Option<&str>,
-    depth: usize,
-    ctx: &mut CollectCtx,
-) {
-    if depth > MAX_AST_DEPTH {
-        note_depth_limit();
-        return;
-    }
-    let depth = depth + 1;
+fn collect(node: Node, parent: Option<&str>, scope: Option<&str>, ctx: &mut CollectCtx) {
     let (source, language, relative_path) = (ctx.source, ctx.language, ctx.relative_path);
     match node.kind() {
         "class_declaration" | "abstract_class_declaration" => {
@@ -173,7 +161,7 @@ fn collect(
             // recursion below for this subtree.
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                collect(child, name.as_deref(), scope, depth, ctx);
+                collect(child, name.as_deref(), scope, ctx);
             }
             return;
         }
@@ -226,7 +214,7 @@ fn collect(
                     }
                 }
                 pending_decorators.clear();
-                collect(child, parent, scope, depth, ctx);
+                collect(child, parent, scope, ctx);
             }
             return;
         }
@@ -291,7 +279,7 @@ fn collect(
             // this method as the call/construct attribution scope.
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                collect(child, None, Some(method_key.as_str()), depth, ctx);
+                collect(child, None, Some(method_key.as_str()), ctx);
             }
             return;
         }
@@ -310,7 +298,7 @@ fn collect(
             let key = qualified_name(relative_path, None, &name);
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                collect(child, parent, Some(key.as_str()), depth, ctx);
+                collect(child, parent, Some(key.as_str()), ctx);
             }
             return;
         }
@@ -392,7 +380,7 @@ fn collect(
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect(child, parent, scope, depth, ctx);
+        collect(child, parent, scope, ctx);
     }
 }
 
@@ -677,19 +665,15 @@ fn referenced_type_name(node: Node, source: &[u8]) -> Option<String> {
 /// parens. Anything else falls back to its own source text.
 fn decorator_name(node: Node, source: &[u8]) -> Option<String> {
     let inner = node.named_child(0)?;
-    decorator_expr_name(inner, source, 0)
+    decorator_expr_name(inner, source)
 }
 
-fn decorator_expr_name(node: Node, source: &[u8], depth: usize) -> Option<String> {
-    if depth > MAX_AST_DEPTH {
-        note_depth_limit();
-        return None;
-    }
+fn decorator_expr_name(node: Node, source: &[u8]) -> Option<String> {
     match node.kind() {
         "identifier" => node.utf8_text(source).ok().map(str::to_string),
         "call_expression" => {
             let func = node.child_by_field_name("function")?;
-            decorator_expr_name(func, source, depth + 1)
+            decorator_expr_name(func, source)
         }
         "member_expression" => node
             .child_by_field_name("property")
@@ -697,7 +681,7 @@ fn decorator_expr_name(node: Node, source: &[u8], depth: usize) -> Option<String
             .map(str::to_string),
         "parenthesized_expression" => {
             let inner = node.named_child(0)?;
-            decorator_expr_name(inner, source, depth + 1)
+            decorator_expr_name(inner, source)
         }
         _ => node.utf8_text(source).ok().map(str::to_string),
     }

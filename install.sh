@@ -63,47 +63,50 @@ fi
 # Release tags are vX.Y.Z; accept a bare X.Y.Z in CODEKURVE_VERSION too.
 case "$version" in v*) ;; *) version="v$version" ;; esac
 
-# 3. Download the binary and verify it before touching the installed copy.
-#
-# Integrity: the release publishes a SHA256SUMS manifest (`<sha256>  <file>`)
-# next to the binaries. The binary is checked against its entry before it is
-# made executable or moved into place. A missing manifest, missing entry, or
-# mismatch aborts with the existing install left untouched.
+# SHA-256 of a file, lowercase hex. Linux ships `sha256sum`, macOS ships
+# `shasum`; `openssl` is the last resort. No tool -> refuse to install rather
+# than skip the check.
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print $1}'
-  else
+  elif command -v shasum >/dev/null 2>&1; then
     shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 -r "$1" | awk '{print $1}'
+  else
+    echo "codekurve: need sha256sum, shasum or openssl to verify the download." >&2
+    return 1
   fi
 }
-if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
-  echo "codekurve: neither sha256sum nor shasum is available; cannot verify the download." >&2
-  exit 1
-fi
 
-release_base="https://github.com/$REPO/releases/download/$version"
-url="$release_base/$asset"
+# 3. Download the raw binary next to its final destination, verify it against
+# the release's SHA256SUMS, and only then move it into place. A mismatch or a
+# missing checksum aborts: nothing is installed. This catches a corrupted or
+# truncated download or a swapped CDN response. It does NOT protect against
+# someone who can edit the GitHub release itself (they could replace
+# SHA256SUMS too); for provenance see docs/SECURITY_MODEL.md.
+base="https://github.com/$REPO/releases/download/$version"
+url="$base/$asset"
 echo "Installing codekurve $version ($asset)..."
 mkdir -p "$BIN_DIR"
 tmp="$(mktemp "$BIN_DIR/.codekurve.XXXXXX")"
 trap 'rm -f "$tmp"' EXIT
 curl -fsSL "$url" -o "$tmp" || { echo "codekurve: download failed: $url" >&2; exit 1; }
 
-manifest="$(curl -fsSL "$release_base/SHA256SUMS")" \
-  || { echo "codekurve: could not download SHA256SUMS from $release_base; refusing to install an unverified binary." >&2; exit 1; }
-expected="$(printf '%s\n' "$manifest" \
-  | awk -v f="$asset" '{ n = $2; sub(/^\*/, "", n); if (n == f) print $1 }')"
-expected_count="$(printf '%s\n' "$expected" | grep -c . || true)"
-if [ "$expected_count" -ne 1 ]; then
-  echo "codekurve: SHA256SUMS has $expected_count entries for $asset (expected exactly 1); refusing to install." >&2
-  exit 1
-fi
-expected="$(printf '%s' "$expected" | tr 'A-F' 'a-f')"
-actual="$(sha256_of "$tmp" | tr 'A-F' 'a-f')"
+sums="$(curl -fsSL "$base/SHA256SUMS")" \
+  || { echo "codekurve: could not download $base/SHA256SUMS; refusing to install unverified binary." >&2; exit 1; }
+# `sha256sum` lines are "<hash>  <name>" (or "<hash> *<name>" in binary mode).
+expected="$(printf '%s\n' "$sums" | awk -v a="$asset" '$2 == a || $2 == "*" a { print tolower($1); exit }')"
+[ -n "$expected" ] \
+  || { echo "codekurve: SHA256SUMS for $version has no entry for $asset; refusing to install." >&2; exit 1; }
+actual="$(sha256_of "$tmp")" || exit 1
 if [ "$actual" != "$expected" ]; then
-  echo "codekurve: checksum mismatch for $asset (expected $expected, got $actual); refusing to install." >&2
+  echo "codekurve: checksum mismatch for $asset ($version); refusing to install." >&2
+  echo "  expected $expected" >&2
+  echo "  actual   $actual" >&2
   exit 1
 fi
+echo "Verified   SHA-256 $actual"
 
 # Smoke test the verified file before it replaces anything.
 chmod +x "$tmp"

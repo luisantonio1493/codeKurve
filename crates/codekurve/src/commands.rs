@@ -159,6 +159,9 @@ pub fn index(root: &Path) -> Result<(), String> {
     let outcome = crate::incremental::apply_batch(&mut setup.conn, &ctx, &changes)?;
     repo::set_analyzer_version(&setup.conn, &setup.project_id, &fingerprint)
         .map_err(|e| e.to_string())?;
+    // Also reached by an index built before planner statistics existed, when
+    // nothing changed: a no-change run is enough to give it statistics.
+    crate::incremental::refresh_planner_stats(&setup.conn);
 
     crate::incremental::warn_outside_root(&outside_root);
     crate::incremental::warn_unverified(&outcome);
@@ -651,7 +654,10 @@ pub fn symbol(root: &Path, name: &str) -> Result<(), String> {
             hit.span.end_line,
             hit.span.end_column
         );
-        println!("  --- snippet {} ---", snippet(&root, hit));
+        println!(
+            "  --- snippet {} ---",
+            snippet(&conn, &project_id, &root, hit)
+        );
     }
     Ok(())
 }
@@ -660,24 +666,10 @@ pub fn symbol(root: &Path, name: &str) -> Result<(), String> {
 pub fn doctor(root: &Path) -> Result<(), String> {
     let mut ok = true;
 
-    let probe = db::open_in_memory().map_err(|e| e.to_string())?;
-    let fts5 = db::has_fts5(&probe);
-    report("sqlite", true, "available (bundled)");
-    report("fts5", fts5, if fts5 { "available" } else { "MISSING" });
-    ok &= fts5;
-
-    let version =
-        codekurve_store::migrations::current_version(&probe).map_err(|e| e.to_string())?;
-    let schema_ok = version == codekurve_store::migrations::SCHEMA_VERSION;
-    report(
-        "schema",
-        schema_ok,
-        &format!(
-            "version {version} (expected {})",
-            codekurve_store::migrations::SCHEMA_VERSION
-        ),
-    );
-    ok &= schema_ok;
+    for check in query::engine_checks() {
+        report(check.name, check.ok, &check.detail);
+        ok &= check.ok;
+    }
 
     match root.canonicalize() {
         Ok(root) => {
@@ -1187,19 +1179,23 @@ fn discovery_options(config: &Config) -> DiscoveryOptions {
         follow_symlinks: config.index.follow_symlinks,
         max_file_size_bytes: config.index.max_file_size_bytes,
         max_total_files: config.index.max_total_files,
+        exclude_patterns: config.ignore.patterns.clone(),
         languages,
-        ignore_patterns: config.ignore.patterns.clone(),
     }
 }
 
-fn snippet(root: &Path, symbol: &StoredSymbol) -> String {
+fn snippet(conn: &Connection, project_id: &str, root: &Path, symbol: &StoredSymbol) -> String {
     let path = root.join(&symbol.relative_path);
     let Ok(bytes) = fs::read(&path) else {
         return "(unavailable: file not found) ---".to_string();
     };
-    // ponytail: bounds check is the Phase 1 staleness signal; hash-based
-    // staleness (§25) arrives with file hashing in Phase 3.
-    if symbol.span.end_byte > bytes.len() {
+    // The bounds check alone missed an edit that kept the file long enough:
+    // the stored byte span then sliced unrelated text and called it live.
+    let changed = repo::indexed_content_hash(conn, project_id, &symbol.relative_path)
+        .ok()
+        .flatten()
+        .is_some_and(|hash| hash != repo::content_hash(&bytes));
+    if changed || symbol.span.end_byte > bytes.len() {
         return "(stale: file changed since index; run `codekurve index`) ---".to_string();
     }
     match std::str::from_utf8(&bytes[symbol.span.start_byte..symbol.span.end_byte]) {

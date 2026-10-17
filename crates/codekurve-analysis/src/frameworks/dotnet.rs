@@ -25,7 +25,6 @@ use tree_sitter::Node;
 use crate::extract::{find_child, span_of};
 use crate::frameworks::AttrPattern;
 use crate::ir::{EdgeTarget, ExtractedRelationship, ExtractedSymbol, FileAnalysis};
-use crate::languages::{note_depth_limit, MAX_AST_DEPTH};
 
 /// design "Q2 — .NET split" PR5 table: attribute name -> HTTP verb text.
 const HTTP_VERB_ATTRS: &[(&str, &str)] = &[
@@ -187,7 +186,7 @@ struct CallInfo<'a> {
 /// prefilter and this file's own parse have already run.
 pub(crate) fn recognize(root: Node, source: &[u8], analysis: &mut FileAnalysis) {
     let mut top_level_key: Option<String> = None;
-    walk(root, source, analysis, None, &mut top_level_key, 0);
+    walk(root, source, analysis, None, &mut top_level_key);
 }
 
 /// `current_method` is the local key of the nearest enclosing
@@ -203,12 +202,7 @@ fn walk(
     analysis: &mut FileAnalysis,
     current_method: Option<&str>,
     top_level_key: &mut Option<String>,
-    depth: usize,
 ) {
-    if depth > MAX_AST_DEPTH {
-        note_depth_limit();
-        return;
-    }
     let mut next_method: Option<String> = None;
 
     match node.kind() {
@@ -237,14 +231,7 @@ fn walk(
     let next_method = next_method.as_deref().or(current_method);
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk(
-            child,
-            source,
-            analysis,
-            next_method,
-            top_level_key,
-            depth + 1,
-        );
+        walk(child, source, analysis, next_method, top_level_key);
     }
 }
 
@@ -1739,26 +1726,5 @@ public class AppDbContext : DbContext
         assert!(!call_driven_rel(&analysis, RelationshipKind::RegisteredAs).is_empty());
         assert!(!call_driven_rel(&analysis, RelationshipKind::HandlesRoute).is_empty());
         assert!(!call_driven_rel(&analysis, RelationshipKind::PersistsTo).is_empty());
-    }
-
-    // --- A2: the framework walk reports its depth truncation ----------------
-
-    /// A field initializer nested past `MAX_AST_DEPTH` is walked only by this
-    /// pass (`languages/csharp.rs` does not descend into it). The walk stops
-    /// there, so the truncation must be recorded the same way the other
-    /// walkers record it.
-    #[test]
-    fn field_initializer_nested_past_the_depth_limit_reports_the_truncation() {
-        let nesting = MAX_AST_DEPTH * 2;
-        let source = format!(
-            "// Http\npublic class Shallow {{ public int Field = {open}1{close}; }}\n",
-            open = "(".repeat(nesting),
-            close = ")".repeat(nesting),
-        );
-        let analysis = analyze(&source);
-        assert!(
-            extract::truncated_at_depth_limit(&analysis),
-            "a dotnet walk stopped at the depth limit must be recorded"
-        );
     }
 }

@@ -20,6 +20,21 @@ pub struct FileAnalysis {
     pub diagnostics: Vec<String>,
 }
 
+/// Leading text of the diagnostic an analyzer leaves on a file whose syntax
+/// tree was too deep to walk (see `languages::MAX_SYNTAX_DEPTH`).
+pub const TOO_DEEP_DIAGNOSTIC: &str = "skipped: syntax nesting deeper than";
+
+impl FileAnalysis {
+    /// Whether extraction skipped this file for nesting depth. Its analysis
+    /// is empty; the file is still recorded (with its hash), so it is not
+    /// retried until it changes.
+    pub fn skipped_too_deep(&self) -> bool {
+        self.diagnostics
+            .iter()
+            .any(|d| d.starts_with(TOO_DEEP_DIAGNOSTIC))
+    }
+}
+
 /// A symbol extracted from one file, keyed locally until pass 2 assigns it a
 /// stable storage identity.
 #[derive(Debug, Clone, PartialEq)]

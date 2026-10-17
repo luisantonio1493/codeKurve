@@ -285,18 +285,11 @@ pub fn trace(
     let target = commands::resolve_symbol(conn, project_id, None, Some(to))?;
     let min_confidence = commands::parse_confidence(args.min_confidence)?;
 
+    let adjacency =
+        traverse::LazyAdjacency::new(conn, false).map_err(|e| CommandError::from(e.to_string()))?;
     let caps = commands::bfs_caps(args.depth);
-    traverse::bfs_db(
-        conn,
-        project_id,
-        false,
-        &from,
-        Some(&target),
-        &caps,
-        None,
-        min_confidence,
-    )
-    .map_err(|e| CommandError::from(e.to_string()))
+    traverse::bfs(adjacency, &from, Some(&target), &caps, None, min_confidence)
+        .map_err(|e| CommandError::from(e.to_string()))
 }
 
 /// Extracted from `commands::impact`: bounded reverse BFS (§26.5) —
@@ -307,18 +300,11 @@ pub fn impact(s: &Session, args: &QueryArgs) -> Result<traverse::BfsOutcome, Com
     let symbol_id = commands::resolve_symbol(conn, project_id, args.symbol_id, args.symbol_name)?;
     let min_confidence = commands::parse_confidence(args.min_confidence)?;
 
+    let adjacency =
+        traverse::LazyAdjacency::new(conn, true).map_err(|e| CommandError::from(e.to_string()))?;
     let caps = commands::bfs_caps(args.depth);
-    traverse::bfs_db(
-        conn,
-        project_id,
-        true,
-        &symbol_id,
-        None,
-        &caps,
-        None,
-        min_confidence,
-    )
-    .map_err(|e| CommandError::from(e.to_string()))
+    traverse::bfs(adjacency, &symbol_id, None, &caps, None, min_confidence)
+        .map_err(|e| CommandError::from(e.to_string()))
 }
 
 /// One §28.3 row (path, line range, confidence, provenance) for a
@@ -681,6 +667,12 @@ fn truncate_at_char_boundary(text: &mut String, max: usize) -> bool {
 /// whether the project's stored freshness metadata shows pending files
 /// (`Session::warnings()` non-empty for an `Indexed` session) — folded into
 /// `stale` even when the read itself succeeds, per confirmed decision 4.
+///
+/// `indexed_hash` is the file's content hash at index time
+/// ([`indexed_file_hash`]). If the file on disk no longer matches it, the
+/// stored span describes older content: slicing it would hand back the
+/// wrong lines as if they were current, so no source is returned
+/// (`file_changed`). `None` skips the check.
 pub fn source_slice(
     root: &Path,
     relative_path: &str,
@@ -688,6 +680,7 @@ pub fn source_slice(
     ctx_lines: u32,
     index_pending: bool,
     limits: &SliceLimits,
+    indexed_hash: Option<&str>,
 ) -> SourceSlice {
     let path = match contained_path(root, relative_path) {
         Ok(path) => path,
@@ -701,6 +694,14 @@ pub fn source_slice(
     let Ok(bytes) = std::fs::read(&path) else {
         return unreadable("file_missing");
     };
+    if indexed_hash.is_some_and(|hash| hash != repo::content_hash(&bytes)) {
+        return SourceSlice {
+            source: None,
+            stale: true,
+            reason: Some("file_changed"),
+            truncated: false,
+        };
+    }
     if span.end_byte > bytes.len() {
         return unreadable("span_out_of_range");
     }
@@ -723,6 +724,16 @@ pub fn source_slice(
         reason: None,
         truncated,
     }
+}
+
+/// The stored content hash of an indexed file, for [`source_slice`]'s drift
+/// check. `None` when the session is not indexed or the lookup fails, which
+/// just skips that check.
+pub fn indexed_file_hash(s: &Session, relative_path: &str) -> Option<String> {
+    let (conn, project_id) = s.indexed().ok()?;
+    repo::indexed_content_hash(conn, project_id, relative_path)
+        .ok()
+        .flatten()
 }
 
 /// `codekurve status`'s data, plus the degraded (`NotIndexed`) shape a
@@ -827,64 +838,14 @@ pub struct DoctorReport {
     pub ok: bool,
 }
 
-/// New data function backing the future `codekurve_doctor` MCP tool (PR4+):
-/// same sqlite/fts5/schema probe `commands::doctor` runs, plus the session's
-/// own resolved root/config/index state (never re-reads the config file —
-/// `Session::open` already did). `commands::doctor` keeps its own
-/// independent implementation unchanged (it must keep reporting partial
-/// results even when `root` itself fails to canonicalize, which a
-/// `Session`-gated version — fatal on bad root — could never do).
+/// Backs the `codekurve_doctor` MCP tool: the shared [`engine_checks`] probe
+/// plus the session's own resolved root/config/index state (never re-reads
+/// the config file — `Session::open` already did). `commands::doctor` keeps
+/// its own root/config half (it must keep reporting partial results even
+/// when `root` itself fails to canonicalize, which a `Session`-gated
+/// version — fatal on bad root — could never do).
 pub fn doctor(s: &Session) -> DoctorReport {
-    let mut checks = Vec::new();
-    let mut ok = true;
-
-    match db::open_in_memory() {
-        Ok(probe) => {
-            checks.push(DoctorCheck {
-                name: "sqlite",
-                ok: true,
-                detail: "available (bundled)".to_string(),
-            });
-            let fts5 = db::has_fts5(&probe);
-            checks.push(DoctorCheck {
-                name: "fts5",
-                ok: fts5,
-                detail: if fts5 { "available" } else { "MISSING" }.to_string(),
-            });
-            ok &= fts5;
-
-            match migrations::current_version(&probe) {
-                Ok(version) => {
-                    let schema_ok = version == migrations::SCHEMA_VERSION;
-                    checks.push(DoctorCheck {
-                        name: "schema",
-                        ok: schema_ok,
-                        detail: format!(
-                            "version {version} (expected {})",
-                            migrations::SCHEMA_VERSION
-                        ),
-                    });
-                    ok &= schema_ok;
-                }
-                Err(e) => {
-                    checks.push(DoctorCheck {
-                        name: "schema",
-                        ok: false,
-                        detail: e.to_string(),
-                    });
-                    ok = false;
-                }
-            }
-        }
-        Err(e) => {
-            checks.push(DoctorCheck {
-                name: "sqlite",
-                ok: false,
-                detail: e.to_string(),
-            });
-            ok = false;
-        }
-    }
+    let mut checks = engine_checks();
 
     checks.push(DoctorCheck {
         name: "project root",
@@ -903,10 +864,56 @@ pub fn doctor(s: &Session) -> DoctorReport {
             ok: false,
             detail: reason.clone(),
         });
-        ok = false;
     }
 
+    let ok = checks.iter().all(|c| c.ok);
     DoctorReport { checks, ok }
+}
+
+/// The engine probe both `doctor`s run (this one and `commands::doctor`):
+/// SQLite, FTS5 and the migrated schema version, checked on a fresh
+/// in-memory database. A failing probe is reported as a failed check, never
+/// returned as an error, so the rest of the report still prints.
+pub(crate) fn engine_checks() -> Vec<DoctorCheck> {
+    let probe = match db::open_in_memory() {
+        Ok(probe) => probe,
+        Err(e) => {
+            return vec![DoctorCheck {
+                name: "sqlite",
+                ok: false,
+                detail: e.to_string(),
+            }]
+        }
+    };
+    let fts5 = db::has_fts5(&probe);
+    let schema = match migrations::current_version(&probe) {
+        Ok(version) => DoctorCheck {
+            name: "schema",
+            ok: version == migrations::SCHEMA_VERSION,
+            detail: format!(
+                "version {version} (expected {})",
+                migrations::SCHEMA_VERSION
+            ),
+        },
+        Err(e) => DoctorCheck {
+            name: "schema",
+            ok: false,
+            detail: e.to_string(),
+        },
+    };
+    vec![
+        DoctorCheck {
+            name: "sqlite",
+            ok: true,
+            detail: "available (bundled)".to_string(),
+        },
+        DoctorCheck {
+            name: "fts5",
+            ok: fts5,
+            detail: if fts5 { "available" } else { "MISSING" }.to_string(),
+        },
+        schema,
+    ]
 }
 
 /// Backing function for `codekurve_reindex` (design "reindex Gated Off by
@@ -1106,7 +1113,15 @@ mod read_boundary_tests {
     fn reads_a_file_inside_the_root() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("a.ts"), "one\ntwo\n").unwrap();
-        let slice = source_slice(dir.path(), "a.ts", &span(2, 2, 3), 0, false, &limits());
+        let slice = source_slice(
+            dir.path(),
+            "a.ts",
+            &span(2, 2, 3),
+            0,
+            false,
+            &limits(),
+            None,
+        );
         assert_eq!(slice.source.as_deref(), Some("two"));
         assert!(!slice.truncated);
     }
@@ -1119,7 +1134,15 @@ mod read_boundary_tests {
         let root = tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path().join("secret"), root.path().join("a.ts"))
             .unwrap();
-        let slice = source_slice(root.path(), "a.ts", &span(1, 1, 1), 0, false, &limits());
+        let slice = source_slice(
+            root.path(),
+            "a.ts",
+            &span(1, 1, 1),
+            0,
+            false,
+            &limits(),
+            None,
+        );
         assert_eq!(slice.source, None);
         assert_eq!(slice.reason, Some("path_outside_root"));
     }
@@ -1138,6 +1161,7 @@ mod read_boundary_tests {
             0,
             false,
             &limits(),
+            None,
         );
         assert_eq!(slice.source, None);
         assert_eq!(slice.reason, Some("path_outside_root"));
@@ -1150,7 +1174,7 @@ mod read_boundary_tests {
         let root = tempdir().unwrap();
         let abs = outside.path().join("secret");
         for rel in ["../secret", abs.to_str().unwrap()] {
-            let slice = source_slice(root.path(), rel, &span(1, 1, 1), 0, false, &limits());
+            let slice = source_slice(root.path(), rel, &span(1, 1, 1), 0, false, &limits(), None);
             assert_eq!(slice.reason, Some("path_outside_root"), "{rel}");
         }
     }
@@ -1164,7 +1188,7 @@ mod read_boundary_tests {
             max_file_bytes: 1_000_000,
             max_snippet_bytes: 5,
         };
-        let slice = source_slice(dir.path(), "a.ts", &span(1, 1, 10), 0, false, &limits);
+        let slice = source_slice(dir.path(), "a.ts", &span(1, 1, 10), 0, false, &limits, None);
         assert_eq!(slice.source.as_deref(), Some("éé"));
         assert!(slice.truncated);
     }
@@ -1177,7 +1201,7 @@ mod read_boundary_tests {
             max_file_bytes: 10,
             max_snippet_bytes: 12_000,
         };
-        let slice = source_slice(dir.path(), "a.ts", &span(1, 1, 1), 0, false, &limits);
+        let slice = source_slice(dir.path(), "a.ts", &span(1, 1, 1), 0, false, &limits, None);
         assert_eq!(slice.reason, Some("file_too_large"));
     }
 
@@ -1193,6 +1217,7 @@ mod read_boundary_tests {
             u32::MAX,
             false,
             &limits(),
+            None,
         );
         let lines = slice.source.unwrap().lines().count();
         assert_eq!(lines, 1 + 2 * MAX_CTX_LINES as usize);

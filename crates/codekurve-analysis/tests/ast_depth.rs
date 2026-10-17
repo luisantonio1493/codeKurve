@@ -1,6 +1,7 @@
 //! SEC-7: pathologically nested sources must index without overflowing the
 //! stack. Each case runs on a thread with an explicit 2 MB stack (the default
-//! test-thread size) so a recursion overflow aborts the test binary.
+//! test-thread size) so a recursion overflow aborts the test binary. Past
+//! `MAX_SYNTAX_DEPTH` the file is skipped with a diagnostic instead of walked.
 
 use codekurve_analysis::extract;
 use codekurve_core::LanguageId;
@@ -53,74 +54,37 @@ fn cs_deep_binary_chain() -> String {
     )
 }
 
-fn assert_indexes_shallow_symbol(source: String, language: LanguageId, path: &'static str) {
+/// A file past the depth limit comes back empty with the skip recorded, and
+/// nothing overflows the stack on the way there.
+fn assert_skipped_without_overflow(source: String, language: LanguageId, path: &'static str) {
     let analysis = on_small_stack(move || extract::analyze(&source, language, path))
         .expect("deep source should still produce an analysis");
     assert!(
-        analysis
-            .symbols
-            .iter()
-            .any(|s| s.name == "shallow" || s.name == "Shallow"),
-        "symbols above the depth cap must be kept, got {:?}",
-        analysis.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
-    );
-}
-
-/// A2: a file whose walk stops at the depth limit still indexes, and the
-/// truncation is recorded so `index` can warn about it.
-fn assert_reports_depth_truncation(source: String, language: LanguageId, path: &'static str) {
-    let analysis = on_small_stack(move || extract::analyze(&source, language, path))
-        .expect("deep source should still produce an analysis");
-    assert!(
-        extract::truncated_at_depth_limit(&analysis),
-        "a walk stopped at the depth limit must be recorded for {path}"
+        analysis.skipped_too_deep(),
+        "a file past the depth limit must be skipped for {path}"
     );
     assert!(
-        analysis
-            .symbols
-            .iter()
-            .any(|s| s.name == "shallow" || s.name == "Shallow"),
-        "symbols above the depth cap must be kept"
+        analysis.symbols.is_empty(),
+        "a skipped file indexes no symbols"
     );
-}
-
-#[test]
-fn typescript_deep_brackets_report_the_depth_truncation() {
-    assert_reports_depth_truncation(ts_deep_brackets(), LanguageId::TypeScript, "deep.ts");
-}
-
-/// Nesting inside a method body, which the C# analyzer walks itself. A field
-/// initializer is only walked by the .NET framework pass, which is not
-/// covered by the depth record yet.
-fn cs_deep_parens_in_method() -> String {
-    format!(
-        "namespace Deep;\n// Http\npublic class Shallow {{ public int M() {{ return {open}1{close}; }} }}\n",
-        open = "(".repeat(NESTING),
-        close = ")".repeat(NESTING),
-    )
-}
-
-#[test]
-fn csharp_deep_parens_in_method_report_the_depth_truncation() {
-    assert_reports_depth_truncation(cs_deep_parens_in_method(), LanguageId::CSharp, "Deep.cs");
 }
 
 #[test]
 fn typescript_deep_brackets_do_not_overflow_the_stack() {
-    assert_indexes_shallow_symbol(ts_deep_brackets(), LanguageId::TypeScript, "deep.ts");
+    assert_skipped_without_overflow(ts_deep_brackets(), LanguageId::TypeScript, "deep.ts");
 }
 
 #[test]
 fn typescript_deep_binary_chain_does_not_overflow_the_stack() {
-    assert_indexes_shallow_symbol(ts_deep_binary_chain(), LanguageId::TypeScript, "chain.ts");
+    assert_skipped_without_overflow(ts_deep_binary_chain(), LanguageId::TypeScript, "chain.ts");
 }
 
 #[test]
 fn csharp_deep_parens_do_not_overflow_the_stack() {
-    assert_indexes_shallow_symbol(cs_deep_parens(), LanguageId::CSharp, "Deep.cs");
+    assert_skipped_without_overflow(cs_deep_parens(), LanguageId::CSharp, "Deep.cs");
 }
 
 #[test]
 fn csharp_deep_binary_chain_does_not_overflow_the_stack() {
-    assert_indexes_shallow_symbol(cs_deep_binary_chain(), LanguageId::CSharp, "Chain.cs");
+    assert_skipped_without_overflow(cs_deep_binary_chain(), LanguageId::CSharp, "Chain.cs");
 }

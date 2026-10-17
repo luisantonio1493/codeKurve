@@ -49,68 +49,70 @@ if (-not $version) {
 if (-not $version) { throw "codekurve: could not resolve latest version; set CODEKURVE_VERSION." }
 if ($version -notmatch '^v') { $version = "v$version" }
 
-# 3. Download the binary and verify it before touching the installed copy.
-#
-# Integrity: the release publishes a SHA256SUMS manifest (`<sha256>  <file>`)
-# next to the binaries. The download is checked against its entry and smoke
-# tested with --version before anything at $dest is replaced.
-$releaseBase = "https://github.com/$repo/releases/download/$version"
-$url = "$releaseBase/$asset"
+# 3. Download the raw binary next to its final destination, verify it against
+# the release's SHA256SUMS, and only then move it into place. A mismatch or a
+# missing checksum aborts: nothing is installed. This catches a corrupted or
+# truncated download or a swapped CDN response. It does NOT protect against
+# someone who can edit the GitHub release itself (they could replace
+# SHA256SUMS too); for provenance see docs/SECURITY_MODEL.md.
+$base = "https://github.com/$repo/releases/download/$version"
+$url = "$base/$asset"
 Write-Host "Installing codekurve $version ($asset)..."
 New-Item -ItemType Directory -Force -Path $binDir | Out-Null
 # The .exe suffix lets the smoke test execute the temp file directly.
 $tmp = Join-Path $binDir ("codekurve.tmp." + [guid]::NewGuid().ToString() + ".exe")
+$sumsTmp = "$tmp.SHA256SUMS"
 try {
-  try {
-    Invoke-WebRequest -Uri $url -OutFile $tmp
-  } catch {
-    throw "codekurve: download failed: $url`n$_"
+  Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $tmp
+} catch {
+  Remove-Item -Force -ErrorAction SilentlyContinue $tmp
+  throw "codekurve: download failed: $url`n$_"
+}
+try {
+  # To a file, not `.Content`: GitHub serves release assets as
+  # application/octet-stream, which Windows PowerShell 5.1 returns as bytes.
+  Invoke-WebRequest -UseBasicParsing -Uri "$base/SHA256SUMS" -OutFile $sumsTmp
+  $expected = $null
+  foreach ($line in (Get-Content -LiteralPath $sumsTmp)) {
+    # "<hash>  <name>" (or "<hash> *<name>" in binary mode).
+    $parts = $line.Trim() -split '\s+', 2
+    if ($parts.Count -eq 2 -and $parts[1].TrimStart('*') -eq $asset) { $expected = $parts[0]; break }
   }
-
-  try {
-    $manifestResponse = Invoke-WebRequest -Uri "$releaseBase/SHA256SUMS" -UseBasicParsing
-  } catch {
-    throw "codekurve: could not download SHA256SUMS from $releaseBase; refusing to install an unverified binary.`n$_"
-  }
-  # Release assets are served as octet-stream, so Content may arrive as bytes.
-  $manifest = $manifestResponse.Content
-  if ($manifest -is [byte[]]) { $manifest = [System.Text.Encoding]::UTF8.GetString($manifest) }
-  $expected = @()
-  foreach ($line in ($manifest -split "`r?`n")) {
-    if ($line -match '^\s*([0-9A-Fa-f]{64})\s+\*?(.+?)\s*$' -and $Matches[2] -eq $asset) {
-      $expected += $Matches[1]
-    }
-  }
-  if ($expected.Count -ne 1) {
-    throw "codekurve: SHA256SUMS has $($expected.Count) entries for $asset (expected exactly 1); refusing to install."
-  }
-  $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $tmp).Hash
-  if ($actual -ine $expected[0]) {
-    throw "codekurve: checksum mismatch for $asset (expected $($expected[0]), got $actual); refusing to install."
-  }
-
-  # Smoke test the verified file before it replaces anything.
-  & $tmp --version *> $null
-  if ($LASTEXITCODE -ne 0) {
-    throw "codekurve: downloaded $asset failed its '--version' smoke test; existing install left unchanged."
-  }
-
-  # Keep the previous binary for manual rollback, then replace it.
-  if (Test-Path -LiteralPath $dest) {
-    try {
-      Copy-Item -Force -LiteralPath $dest -Destination "$dest.prev"
-    } catch {
-      throw "codekurve: could not back up $dest to $dest.prev (file in use?). Close any running codekurve.exe (or terminal using it) and re-run this installer.`n$_"
-    }
-  }
-  try {
-    Move-Item -Force $tmp $dest
-  } catch {
-    throw "codekurve: could not replace $dest (file in use). Close any running codekurve.exe (or terminal using it) and re-run this installer.`n$_"
+  if (-not $expected) { throw "SHA256SUMS for $version has no entry for $asset" }
+  $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $tmp).Hash.ToLowerInvariant()
+  # PowerShell's -ne is case-insensitive, so upper/lower hex compare equal.
+  if ($actual -ne $expected) {
+    throw "checksum mismatch for $asset ($version): expected $expected, actual $actual"
   }
 } catch {
   Remove-Item -Force -ErrorAction SilentlyContinue $tmp
-  throw
+  throw "codekurve: $_; refusing to install."
+} finally {
+  Remove-Item -Force -ErrorAction SilentlyContinue $sumsTmp
+}
+Write-Host "Verified   SHA-256 $actual"
+
+# Smoke test the verified file before it replaces anything.
+& $tmp --version *> $null
+if ($LASTEXITCODE -ne 0) {
+  Remove-Item -Force -ErrorAction SilentlyContinue $tmp
+  throw "codekurve: downloaded $asset failed its '--version' smoke test; existing install left unchanged."
+}
+
+# Keep the previous binary for manual rollback, then replace it.
+if (Test-Path -LiteralPath $dest) {
+  try {
+    Copy-Item -Force -LiteralPath $dest -Destination "$dest.prev"
+  } catch {
+    Remove-Item -Force -ErrorAction SilentlyContinue $tmp
+    throw "codekurve: could not back up $dest to $dest.prev (file in use?). Close any running codekurve.exe (or terminal using it) and re-run this installer.`n$_"
+  }
+}
+try {
+  Move-Item -Force $tmp $dest
+} catch {
+  Remove-Item -Force -ErrorAction SilentlyContinue $tmp
+  throw "codekurve: could not replace $dest (file in use). Close any running codekurve.exe (or terminal using it) and re-run this installer.`n$_"
 }
 
 Write-Host "Installed  $dest"
